@@ -73,12 +73,14 @@ torchtitan/models/glm5/
 `-- README.md
 ```
 
-The model name will be added to `torchtitan/models/__init__.py`. Tests will live
-in the repository-level test tree:
+The model name will be added to `torchtitan/models/__init__.py`. Tests will reuse
+the repository's existing unit-test suite. Generic configuration coverage will
+be added to the existing config-manager test, while only GLM-5-specific model
+behavior and Transformers parity receive new modules:
 
 ```text
-tests/unit_tests/test_glm5_model.py
-tests/unit_tests/test_glm5_state_dict_adapter.py
+tests/unit_tests/test_config_manager.py  # extend existing parameter coverage
+tests/unit_tests/test_glm5.py
 tests/unit_tests/test_glm5_parity.py
 ```
 
@@ -330,6 +332,19 @@ will not imply that the released checkpoint or 200K-token execution is already
 supported.
 
 ## Validation Strategy
+
+Tests will reuse existing `tests/unit_tests` conventions, runners, assertions,
+and device-skip behavior. Existing common-component tests remain authoritative
+for `RMSNorm`, `FeedForward`, `MoE`, and `GroupedExperts`; GLM-5 tests will not
+duplicate those operator tests. They will verify only GLM-5 composition and
+GLM-5-specific behavior. The CLI/config registration case will be added to
+`test_config_manager.py` beside the existing DeepSeek-V3 case.
+
+`test_state_dict_keys.py` is currently a Llama3-specific optimizer/checkpoint
+contract test with hard-coded structural anchors. Generalizing it to multiple
+models is outside this milestone, so GLM-5 adapter coverage will stay in
+`test_glm5.py`. The multi-GPU model integration matrix is also out of scope
+because this milestone explicitly supports one device only.
 
 ### CPU tests
 
