@@ -39,6 +39,22 @@ class Linear(nn.Linear, Module):
             bias=config.bias,
         )
 
+    def forward(
+        self,
+        input: torch.Tensor,
+        *,
+        compute_dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        """Apply the projection, optionally using a higher compute precision."""
+        if compute_dtype is None:
+            return super().forward(input)
+        bias = None if self.bias is None else self.bias.to(dtype=compute_dtype)
+        return F.linear(
+            input.to(dtype=compute_dtype),
+            self.weight.to(dtype=compute_dtype),
+            bias,
+        )
+
 
 class ScaledBiasRowwiseLinear(Linear):
     """

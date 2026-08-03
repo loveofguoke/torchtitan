@@ -289,12 +289,11 @@ class TokenChoiceTopKRouter(Module):
             scores_BLE: Full routing scores ``(B, L, E)``.
         """
         # Compute gate in float32 to help stability of expert load balancing.
-        # Autocast cannot force FP32 on all backends, so upcast explicitly.
-        gate_bias = None if self.gate.bias is None else self.gate.bias.float()
-        scores_BLE = F.linear(x_BLD.float(), self.gate.weight.float(), gate_bias)
+        # Use the module call so parallelization wrappers and hooks stay active.
+        scores_BLE = self.gate(x_BLD, compute_dtype=torch.float32)
 
         # By default, sigmoid or softmax is performed in float32 to avoid loss explosion.
-        # scores_BLE is already float32 from the autocast above.
+        # scores_BLE is already float32 from the gate's explicit compute dtype.
         if self.score_func == "sigmoid":
             scores_BLE = torch.sigmoid(scores_BLE)
         elif self.score_func == "softmax":

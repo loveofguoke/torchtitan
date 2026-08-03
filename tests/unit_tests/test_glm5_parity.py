@@ -16,6 +16,8 @@ import unittest
 import torch
 import torch.nn.functional as F
 
+from torchtitan.models.common.linear import Linear
+from torchtitan.models.common.moe import TokenChoiceTopKRouter
 from torchtitan.models.glm5 import glm5_configs, Glm5StateDictAdapter
 
 try:
@@ -146,6 +148,43 @@ class TestGlm5Bfloat16RouterPrecision(unittest.TestCase):
         )
         self.assertEqual(scores.dtype, torch.float32)
         torch.testing.assert_close(scores, expected_scores, rtol=0, atol=0)
+
+    def test_router_uses_gate_forward_for_fp32_biased_computation(self) -> None:
+        """FP32 routing must retain the gate module's hooks and gradients."""
+        router = TokenChoiceTopKRouter.Config(
+            num_experts=4,
+            gate=Linear.Config(in_features=3, out_features=4, bias=True),
+            top_k=2,
+            score_func="sigmoid",
+        ).build()
+        router.bfloat16()
+        hidden_states = torch.randn(1, 2, 3, dtype=torch.bfloat16)
+        gate_call_count = 0
+
+        def count_gate_calls(*_args) -> None:
+            nonlocal gate_call_count
+            gate_call_count += 1
+
+        hook = router.gate.register_forward_hook(count_gate_calls)
+        try:
+            _, _, scores = router(hidden_states)
+        finally:
+            hook.remove()
+
+        expected_scores = torch.sigmoid(
+            F.linear(
+                hidden_states.float(),
+                router.gate.weight.float(),
+                router.gate.bias.float(),
+            )
+        )
+        self.assertEqual(gate_call_count, 1)
+        self.assertEqual(scores.dtype, torch.float32)
+        torch.testing.assert_close(scores, expected_scores, rtol=0, atol=0)
+
+        scores.sum().backward()
+        self.assertIsNotNone(router.gate.weight.grad)
+        self.assertIsNotNone(router.gate.bias.grad)
 
 
 class TestGlm5TransformersComponentParity(unittest.TestCase):
