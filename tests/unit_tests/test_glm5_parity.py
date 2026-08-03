@@ -14,6 +14,7 @@ single-GPU end-to-end BF16 and gradient acceptance work.
 import unittest
 
 import torch
+import torch.nn.functional as F
 
 from torchtitan.models.glm5 import glm5_configs, Glm5StateDictAdapter
 
@@ -62,10 +63,12 @@ def _hf_config():
     )
 
 
-def _build_models(device: torch.device) -> tuple[torch.nn.Module, torch.nn.Module]:
+def _build_models(
+    device: torch.device, *, seed: int = 41
+) -> tuple[torch.nn.Module, torch.nn.Module]:
     """Construct exact FP32 peers and load the HF tensors through the adapter."""
     assert GlmMoeDsaForCausalLM is not None
-    torch.manual_seed(41)
+    torch.manual_seed(seed)
     hf_model = GlmMoeDsaForCausalLM(_hf_config()).float()
 
     titan_config = glm5_configs["debugmodel"]()
@@ -79,6 +82,46 @@ def _build_models(device: torch.device) -> tuple[torch.nn.Module, torch.nn.Modul
     return hf_model, titan_model
 
 
+def _convert_models_to_bfloat16(
+    hf_model: torch.nn.Module,
+    titan_model: torch.nn.Module,
+    device: torch.device,
+) -> None:
+    """Move both peers to CUDA BF16 while retaining FP32 DSA head weights.
+
+    The GLM DSA indexer's learned head weights are deliberately evaluated in
+    FP32.  TorchTitan's indexer protects that parameter in ``_apply``; the
+    Transformers reference needs the equivalent explicit restoration after
+    ``Module.to(dtype=torch.bfloat16)``.
+    """
+    hf_model.to(device=device, dtype=torch.bfloat16)
+    titan_model.to(device=device, dtype=torch.bfloat16)
+
+    for module in hf_model.modules():
+        indexer = getattr(module, "indexer", None)
+        if indexer is not None:
+            indexer.weights_proj.float()
+
+    for model in (hf_model, titan_model):
+        indexer_weights = [
+            (name, parameter)
+            for name, parameter in model.named_parameters()
+            if name.endswith("indexer.weights_proj.weight")
+        ]
+        expected_indexer_weights = len(getattr(model, "model", model).layers)
+        if len(indexer_weights) != expected_indexer_weights:
+            raise AssertionError(
+                "GLM-5 model has an unexpected number of "
+                f"indexer.weights_proj.weight parameters: {indexer_weights}"
+            )
+        for name, parameter in indexer_weights:
+            if parameter.dtype is not torch.float32:
+                raise AssertionError(
+                    "GLM-5 indexer.weights_proj.weight must remain FP32 after "
+                    f"BF16 conversion: {name} has dtype {parameter.dtype}"
+                )
+
+
 def _causal_mask(positions_BL: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     B, L = positions_BL.shape
     token_indices_L = torch.arange(L, device=positions_BL.device)
@@ -86,6 +129,23 @@ def _causal_mask(positions_BL: torch.Tensor, dtype: torch.dtype) -> torch.Tensor
     return torch.zeros(B, 1, L, L, dtype=dtype, device=positions_BL.device).masked_fill(
         ~allowed_BLL.unsqueeze(1), torch.finfo(dtype).min
     )
+
+
+class TestGlm5Bfloat16RouterPrecision(unittest.TestCase):
+    def test_router_gate_is_evaluated_in_float32(self) -> None:
+        """BF16 activations must not reduce the discrete router's precision."""
+        titan_model = glm5_configs["debugmodel"]().build()
+        titan_model.init_states()
+        titan_model.bfloat16()
+        router = titan_model.layers["1"].moe.router
+        hidden_states = torch.randn(1, 16, 256, dtype=torch.bfloat16)
+
+        _, _, scores = router(hidden_states, titan_model.layers["1"].moe.expert_bias_E)
+        expected_scores = torch.sigmoid(
+            F.linear(hidden_states.float(), router.gate.weight.float())
+        )
+        self.assertEqual(scores.dtype, torch.float32)
+        torch.testing.assert_close(scores, expected_scores, rtol=0, atol=0)
 
 
 class TestGlm5TransformersComponentParity(unittest.TestCase):
@@ -204,3 +264,160 @@ class TestGlm5TransformersComponentParity(unittest.TestCase):
         torch.testing.assert_close(
             titan_output_BLD, hf_output_BLD, rtol=1e-4, atol=1e-5
         )
+
+
+class TestGlm5TransformersBfloat16Parity(unittest.TestCase):
+    """Single-GPU BF16 output, routed-MoE, and gradient parity acceptance."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if _TRANSFORMERS_IMPORT_ERROR is not None:
+            raise unittest.SkipTest(
+                "Transformers GLM-MoE-DSA is unavailable: "
+                f"{_TRANSFORMERS_IMPORT_ERROR!r}"
+            )
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest(
+                "GLM-5 Transformers BF16 parity requires one CUDA device"
+            )
+
+        cls.device = torch.device("cuda")
+        cls.hf_model, cls.titan_model = _build_models(cls.device, seed=53)
+        _convert_models_to_bfloat16(cls.hf_model, cls.titan_model, cls.device)
+        cls.batch_size = 1
+        cls.sequence_length = 16
+        torch.manual_seed(53)
+        cls.tokens = torch.randint(
+            0,
+            2048,
+            (cls.batch_size, cls.sequence_length),
+            device=cls.device,
+            dtype=torch.long,
+        )
+        cls.positions = torch.arange(
+            cls.sequence_length, device=cls.device, dtype=torch.long
+        ).expand(cls.batch_size, -1)
+        cls.causal_mask = _causal_mask(cls.positions, torch.bfloat16)
+
+    def test_end_to_end_bfloat16_output_loss_moe_and_gradients(self) -> None:
+        """Mapped GLM-5 peers agree across the complete debug training path."""
+        self.hf_model.zero_grad(set_to_none=True)
+        self.titan_model.zero_grad(set_to_none=True)
+
+        # Exercise the second decoder block from an identical BF16 activation.
+        # Layer 1 is the first routed-MoE layer in the debug configuration.
+        with torch.no_grad():
+            moe_input = self.hf_model.model.embed_tokens(self.tokens)
+            hf_position_embeddings = self.hf_model.model.rotary_emb(
+                moe_input, position_ids=self.positions
+            )
+            hf_moe_block_output = self.hf_model.model.layers[1](
+                moe_input,
+                attention_mask=self.causal_mask,
+                position_ids=self.positions,
+                position_embeddings=hf_position_embeddings,
+                use_cache=False,
+            )[0]
+            titan_moe_block_output = self.titan_model.layers["1"](
+                moe_input, self.causal_mask, self.positions
+            )
+        torch.testing.assert_close(
+            titan_moe_block_output,
+            hf_moe_block_output,
+            rtol=5e-2,
+            atol=5e-2,
+        )
+
+        labels = self.tokens.clone()
+        hf_outputs = self.hf_model(
+            input_ids=self.tokens,
+            position_ids=self.positions,
+            labels=labels,
+            use_cache=False,
+        )
+        hf_logits = hf_outputs.logits
+        hf_loss = hf_outputs.loss
+        titan_logits = self.titan_model(self.tokens, positions=self.positions)
+        titan_loss = F.cross_entropy(
+            titan_logits[:, :-1].float().reshape(-1, 2048),
+            labels[:, 1:].reshape(-1),
+        )
+
+        torch.testing.assert_close(titan_logits, hf_logits, rtol=5e-2, atol=5e-2)
+        torch.testing.assert_close(titan_loss, hf_loss, rtol=5e-2, atol=5e-2)
+
+        hf_loss.backward()
+        titan_loss.backward()
+
+        hf_layer0 = self.hf_model.model.layers[0]
+        titan_layer0 = self.titan_model.layers["0"]
+        hf_layer1 = self.hf_model.model.layers[1]
+        titan_layer1 = self.titan_model.layers["1"]
+        expert_width = self.hf_model.config.moe_intermediate_size
+        gradient_pairs = (
+            (
+                "embedding",
+                self.hf_model.model.embed_tokens.weight.grad,
+                self.titan_model.tok_embeddings.weight.grad,
+            ),
+            (
+                "layer0 q_a",
+                hf_layer0.self_attn.q_a_proj.weight.grad,
+                titan_layer0.attention.wq_a.weight.grad,
+            ),
+            (
+                "layer0 dense gate",
+                hf_layer0.mlp.gate_proj.weight.grad,
+                titan_layer0.feed_forward.w1.weight.grad,
+            ),
+            (
+                "layer1 router",
+                hf_layer1.mlp.gate.weight.grad,
+                titan_layer1.moe.router.gate.weight.grad,
+            ),
+            (
+                "layer1 routed gate",
+                hf_layer1.mlp.experts.gate_up_proj.grad[:, :expert_width],
+                titan_layer1.moe.routed_experts.inner_experts.w1_EFD.grad,
+            ),
+            (
+                "layer1 routed up",
+                hf_layer1.mlp.experts.gate_up_proj.grad[:, expert_width:],
+                titan_layer1.moe.routed_experts.inner_experts.w3_EFD.grad,
+            ),
+            (
+                "layer1 routed down",
+                hf_layer1.mlp.experts.down_proj.grad,
+                titan_layer1.moe.routed_experts.inner_experts.w2_EDF.grad,
+            ),
+            (
+                "lm head",
+                self.hf_model.lm_head.weight.grad,
+                self.titan_model.lm_head.weight.grad,
+            ),
+        )
+        for name, hf_gradient, titan_gradient in gradient_pairs:
+            self.assertIsNotNone(hf_gradient, f"HF {name} gradient is missing")
+            self.assertIsNotNone(
+                titan_gradient, f"TorchTitan {name} gradient is missing"
+            )
+            assert hf_gradient is not None
+            assert titan_gradient is not None
+            torch.testing.assert_close(
+                titan_gradient,
+                hf_gradient,
+                rtol=5e-2,
+                atol=5e-2,
+            )
+
+        for model_name, model in (
+            ("HF", self.hf_model),
+            ("TorchTitan", self.titan_model),
+        ):
+            for parameter_name, parameter in model.named_parameters():
+                if ".indexer." in parameter_name:
+                    self.assertIsNone(
+                        parameter.grad,
+                        f"{model_name} indexer parameter unexpectedly received "
+                        f"a gradient: {parameter_name}",
+                    )

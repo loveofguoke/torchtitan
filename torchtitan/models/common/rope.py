@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import math
+import warnings
 from dataclasses import dataclass
 from typing import Literal
 
@@ -181,6 +182,19 @@ class ComplexRoPE(RoPE):
     @dataclass(kw_only=True, slots=True)
     class Config(RoPE.Config):
         pass
+
+    def _apply(self, fn, recurse: bool = True):
+        """Keep the phase-bearing cache complex across reduced-dtype moves."""
+        cache = self.cache
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="Casting complex values to real discards the imaginary part",
+            )
+            super()._apply(fn, recurse=recurse)
+        if not self.cache.is_complex():
+            self.cache = cache.to(device=self.cache.device)
+        return self
 
     def _precompute_cache(self) -> torch.Tensor:
         """Precompute complex cis values.
