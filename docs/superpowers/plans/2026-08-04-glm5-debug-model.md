@@ -80,8 +80,21 @@ def test_indexer_returns_masked_int32_topk(self):
 
     self.assertEqual(topk_indices_BLK.dtype, torch.int32)
     self.assertEqual(topk_indices_BLK.shape, (2, 5, 3))
-    query_positions_BL1 = positions_BL.unsqueeze(-1)
-    self.assertTrue(torch.all(topk_indices_BLK <= query_positions_BL1))
+    full_topk_queries_B = positions_BL >= topk_indices_BLK.shape[-1] - 1
+    self.assertTrue(
+        torch.all(
+            topk_indices_BLK[full_topk_queries_B]
+            <= positions_BL[full_topk_queries_B].unsqueeze(-1)
+        )
+    )
+    self.assertTrue(
+        torch.all(
+            torch.any(
+                topk_indices_BLK[:, 0] > positions_BL[:, 0].unsqueeze(-1),
+                dim=-1,
+            )
+        )
+    )
 
 def test_indexer_matches_independent_reference(self):
     torch.manual_seed(17)

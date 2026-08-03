@@ -67,19 +67,26 @@ def _reference_indexer_topk(
     k_rot_complex_BL1R2 = torch.view_as_complex(
         k_rot_BL1R.float().reshape(B, L, 1, -1, 2)
     )
-    q_rot_BLNR = torch.view_as_real(
-        q_rot_complex_BLNR2 * rope_cache_BL1R2
-    ).flatten(3).type_as(q_rot_BLNR)
-    k_rot_BL1R = torch.view_as_real(
-        k_rot_complex_BL1R2 * rope_cache_BL1R2
-    ).flatten(3).type_as(k_rot_BL1R)
+    q_rot_BLNR = (
+        torch.view_as_real(q_rot_complex_BLNR2 * rope_cache_BL1R2)
+        .flatten(3)
+        .type_as(q_rot_BLNR)
+    )
+    k_rot_BL1R = (
+        torch.view_as_real(k_rot_complex_BL1R2 * rope_cache_BL1R2)
+        .flatten(3)
+        .type_as(k_rot_BL1R)
+    )
     q_BLNH = torch.cat((q_rot_BLNR, q_pass_BLNP), dim=-1)
     k_BLH = torch.cat((k_rot_BL1R, k_pass_BL1P), dim=-1).squeeze(2)
 
-    scores_BNLL = torch.matmul(
-        q_BLNH.float().transpose(1, 2),
-        k_BLH.float().transpose(1, 2).unsqueeze(1),
-    ) * indexer.softmax_scale
+    scores_BNLL = (
+        torch.matmul(
+            q_BLNH.float().transpose(1, 2),
+            k_BLH.float().transpose(1, 2).unsqueeze(1),
+        )
+        * indexer.softmax_scale
+    )
     scores_BNLL = F.relu(scores_BNLL)
     weights_BLN = F.linear(
         hidden_states_BLD.to(indexer.weights_proj.weight.dtype),
@@ -97,8 +104,7 @@ def _reference_indexer_topk(
             key_positions_11L > positions_BL.unsqueeze(-1), float("-inf")
         )
     topk = min(indexer.index_topk, index_scores_BLL.shape[-1])
-    topk_indices_BLK = index_scores_BLL.topk(topk, dim=-1).indices
-    return torch.minimum(topk_indices_BLK, positions_BL.unsqueeze(-1)).to(torch.int32)
+    return index_scores_BLL.topk(topk, dim=-1).indices.to(torch.int32)
 
 
 class TestGlm5DsaIndexer(unittest.TestCase):
@@ -122,8 +128,21 @@ class TestGlm5DsaIndexer(unittest.TestCase):
 
         self.assertEqual(topk_indices_BLK.dtype, torch.int32)
         self.assertEqual(topk_indices_BLK.shape, (2, 5, 3))
-        query_positions_BL1 = positions_BL.unsqueeze(-1)
-        self.assertTrue(torch.all(topk_indices_BLK <= query_positions_BL1))
+        full_topk_queries_B = positions_BL >= topk_indices_BLK.shape[-1] - 1
+        self.assertTrue(
+            torch.all(
+                topk_indices_BLK[full_topk_queries_B]
+                <= positions_BL[full_topk_queries_B].unsqueeze(-1)
+            )
+        )
+        self.assertTrue(
+            torch.all(
+                torch.any(
+                    topk_indices_BLK[:, 0] > positions_BL[:, 0].unsqueeze(-1),
+                    dim=-1,
+                )
+            )
+        )
 
     def test_indexer_matches_independent_reference(self):
         torch.manual_seed(17)

@@ -32,9 +32,7 @@ class Glm5DsaIndexer(Module):
             if self.q_lora_rank <= 0:
                 raise ValueError("GLM-5 DSA requires q_lora_rank > 0.")
             if self.head_dim < self.qk_rope_head_dim:
-                raise ValueError(
-                    "index_head_dim must be >= qk_rope_head_dim."
-                )
+                raise ValueError("index_head_dim must be >= qk_rope_head_dim.")
             if self.qk_rope_head_dim % 2 != 0:
                 raise ValueError("qk_rope_head_dim must be even.")
             if self.index_topk <= 0:
@@ -83,10 +81,13 @@ class Glm5DsaIndexer(Module):
         q_BLNH = torch.cat((q_rot_BLNR, q_pass_BLNP), dim=-1)
         k_BLH = torch.cat((k_rot_BL1R, k_pass_BL1P), dim=-1).squeeze(2)
 
-        scores_BNLL = torch.matmul(
-            q_BLNH.float().transpose(1, 2),
-            k_BLH.float().transpose(1, 2).unsqueeze(1),
-        ) * self.softmax_scale
+        scores_BNLL = (
+            torch.matmul(
+                q_BLNH.float().transpose(1, 2),
+                k_BLH.float().transpose(1, 2).unsqueeze(1),
+            )
+            * self.softmax_scale
+        )
         scores_BNLL = F.relu(scores_BNLL)
         weights_BLN = self.weights_proj(
             hidden_states_BLD.to(self.weights_proj.weight.dtype)
@@ -104,7 +105,4 @@ class Glm5DsaIndexer(Module):
                 key_positions_11L > positions_BL.unsqueeze(-1), float("-inf")
             )
         topk = min(self.index_topk, index_scores_BLL.shape[-1])
-        topk_indices_BLK = index_scores_BLL.topk(topk, dim=-1).indices
-        return torch.minimum(topk_indices_BLK, positions_BL.unsqueeze(-1)).to(
-            torch.int32
-        )
+        return index_scores_BLL.topk(topk, dim=-1).indices.to(torch.int32)
