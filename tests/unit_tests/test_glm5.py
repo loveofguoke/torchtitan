@@ -5,12 +5,13 @@
 # LICENSE file in the root directory of this source tree.
 
 import unittest
+from unittest import mock
 
 import torch
 import torch.nn.functional as F
 
-from torchtitan.models.common import ComplexRoPE, LayerNorm, Linear
-from torchtitan.models.glm5.model import Glm5DsaIndexer
+from torchtitan.models.common import ComplexRoPE, FlexAttention, LayerNorm, Linear
+from torchtitan.models.glm5.model import Glm5Attention, Glm5DsaIndexer
 
 
 def _indexer_config() -> Glm5DsaIndexer.Config:
@@ -26,6 +27,129 @@ def _indexer_config() -> Glm5DsaIndexer.Config:
         k_norm=LayerNorm.Config(normalized_shape=8),
         weights_proj=Linear.Config(in_features=16, out_features=2),
         rope=ComplexRoPE.Config(dim=4, max_seq_len=8, theta=1_000_000),
+    )
+
+
+def _attention_config() -> Glm5Attention.Config:
+    return Glm5Attention.Config(
+        dim=16,
+        n_heads=2,
+        q_lora_rank=8,
+        kv_lora_rank=4,
+        qk_nope_head_dim=4,
+        qk_rope_head_dim=4,
+        v_head_dim=4,
+        attention_dropout=0.0,
+        wq_a=Linear.Config(in_features=16, out_features=8),
+        q_norm=LayerNorm.Config(normalized_shape=8),
+        wq_b=Linear.Config(in_features=8, out_features=16),
+        wkv_a=Linear.Config(in_features=16, out_features=8),
+        kv_norm=LayerNorm.Config(normalized_shape=4),
+        wkv_b=Linear.Config(in_features=4, out_features=16),
+        wo=Linear.Config(in_features=8, out_features=16),
+        rope=ComplexRoPE.Config(dim=4, max_seq_len=8, theta=1_000_000),
+        indexer=_indexer_config(),
+        inner_attention=FlexAttention.Config(),
+    )
+
+
+def _dense_causal_mask(
+    positions_BL: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    B, L = positions_BL.shape
+    key_positions_11L = torch.arange(L, device=positions_BL.device)[None, None, :]
+    return torch.zeros(B, 1, L, L, dtype=dtype, device=positions_BL.device).masked_fill(
+        key_positions_11L > positions_BL.unsqueeze(-1).unsqueeze(1),
+        float("-inf"),
+    )
+
+
+def _reference_sparse_attention(
+    attention: Glm5Attention,
+    x_BLD: torch.Tensor,
+    attention_masks_B1LL: torch.Tensor,
+    positions_BL: torch.Tensor,
+    topk_indices_BLK: torch.Tensor,
+) -> torch.Tensor:
+    B, L, _ = x_BLD.shape
+    q_resid_BLR = F.layer_norm(
+        F.linear(x_BLD, attention.wq_a.weight, attention.wq_a.bias),
+        attention.q_norm.normalized_shape,
+        attention.q_norm.weight,
+        attention.q_norm.bias,
+        attention.q_norm.eps,
+    )
+    q_BLNH = F.linear(q_resid_BLR, attention.wq_b.weight, attention.wq_b.bias).view(
+        B, L, attention.n_heads, attention.qk_head_dim
+    )
+    q_nope_BLNP, q_rope_BLNR = torch.split(
+        q_BLNH,
+        [attention.qk_nope_head_dim, attention.qk_rope_head_dim],
+        dim=-1,
+    )
+    compressed_kv_BLC = F.linear(
+        x_BLD, attention.wkv_a.weight, attention.wkv_a.bias
+    )
+    kv_BLR, k_rope_BL1R = torch.split(
+        compressed_kv_BLC,
+        [attention.kv_lora_rank, attention.qk_rope_head_dim],
+        dim=-1,
+    )
+    kv_BLR = F.layer_norm(
+        kv_BLR,
+        attention.kv_norm.normalized_shape,
+        attention.kv_norm.weight,
+        attention.kv_norm.bias,
+        attention.kv_norm.eps,
+    )
+    k_rope_BL1R = k_rope_BL1R.unsqueeze(2)
+    rope_cache_BL1R2 = attention.rope.cache[positions_BL].unsqueeze(2)
+    q_rope_complex_BLNR2 = torch.view_as_complex(
+        q_rope_BLNR.float().reshape(B, L, attention.n_heads, -1, 2)
+    )
+    k_rope_complex_BL1R2 = torch.view_as_complex(
+        k_rope_BL1R.float().reshape(B, L, 1, -1, 2)
+    )
+    q_rope_BLNR = (
+        torch.view_as_real(q_rope_complex_BLNR2 * rope_cache_BL1R2)
+        .flatten(3)
+        .type_as(q_rope_BLNR)
+    )
+    k_rope_BL1R = (
+        torch.view_as_real(k_rope_complex_BL1R2 * rope_cache_BL1R2)
+        .flatten(3)
+        .type_as(k_rope_BL1R)
+    )
+    q_BLNH = torch.cat((q_nope_BLNP, q_rope_BLNR), dim=-1)
+    kv_BLNX = F.linear(kv_BLR, attention.wkv_b.weight, attention.wkv_b.bias).view(
+        B,
+        L,
+        attention.n_heads,
+        attention.qk_nope_head_dim + attention.v_head_dim,
+    )
+    k_nope_BLNP, v_BLNV = torch.split(
+        kv_BLNX, [attention.qk_nope_head_dim, attention.v_head_dim], dim=-1
+    )
+    k_BLNH = torch.cat(
+        (k_nope_BLNP, k_rope_BL1R.expand(-1, -1, attention.n_heads, -1)),
+        dim=-1,
+    )
+    selected_BLL = torch.zeros(B, L, L, dtype=torch.bool, device=x_BLD.device).scatter(
+        -1, topk_indices_BLK.long(), True
+    )
+    sparse_mask_B1LL = attention_masks_B1LL.masked_fill(
+        ~selected_BLL.unsqueeze(1), torch.finfo(x_BLD.dtype).min
+    )
+    scores_BNLL = torch.matmul(
+        q_BLNH.transpose(1, 2), k_BLNH.transpose(1, 2).transpose(-1, -2)
+    ) * attention.softmax_scale
+    scores_BNLL = scores_BNLL + sparse_mask_B1LL
+    probs_BNLL = F.softmax(scores_BNLL, dim=-1, dtype=torch.float32).to(q_BLNH.dtype)
+    output_BLNV = torch.matmul(probs_BNLL, v_BLNV.transpose(1, 2)).transpose(1, 2)
+    return F.linear(
+        output_BLNV.contiguous().view(B, L, -1), attention.wo.weight, attention.wo.bias
     )
 
 
@@ -183,3 +307,44 @@ class TestGlm5DsaIndexer(unittest.TestCase):
             torch.zeros(1, 4, 4, dtype=torch.bfloat16),
         )
         self.assertFalse(out_BLK.requires_grad)
+
+
+class TestGlm5Attention(unittest.TestCase):
+    def test_attention_topk_cannot_reopen_causal_mask(self):
+        attention = _attention_config().build()
+        attention.init_states()
+        x_BLD = torch.randn(1, 4, 16)
+        positions_BL = torch.arange(4).unsqueeze(0)
+        base_mask_B1LL = _dense_causal_mask(positions_BL, dtype=x_BLD.dtype)
+        future_selecting_topk_BLK = torch.tensor(
+            [[[3, 2], [3, 2], [3, 2], [3, 2]]], dtype=torch.int32
+        )
+        with mock.patch.object(
+            attention.indexer,
+            "forward",
+            return_value=future_selecting_topk_BLK,
+        ):
+            actual_BLD = attention(x_BLD, base_mask_B1LL, positions_BL)
+        expected_BLD = _reference_sparse_attention(
+            attention,
+            x_BLD,
+            base_mask_B1LL,
+            positions_BL,
+            future_selecting_topk_BLK,
+        )
+        torch.testing.assert_close(actual_BLD, expected_BLD, rtol=1e-5, atol=1e-6)
+
+    def test_attention_output_shape_and_backward(self):
+        attention = _attention_config().build()
+        attention.init_states()
+        x_BLD = torch.randn(2, 5, 16, requires_grad=True)
+        positions_BL = torch.arange(5).expand(2, -1)
+        mask_B1LL = _dense_causal_mask(positions_BL, dtype=x_BLD.dtype)
+        output_BLD = attention(x_BLD, mask_B1LL, positions_BL)
+        self.assertEqual(output_BLD.shape, x_BLD.shape)
+        output_BLD.square().mean().backward()
+        self.assertIsNotNone(attention.wq_a.weight.grad)
+        self.assertIsNotNone(attention.wo.weight.grad)
+        self.assertTrue(
+            all(parameter.grad is None for parameter in attention.indexer.parameters())
+        )

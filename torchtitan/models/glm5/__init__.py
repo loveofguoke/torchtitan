@@ -4,6 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from .model import Glm5DsaIndexer
+from .model import Glm5Attention, Glm5DsaIndexer
 
-__all__ = ["Glm5DsaIndexer"]
+__all__ = ["Glm5Attention", "Glm5DsaIndexer"]
