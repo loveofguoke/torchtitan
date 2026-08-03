@@ -18,7 +18,7 @@ from torchtitan.models.common import (
     Linear,
     RMSNorm,
 )
-from torchtitan.models.glm5 import glm5_configs
+from torchtitan.models.glm5 import build_glm5_layers, glm5_configs
 from torchtitan.models.glm5.model import (
     Glm5Attention,
     Glm5DsaIndexer,
@@ -71,6 +71,40 @@ def _build_debug_model() -> Glm5Model:
     model.init_states()
     model.eval()
     return model
+
+
+def _debug_layer_kwargs() -> dict:
+    config = glm5_configs["debugmodel"]()
+    attention = config.layers[0].attention
+    moe = config.layers[1].moe
+    assert moe is not None
+    return {
+        "n_layers": len(config.layers),
+        "n_dense_layers": 1,
+        "dim": config.dim,
+        "n_heads": attention.n_heads,
+        "q_lora_rank": attention.q_lora_rank,
+        "kv_lora_rank": attention.kv_lora_rank,
+        "qk_nope_head_dim": attention.qk_nope_head_dim,
+        "qk_rope_head_dim": attention.qk_rope_head_dim,
+        "v_head_dim": attention.v_head_dim,
+        "dense_hidden_dim": config.layers[0].feed_forward.w1.out_features,
+        "moe_hidden_dim": moe.routed_experts.inner_experts.hidden_dim,
+        "num_experts": moe.num_experts,
+        "num_shared_experts": (
+            moe.shared_experts.w1.out_features
+            // moe.routed_experts.inner_experts.hidden_dim
+        ),
+        "router_top_k": moe.router.top_k,
+        "router_num_expert_groups": moe.router.num_expert_groups,
+        "router_num_limited_groups": moe.router.num_limited_groups,
+        "router_route_scale": moe.router.route_scale,
+        "index_n_heads": attention.indexer.n_heads,
+        "index_head_dim": attention.indexer.head_dim,
+        "index_topk": attention.indexer.index_topk,
+        "attention_dropout": attention.attention_dropout,
+        "rope": attention.rope,
+    }
 
 
 def _dense_causal_mask(
@@ -422,6 +456,21 @@ class TestGlm5Attention(unittest.TestCase):
 
 
 class TestGlm5Model(unittest.TestCase):
+    def test_layer_builder_rejects_infeasible_grouped_routing(self):
+        kwargs = _debug_layer_kwargs()
+        invalid_groupings = (
+            {
+                "router_num_expert_groups": 4,
+                "router_num_limited_groups": 1,
+                "router_top_k": 3,
+            },
+            {"router_num_expert_groups": 8},
+        )
+        for overrides in invalid_groupings:
+            with self.subTest(overrides=overrides):
+                with self.assertRaisesRegex(ValueError, "experts_per_group|top_k"):
+                    build_glm5_layers(**(kwargs | overrides))
+
     def test_debug_model_config_has_approved_architecture(self):
         config = glm5_configs["debugmodel"]()
 
@@ -442,6 +491,7 @@ class TestGlm5Model(unittest.TestCase):
             self.assertEqual(attention.attention_dropout, 0.0)
             self.assertEqual(attention.rope.max_seq_len, 128)
             self.assertEqual(attention.rope.theta, 1_000_000)
+            self.assertEqual(attention.rope.scaling, "none")
             self.assertEqual(attention.q_norm.eps, 1e-6)
             self.assertEqual(attention.kv_norm.eps, 1e-6)
             self.assertEqual(attention.indexer.n_heads, 4)
@@ -458,6 +508,8 @@ class TestGlm5Model(unittest.TestCase):
                 self.assertIsNotNone(layer_config.moe)
                 self.assertEqual(layer_config.moe.num_experts, 8)
                 self.assertEqual(layer_config.moe.router.top_k, 2)
+                self.assertEqual(layer_config.moe.router.num_expert_groups, 1)
+                self.assertEqual(layer_config.moe.router.num_limited_groups, 1)
                 self.assertEqual(layer_config.moe.router.score_func, "sigmoid")
                 self.assertEqual(layer_config.moe.router.route_scale, 2.5)
                 self.assertTrue(layer_config.moe.router.route_norm)

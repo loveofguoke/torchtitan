@@ -192,12 +192,17 @@ def build_glm5_layers(
         raise ValueError("router_num_expert_groups must be > 0.")
     if num_experts % router_num_expert_groups != 0:
         raise ValueError("num_experts must divide evenly into router expert groups.")
+    experts_per_group = num_experts // router_num_expert_groups
+    if experts_per_group < 2:
+        raise ValueError("experts_per_group must be >= 2.")
     if not 0 < router_num_limited_groups <= router_num_expert_groups:
         raise ValueError(
             "router_num_limited_groups must be in [1, router_num_expert_groups]."
         )
     if not 0 < router_top_k <= num_experts:
         raise ValueError("router_top_k must be in [1, num_experts].")
+    if router_top_k > experts_per_group * router_num_limited_groups:
+        raise ValueError("router_top_k exceeds the experts in limited groups.")
 
     layers: list[TransformerBlock.Config] = []
     for layer_id in range(n_layers):
