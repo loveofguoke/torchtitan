@@ -18,7 +18,7 @@ from torchtitan.models.common import (
     Linear,
     RMSNorm,
 )
-from torchtitan.models.glm5 import build_glm5_layers, glm5_configs
+from torchtitan.models.glm5 import build_glm5_layers, glm5_configs, Glm5StateDictAdapter
 from torchtitan.models.glm5.model import (
     Glm5Attention,
     Glm5DsaIndexer,
@@ -538,3 +538,114 @@ class TestGlm5Model(unittest.TestCase):
         logits_BLV = model(tokens_BL, positions=positions_BL)
 
         self.assertEqual(logits_BLV.shape, (2, 12, 2048))
+
+
+class TestGlm5StateDictAdapter(unittest.TestCase):
+    def _adapter(self) -> Glm5StateDictAdapter:
+        return Glm5StateDictAdapter(glm5_configs["debugmodel"](), hf_assets_path=None)
+
+    def test_fused_expert_gate_up_order(self):
+        adapter = self._adapter()
+        E, F, D = 8, 256, 256
+        gate_EFD = torch.arange(E * F * D).reshape(E, F, D)
+        up_EFD = gate_EFD + gate_EFD.numel()
+        down_EDF = torch.arange(E * D * F).reshape(E, D, F)
+        hf_state = {
+            "model.layers.1.mlp.experts.gate_up_proj": torch.cat(
+                (gate_EFD, up_EFD), dim=1
+            ),
+            "model.layers.1.mlp.experts.down_proj": down_EDF,
+        }
+
+        titan_state = adapter.from_hf(hf_state)
+
+        self.assertTrue(
+            torch.equal(
+                titan_state["layers.1.moe.routed_experts.inner_experts.w1_EFD"],
+                gate_EFD,
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                titan_state["layers.1.moe.routed_experts.inner_experts.w3_EFD"],
+                up_EFD,
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                titan_state["layers.1.moe.routed_experts.inner_experts.w2_EDF"],
+                down_EDF,
+            )
+        )
+
+    def test_direct_indexer_and_fp32_expert_bias_mappings(self):
+        adapter = self._adapter()
+        indexer_wq_b = torch.randn(256, 128)
+        indexer_wk = torch.randn(64, 256)
+        indexer_norm_weight = torch.randn(64)
+        indexer_norm_bias = torch.randn(64)
+        indexer_weights_proj = torch.randn(4, 256)
+        expert_bias = torch.randn(8, dtype=torch.float32)
+
+        titan_state = adapter.from_hf(
+            {
+                "model.layers.1.self_attn.indexer.wq_b.weight": indexer_wq_b,
+                "model.layers.1.self_attn.indexer.wk.weight": indexer_wk,
+                "model.layers.1.self_attn.indexer.k_norm.weight": indexer_norm_weight,
+                "model.layers.1.self_attn.indexer.k_norm.bias": indexer_norm_bias,
+                "model.layers.1.self_attn.indexer.weights_proj.weight": indexer_weights_proj,
+                "model.layers.1.mlp.gate.e_score_correction_bias": expert_bias,
+            }
+        )
+
+        expected_indexer = {
+            "layers.1.attention.indexer.wq_b.weight": indexer_wq_b,
+            "layers.1.attention.indexer.wk.weight": indexer_wk,
+            "layers.1.attention.indexer.k_norm.weight": indexer_norm_weight,
+            "layers.1.attention.indexer.k_norm.bias": indexer_norm_bias,
+            "layers.1.attention.indexer.weights_proj.weight": indexer_weights_proj,
+        }
+        for titan_key, hf_value in expected_indexer.items():
+            self.assertIs(titan_state[titan_key], hf_value)
+        self.assertEqual(titan_state["layers.1.moe.expert_bias_E"].dtype, torch.float32)
+        self.assertTrue(
+            torch.equal(titan_state["layers.1.moe.expert_bias_E"], expert_bias)
+        )
+
+    def test_full_state_dict_roundtrip(self):
+        config = glm5_configs["debugmodel"]()
+        model = config.build()
+        model.init_states()
+        adapter = Glm5StateDictAdapter(config, hf_assets_path=None)
+        original = model.state_dict()
+
+        restored = adapter.from_hf(adapter.to_hf(original))
+
+        self.assertEqual(set(restored), set(original))
+        for key in original:
+            self.assertTrue(torch.equal(restored[key], original[key]), key)
+
+    def test_unknown_hf_key_is_rejected(self):
+        with self.assertRaisesRegex(KeyError, "unmapped HF key"):
+            self._adapter().from_hf({"model.layers.0.unexpected.weight": torch.ones(1)})
+
+    def test_only_next_mtp_layer_namespace_is_warned_and_skipped(self):
+        with self.assertWarnsRegex(UserWarning, "MTP"):
+            titan_state = self._adapter().from_hf(
+                {"model.layers.4.some_mtp_weight": torch.ones(1)}
+            )
+        self.assertEqual(titan_state, {})
+
+    def test_later_layer_namespace_is_rejected(self):
+        with self.assertRaisesRegex(KeyError, "unmapped HF key"):
+            self._adapter().from_hf({"model.layers.5.some_mtp_weight": torch.ones(1)})
+
+    def test_to_hf_rejects_incomplete_fused_expert_mapping(self):
+        with self.assertRaisesRegex(KeyError, "incomplete"):
+            self._adapter().to_hf(
+                {
+                    "layers.1.moe.routed_experts.inner_experts.w1_EFD": torch.ones(
+                        8, 256, 256
+                    )
+                }
+            )

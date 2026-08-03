@@ -28,11 +28,13 @@ from torchtitan.models.common.config_utils import (
 from torchtitan.models.common.param_init import depth_scaled_std
 
 from .model import Glm5Attention, Glm5DsaIndexer, Glm5Model, Glm5TransformerBlock
+from .state_dict_adapter import Glm5StateDictAdapter
 
 __all__ = [
     "Glm5Attention",
     "Glm5DsaIndexer",
     "Glm5Model",
+    "Glm5StateDictAdapter",
     "Glm5TransformerBlock",
     "build_glm5_layers",
     "glm5_configs",
