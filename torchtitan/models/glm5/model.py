@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 
 import torch
 import torch.nn.functional as F
+from torch import nn
 
 from torchtitan.models.common import (
     ComplexRoPE,
@@ -17,6 +18,8 @@ from torchtitan.models.common import (
     RMSNorm,
 )
 from torchtitan.models.common.attention import BaseAttention
+from torchtitan.models.common.decoder import Decoder, TransformerBlock
+from torchtitan.models.utils import get_moe_model_nparams_and_flops
 from torchtitan.protocols.module import Module
 
 
@@ -196,7 +199,6 @@ class Glm5Attention(BaseAttention):
             if (
                 self.indexer.dim != self.dim
                 or self.indexer.q_lora_rank != self.q_lora_rank
-                or self.indexer.n_heads != self.n_heads
                 or self.indexer.head_dim != self.qk_head_dim
                 or self.indexer.qk_rope_head_dim != self.qk_rope_head_dim
             ):
@@ -302,3 +304,110 @@ class Glm5Attention(BaseAttention):
         )
         output_BLNV = torch.matmul(probs_BNLL, v_BLNV.transpose(1, 2)).transpose(1, 2)
         return self.wo(output_BLNV.contiguous().view(B, L, -1))
+
+
+class Glm5TransformerBlock(TransformerBlock):
+    """GLM-5 decoder block with either a dense FFN or common MoE."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(TransformerBlock.Config):
+        pass
+
+    def __init__(self, config: Config):
+        super().__init__()
+        self.attention = config.attention.build()
+        self.attention_norm = config.attention_norm.build()
+        self.ffn_norm = config.ffn_norm.build()
+        self.moe_enabled = config.moe is not None
+        if self.moe_enabled:
+            assert config.moe is not None
+            self.moe = config.moe.build()
+        else:
+            assert config.feed_forward is not None
+            self.feed_forward = config.feed_forward.build()
+
+    def forward(
+        self,
+        x_BLD: torch.Tensor,
+        attention_masks: torch.Tensor,
+        positions: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        x_BLD = x_BLD + self.attention(
+            self.attention_norm(x_BLD), attention_masks, positions
+        )
+        normalized_BLD = self.ffn_norm(x_BLD)
+        ffn_output_BLD = (
+            self.moe(normalized_BLD)
+            if self.moe_enabled
+            else self.feed_forward(normalized_BLD)
+        )
+        return x_BLD + ffn_output_BLD
+
+
+class Glm5Model(Decoder):
+    """Single-device GLM-5 debug decoder with dense DSA-safe masks."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Decoder.Config):
+        dim: int = 256
+        vocab_size: int = 2048
+
+        def update_from_config(self, *, config, **kwargs) -> None:
+            # This import is deliberately local: Task 5 supplies the runtime
+            # validation module, while config construction remains usable now.
+            from torchtitan.models.glm5.parallelize import validate_glm5_parallelism
+
+            validate_glm5_parallelism(config.parallelism)
+            Decoder.Config.update_from_config(self, config=config, **kwargs)
+
+        def get_nparams_and_flops(
+            self, model: nn.Module, seq_len: int
+        ) -> tuple[int, int]:
+            attention = self.layers[0].attention
+            assert isinstance(attention, Glm5Attention.Config)
+            nparams, base_flops = get_moe_model_nparams_and_flops(
+                self,
+                model,
+                attention.n_heads,
+                attention.qk_head_dim + attention.v_head_dim,
+                seq_len,
+            )
+            dsa_flops = (
+                2
+                * len(self.layers)
+                * attention.indexer.n_heads
+                * attention.indexer.head_dim
+                * seq_len
+            )
+            return nparams, base_flops + dsa_flops
+
+    def get_attention_masks(self, positions_BL: torch.Tensor) -> torch.Tensor:
+        B, L = positions_BL.shape
+        token_dtype = self.tok_embeddings.weight.dtype
+        document_ids_BL = (positions_BL == 0).cumsum(dim=1)
+        sequence_indices_L = torch.arange(L, device=positions_BL.device)
+        causal_BLL = (
+            sequence_indices_L[None, :, None] >= sequence_indices_L[None, None, :]
+        )
+        same_document_BLL = document_ids_BL.unsqueeze(-1) == document_ids_BL.unsqueeze(
+            -2
+        )
+        allowed_BLL = causal_BLL & same_document_BLL
+        return torch.zeros(
+            B, 1, L, L, dtype=token_dtype, device=positions_BL.device
+        ).masked_fill(~allowed_BLL.unsqueeze(1), torch.finfo(token_dtype).min)
+
+    def forward(
+        self,
+        tokens_BL: torch.Tensor,
+        positions: torch.Tensor | None = None,
+        attention_masks: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        B, L = tokens_BL.shape[:2]
+        if positions is None:
+            positions = torch.arange(
+                tokens_BL.shape[1], device=tokens_BL.device
+            ).expand(B, -1)
+        if attention_masks is None:
+            attention_masks = self.get_attention_masks(positions)
+        return super().forward(tokens_BL, positions, attention_masks)

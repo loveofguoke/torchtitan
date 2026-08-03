@@ -18,7 +18,13 @@ from torchtitan.models.common import (
     Linear,
     RMSNorm,
 )
-from torchtitan.models.glm5.model import Glm5Attention, Glm5DsaIndexer
+from torchtitan.models.glm5 import glm5_configs
+from torchtitan.models.glm5.model import (
+    Glm5Attention,
+    Glm5DsaIndexer,
+    Glm5Model,
+    Glm5TransformerBlock,
+)
 
 
 def _indexer_config() -> Glm5DsaIndexer.Config:
@@ -58,6 +64,13 @@ def _attention_config() -> Glm5Attention.Config:
         indexer=_indexer_config(),
         inner_attention=FlexAttention.Config(),
     )
+
+
+def _build_debug_model() -> Glm5Model:
+    model = glm5_configs["debugmodel"]().build()
+    model.init_states()
+    model.eval()
+    return model
 
 
 def _dense_causal_mask(
@@ -406,3 +419,70 @@ class TestGlm5Attention(unittest.TestCase):
                 rope=dataclasses.replace(config.rope, dim=0),
                 indexer=zero_rope_indexer,
             )
+
+
+class TestGlm5Model(unittest.TestCase):
+    def test_debug_model_config_has_approved_architecture(self):
+        config = glm5_configs["debugmodel"]()
+
+        self.assertEqual(config.vocab_size, 2048)
+        self.assertEqual(config.dim, 256)
+        self.assertEqual(len(config.layers), 4)
+        self.assertEqual(config.max_seq_len, 128)
+        self.assertEqual(config.norm.eps, 1e-5)
+        for layer_id, layer_config in enumerate(config.layers):
+            self.assertIsInstance(layer_config, Glm5TransformerBlock.Config)
+            attention = layer_config.attention
+            self.assertEqual(attention.n_heads, 8)
+            self.assertEqual(attention.q_lora_rank, 128)
+            self.assertEqual(attention.kv_lora_rank, 64)
+            self.assertEqual(attention.qk_nope_head_dim, 32)
+            self.assertEqual(attention.qk_rope_head_dim, 32)
+            self.assertEqual(attention.v_head_dim, 64)
+            self.assertEqual(attention.attention_dropout, 0.0)
+            self.assertEqual(attention.rope.max_seq_len, 128)
+            self.assertEqual(attention.rope.theta, 1_000_000)
+            self.assertEqual(attention.q_norm.eps, 1e-6)
+            self.assertEqual(attention.kv_norm.eps, 1e-6)
+            self.assertEqual(attention.indexer.n_heads, 4)
+            self.assertEqual(attention.indexer.head_dim, 64)
+            self.assertEqual(attention.indexer.index_topk, 8)
+            self.assertEqual(attention.indexer.k_norm.eps, 1e-6)
+            self.assertIsNotNone(attention.indexer)
+            if layer_id == 0:
+                self.assertIsNotNone(layer_config.feed_forward)
+                self.assertIsNone(layer_config.moe)
+                self.assertEqual(layer_config.feed_forward.w1.out_features, 1024)
+            else:
+                self.assertIsNone(layer_config.feed_forward)
+                self.assertIsNotNone(layer_config.moe)
+                self.assertEqual(layer_config.moe.num_experts, 8)
+                self.assertEqual(layer_config.moe.router.top_k, 2)
+                self.assertEqual(layer_config.moe.router.score_func, "sigmoid")
+                self.assertEqual(layer_config.moe.router.route_scale, 2.5)
+                self.assertTrue(layer_config.moe.router.route_norm)
+                self.assertEqual(
+                    layer_config.moe.routed_experts.inner_experts.hidden_dim, 256
+                )
+                self.assertEqual(layer_config.moe.shared_experts.w1.out_features, 256)
+
+    def test_dense_mask_enforces_causality_and_document_boundaries(self):
+        model = _build_debug_model()
+        positions_BL = torch.tensor([[0, 1, 2, 0, 1]], dtype=torch.long)
+
+        mask_B1LL = model.get_attention_masks(positions_BL)
+
+        min_value = torch.finfo(mask_B1LL.dtype).min
+        self.assertEqual(mask_B1LL.shape, (1, 1, 5, 5))
+        self.assertEqual(mask_B1LL[0, 0, 4, 3].item(), 0.0)
+        self.assertEqual(mask_B1LL[0, 0, 4, 1].item(), min_value)
+        self.assertEqual(mask_B1LL[0, 0, 1, 2].item(), min_value)
+
+    def test_debug_model_forward_shape(self):
+        model = _build_debug_model()
+        tokens_BL = torch.randint(0, 2048, (2, 12))
+        positions_BL = torch.arange(12).expand(2, -1)
+
+        logits_BLV = model(tokens_BL, positions=positions_BL)
+
+        self.assertEqual(logits_BLV.shape, (2, 12, 2048))
