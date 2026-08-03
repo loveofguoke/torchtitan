@@ -26,6 +26,9 @@ from torchtitan.protocols.module import Module
 class Linear(nn.Linear, Module):
     """Configurable nn.Linear."""
 
+    supports_compute_dtype = True
+    """Whether ``forward`` honors the explicit ``compute_dtype`` contract."""
+
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
         in_features: int

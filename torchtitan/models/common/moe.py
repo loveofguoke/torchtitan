@@ -207,6 +207,13 @@ class TokenChoiceTopKRouter(Module):
     def __init__(self, config: Config):
         super().__init__()
         self.gate = config.gate.build()
+        if not type(self.gate).__dict__.get("supports_compute_dtype", False):
+            raise ValueError(
+                f"TokenChoiceTopKRouter gate {type(self.gate).__name__} must support "
+                "explicit compute_dtype for stable FP32 routing. Exclude the gate "
+                "from this Linear replacement or implement and declare "
+                "supports_compute_dtype."
+            )
         self.num_experts = config.num_experts
         self.num_expert_groups = config.num_expert_groups
         self.num_limited_groups = config.num_limited_groups

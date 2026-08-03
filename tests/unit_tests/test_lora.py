@@ -8,11 +8,13 @@ from dataclasses import dataclass
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from torchtitan.components.lora import _get_lora_cls, LoRAConverter
 from torchtitan.components.quantization import Float8LinearConverter
 from torchtitan.models.common.attention import FlexAttention
-from torchtitan.models.common.linear import Linear
+from torchtitan.models.common.linear import Linear, ScaledBiasRowwiseLinear
+from torchtitan.models.common.moe import TokenChoiceTopKRouter
 from torchtitan.models.llama3 import model_registry
 from torchtitan.models.utils import validate_converter_order
 from torchtitan.protocols.module import Module
@@ -77,6 +79,97 @@ def test_lora_forward():
     with torch.no_grad():
         output = model(tokens, attention_masks=attention_masks, positions=positions)
     assert output.shape == (batch_size, seq_len, vocab_size)
+
+
+def _build_lora_router() -> TokenChoiceTopKRouter:
+    router_config = TokenChoiceTopKRouter.Config(
+        num_experts=4,
+        gate=Linear.Config(in_features=3, out_features=4, bias=True),
+        top_k=2,
+        score_func="sigmoid",
+    )
+    converted_config = LoRAConverter(
+        LoRAConverter.Config(rank=2, alpha=4.0, target_modules=["gate"])
+    ).convert(router_config)
+    router = converted_config.build()
+    router.bfloat16()
+    with torch.no_grad():
+        router.gate.lora_a.weight.fill_(0.25)
+        router.gate.lora_b.weight.fill_(0.5)
+    return router
+
+
+def _lora_router_reference(
+    router: TokenChoiceTopKRouter, inputs: torch.Tensor
+) -> torch.Tensor:
+    gate = router.gate
+    base_output = F.linear(inputs.float(), gate.weight.float(), gate.bias.float())
+    adapter_output = F.linear(
+        F.linear(inputs.float(), gate.lora_a.weight.float()),
+        gate.lora_b.weight.float(),
+    )
+    return torch.sigmoid(base_output + 2.0 * adapter_output)
+
+
+def test_lora_router_preserves_fp32_compute_contract_and_module_hooks():
+    """A LoRA gate must retain FP32 router logits, hooks, bias, and gradients."""
+    router = _build_lora_router()
+    inputs = torch.randn(1, 2, 3, dtype=torch.bfloat16)
+    gate_call_count = 0
+
+    def count_gate_calls(*_args) -> None:
+        nonlocal gate_call_count
+        gate_call_count += 1
+
+    hook = router.gate.register_forward_hook(count_gate_calls)
+    try:
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            _, _, scores = router(inputs)
+    finally:
+        hook.remove()
+
+    expected_scores = _lora_router_reference(router, inputs)
+    assert gate_call_count == 1
+    assert scores.dtype == torch.float32
+    torch.testing.assert_close(scores, expected_scores, rtol=0, atol=0)
+
+    scores.sum().backward()
+    assert router.gate.weight.grad is None
+    assert router.gate.bias.grad is None
+    assert router.gate.lora_a.weight.grad is not None
+    assert router.gate.lora_b.weight.grad is not None
+
+
+def test_lora_router_fp32_compute_contract_compiles():
+    """The LoRA router's explicit FP32 path must remain graph-capturable."""
+    router = _build_lora_router()
+    inputs = torch.randn(1, 2, 3, dtype=torch.bfloat16)
+    expected_scores = _lora_router_reference(router, inputs)
+    compiled_router = torch.compile(router, backend="eager", fullgraph=True)
+
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        _, _, scores = compiled_router(inputs)
+
+    assert scores.dtype == torch.float32
+    torch.testing.assert_close(scores, expected_scores, rtol=0, atol=0)
+
+
+def test_lora_rejects_explicit_compute_dtype_for_incompatible_parent():
+    """A LoRA router must reject a parent that lacks the precision contract."""
+    lora_cls = _get_lora_cls(ScaledBiasRowwiseLinear)
+    router_config = TokenChoiceTopKRouter.Config(
+        num_experts=4,
+        gate=lora_cls.Config(
+            in_features=3,
+            out_features=4,
+            bias=True,
+            rank=2,
+            alpha=4.0,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="must support explicit compute_dtype"):
+        router_config.build()
 
 
 def test_validate_converter_order():
