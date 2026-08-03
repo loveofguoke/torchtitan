@@ -103,15 +103,23 @@ parameters.
 
 ## Roadmap
 
-The approved staged path is:
+Before beginning these later stages, run the recorded CUDA parity suite on a
+one-GPU CUDA host. It remains the numerical acceptance gate for this milestone
+and is currently pending because this host has no CUDA device.
 
-1. Run the recorded CUDA parity suite on a one-GPU CUDA host and retain it as
-   the numerical acceptance gate.
-2. Replace the eager quadratic DSA backend with an appropriate Flash-MLA or
-   specialized DSA implementation, with independent performance and numerical
-   validation.
-3. Add KV cache and incremental decoding semantics.
-4. Add shared/cross-layer indexer behavior, MTP, and any separately designed
-   auxiliary indexer objective.
-5. Design and validate TP, CP, PP, EP, FSDP, and HSDP support before enabling
-   distributed execution.
+After the single-device correctness milestone, later work may add:
+
+1. FSDP and expert parallelism for reduced-model distributed training.
+2. Tensor parallelism with distributed index-head reduction and replicated
+   global top-k indices.
+3. Context and pipeline parallelism and, when needed, cross-layer top-k
+   transfer.
+4. A production index-aware DSA or Flash-MLA kernel for long sequences.
+5. KV cache and incremental decoding.
+6. Cross-layer IndexCache and shared-indexer patterns.
+7. MTP layers and released-checkpoint coverage.
+8. An explicit auxiliary or distillation objective for training indexers from
+   random initialization.
+
+Each stage requires its own correctness and numerical-validation design; none
+is implied by the debug milestone.
