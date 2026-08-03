@@ -147,6 +147,8 @@ class Glm5Attention(BaseAttention):
                 raise ValueError("GLM-5 MLA requires kv_lora_rank > 0.")
             if self.qk_nope_head_dim <= 0:
                 raise ValueError("GLM-5 MLA requires qk_nope_head_dim > 0.")
+            if self.qk_rope_head_dim <= 0:
+                raise ValueError("GLM-5 MLA requires qk_rope_head_dim > 0.")
             if self.qk_rope_head_dim % 2 != 0:
                 raise ValueError("GLM-5 MLA requires an even qk_rope_head_dim.")
             if self.qk_head_dim <= 0:

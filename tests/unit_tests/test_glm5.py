@@ -378,10 +378,31 @@ class TestGlm5Attention(unittest.TestCase):
         invalid_configs = {
             "kv_lora_rank": ({"kv_lora_rank": 0}, "kv_lora_rank"),
             "qk_nope_head_dim": ({"qk_nope_head_dim": 0}, "qk_nope_head_dim"),
-            "qk_head_dim": ({"qk_rope_head_dim": -4}, "qk_head_dim"),
+            "qk_rope_head_dim": ({"qk_rope_head_dim": -4}, "qk_rope_head_dim"),
             "v_head_dim": ({"v_head_dim": 0}, "v_head_dim"),
         }
         for case, (changes, message) in invalid_configs.items():
             with self.subTest(case=case):
                 with self.assertRaisesRegex(ValueError, message):
                     dataclasses.replace(_attention_config(), **changes)
+
+    def test_attention_config_rejects_dimension_consistent_zero_rope(self):
+        config = _attention_config()
+        zero_rope_indexer = dataclasses.replace(
+            config.indexer,
+            head_dim=4,
+            qk_rope_head_dim=0,
+            wq_b=Linear.Config(in_features=8, out_features=8),
+            wk=Linear.Config(in_features=16, out_features=4),
+            k_norm=LayerNorm.Config(normalized_shape=4),
+            rope=dataclasses.replace(config.indexer.rope, dim=0),
+        )
+        with self.assertRaisesRegex(ValueError, "qk_rope_head_dim"):
+            dataclasses.replace(
+                config,
+                qk_rope_head_dim=0,
+                wq_b=Linear.Config(in_features=8, out_features=8),
+                wkv_a=Linear.Config(in_features=16, out_features=4),
+                rope=dataclasses.replace(config.rope, dim=0),
+                indexer=zero_rope_indexer,
+            )
