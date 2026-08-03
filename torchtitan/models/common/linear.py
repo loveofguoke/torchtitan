@@ -49,11 +49,12 @@ class Linear(nn.Linear, Module):
         if compute_dtype is None:
             return super().forward(input)
         bias = None if self.bias is None else self.bias.to(dtype=compute_dtype)
-        return F.linear(
-            input.to(dtype=compute_dtype),
-            self.weight.to(dtype=compute_dtype),
-            bias,
-        )
+        with torch.autocast(device_type=input.device.type, enabled=False):
+            return F.linear(
+                input.to(dtype=compute_dtype),
+                self.weight.to(dtype=compute_dtype),
+                bias,
+            )
 
 
 class ScaledBiasRowwiseLinear(Linear):

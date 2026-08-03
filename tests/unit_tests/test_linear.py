@@ -101,6 +101,22 @@ class TestLinear(unittest.TestCase):
         self.assertIsNotNone(linear.weight.grad)
         self.assertIsNotNone(linear.bias.grad)
 
+    def test_compute_dtype_disables_ambient_bfloat16_autocast(self):
+        """The opt-in FP32 path must override an enclosing BF16 autocast."""
+        linear = Linear.Config(in_features=3, out_features=4, bias=True).build()
+        linear.bfloat16()
+        inputs = torch.randn(2, 3, dtype=torch.bfloat16)
+
+        with torch.autocast(device_type="cpu", enabled=False):
+            expected = F.linear(
+                inputs.float(), linear.weight.float(), linear.bias.float()
+            )
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            output = linear(inputs, compute_dtype=torch.float32)
+
+        self.assertEqual(output.dtype, torch.float32)
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
     def test_shared_config_builds_independent_instances(self):
         """A single Linear.Config can build multiple independent linears."""
         cfg1 = Linear.Config(in_features=32, out_features=16)
