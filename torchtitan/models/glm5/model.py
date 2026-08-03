@@ -9,7 +9,13 @@ from dataclasses import dataclass, field
 import torch
 import torch.nn.functional as F
 
-from torchtitan.models.common import ComplexRoPE, FlexAttention, LayerNorm, Linear
+from torchtitan.models.common import (
+    ComplexRoPE,
+    FlexAttention,
+    LayerNorm,
+    Linear,
+    RMSNorm,
+)
 from torchtitan.models.common.attention import BaseAttention
 from torchtitan.protocols.module import Module
 
@@ -109,7 +115,7 @@ class Glm5DsaIndexer(Module):
         return index_scores_BLL.topk(topk, dim=-1).indices.to(torch.int32)
 
 
-class Glm5Attention(Module):
+class Glm5Attention(BaseAttention):
     @dataclass(kw_only=True, slots=True)
     class Config(BaseAttention.Config):
         dim: int
@@ -120,10 +126,10 @@ class Glm5Attention(Module):
         v_head_dim: int
         attention_dropout: float
         wq_a: Linear.Config
-        q_norm: LayerNorm.Config
+        q_norm: RMSNorm.Config
         wq_b: Linear.Config
         wkv_a: Linear.Config
-        kv_norm: LayerNorm.Config
+        kv_norm: RMSNorm.Config
         wkv_b: Linear.Config
         wo: Linear.Config
         rope: ComplexRoPE.Config
@@ -137,8 +143,16 @@ class Glm5Attention(Module):
         def __post_init__(self) -> None:
             if self.q_lora_rank <= 0:
                 raise ValueError("GLM-5 MLA requires q_lora_rank > 0.")
+            if self.kv_lora_rank <= 0:
+                raise ValueError("GLM-5 MLA requires kv_lora_rank > 0.")
+            if self.qk_nope_head_dim <= 0:
+                raise ValueError("GLM-5 MLA requires qk_nope_head_dim > 0.")
             if self.qk_rope_head_dim % 2 != 0:
                 raise ValueError("GLM-5 MLA requires an even qk_rope_head_dim.")
+            if self.qk_head_dim <= 0:
+                raise ValueError("GLM-5 MLA requires qk_head_dim > 0.")
+            if self.v_head_dim <= 0:
+                raise ValueError("GLM-5 MLA requires v_head_dim > 0.")
             if self.n_heads <= 0:
                 raise ValueError("GLM-5 MLA requires n_heads > 0.")
             if not 0.0 <= self.attention_dropout < 1.0:
@@ -216,16 +230,21 @@ class Glm5Attention(Module):
         attention_masks: torch.Tensor,
         positions_BL: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if (
-            not isinstance(attention_masks, torch.Tensor)
-            or attention_masks.layout != torch.strided
-        ):
+        if not isinstance(attention_masks, torch.Tensor):
             raise ValueError("GLM-5 eager attention requires dense attention_masks.")
 
         B, L, _ = x_BLD.shape
+        if attention_masks.layout != torch.strided:
+            raise ValueError("GLM-5 eager attention requires dense attention_masks.")
+        if attention_masks.shape != (B, 1, L, L):
+            raise ValueError("attention_masks must have shape [B, 1, L, L].")
+        if attention_masks.device != x_BLD.device:
+            raise ValueError("attention_masks must be on the same device as x_BLD.")
+        if not attention_masks.is_floating_point():
+            raise ValueError("attention_masks must use a floating additive dtype.")
         if positions_BL is None:
-            positions_BL = torch.arange(L, device=x_BLD.device).unsqueeze(0).expand(
-                B, -1
+            positions_BL = (
+                torch.arange(L, device=x_BLD.device).unsqueeze(0).expand(B, -1)
             )
 
         q_resid_BLR = self.q_norm(self.wq_a(x_BLD))
@@ -241,9 +260,7 @@ class Glm5Attention(Module):
         )
         kv_BLR = self.kv_norm(kv_BLR)
         k_rope_BL1R = k_rope_BL1R.unsqueeze(2)
-        q_rope_BLNR, k_rope_BL1R = self.rope(
-            q_rope_BLNR, k_rope_BL1R, positions_BL
-        )
+        q_rope_BLNR, k_rope_BL1R = self.rope(q_rope_BLNR, k_rope_BL1R, positions_BL)
         q_BLNH = torch.cat((q_nope_BLNP, q_rope_BLNR), dim=-1)
         kv_BLNX = self.wkv_b(kv_BLR).view(
             B, L, self.n_heads, self.qk_nope_head_dim + self.v_head_dim
@@ -268,9 +285,12 @@ class Glm5Attention(Module):
         sparse_mask_B1LL = attention_masks.masked_fill(
             ~selected_BLL.unsqueeze(1), min_value
         )
-        scores_BNLL = torch.matmul(
-            q_BLNH.transpose(1, 2), k_BLNH.transpose(1, 2).transpose(-1, -2)
-        ) * self.softmax_scale
+        scores_BNLL = (
+            torch.matmul(
+                q_BLNH.transpose(1, 2), k_BLNH.transpose(1, 2).transpose(-1, -2)
+            )
+            * self.softmax_scale
+        )
         scores_BNLL = scores_BNLL + sparse_mask_B1LL
         probs_BNLL = F.softmax(scores_BNLL, dim=-1, dtype=torch.float32).to(
             q_BLNH.dtype

@@ -4,13 +4,20 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import dataclasses
 import unittest
 from unittest import mock
 
 import torch
 import torch.nn.functional as F
 
-from torchtitan.models.common import ComplexRoPE, FlexAttention, LayerNorm, Linear
+from torchtitan.models.common import (
+    ComplexRoPE,
+    FlexAttention,
+    LayerNorm,
+    Linear,
+    RMSNorm,
+)
 from torchtitan.models.glm5.model import Glm5Attention, Glm5DsaIndexer
 
 
@@ -41,10 +48,10 @@ def _attention_config() -> Glm5Attention.Config:
         v_head_dim=4,
         attention_dropout=0.0,
         wq_a=Linear.Config(in_features=16, out_features=8),
-        q_norm=LayerNorm.Config(normalized_shape=8),
+        q_norm=RMSNorm.Config(normalized_shape=8),
         wq_b=Linear.Config(in_features=8, out_features=16),
         wkv_a=Linear.Config(in_features=16, out_features=8),
-        kv_norm=LayerNorm.Config(normalized_shape=4),
+        kv_norm=RMSNorm.Config(normalized_shape=4),
         wkv_b=Linear.Config(in_features=4, out_features=16),
         wo=Linear.Config(in_features=8, out_features=16),
         rope=ComplexRoPE.Config(dim=4, max_seq_len=8, theta=1_000_000),
@@ -74,12 +81,9 @@ def _reference_sparse_attention(
     topk_indices_BLK: torch.Tensor,
 ) -> torch.Tensor:
     B, L, _ = x_BLD.shape
-    q_resid_BLR = F.layer_norm(
+    q_resid_BLR = _reference_rms_norm(
         F.linear(x_BLD, attention.wq_a.weight, attention.wq_a.bias),
-        attention.q_norm.normalized_shape,
-        attention.q_norm.weight,
-        attention.q_norm.bias,
-        attention.q_norm.eps,
+        attention.q_norm,
     )
     q_BLNH = F.linear(q_resid_BLR, attention.wq_b.weight, attention.wq_b.bias).view(
         B, L, attention.n_heads, attention.qk_head_dim
@@ -89,21 +93,13 @@ def _reference_sparse_attention(
         [attention.qk_nope_head_dim, attention.qk_rope_head_dim],
         dim=-1,
     )
-    compressed_kv_BLC = F.linear(
-        x_BLD, attention.wkv_a.weight, attention.wkv_a.bias
-    )
+    compressed_kv_BLC = F.linear(x_BLD, attention.wkv_a.weight, attention.wkv_a.bias)
     kv_BLR, k_rope_BL1R = torch.split(
         compressed_kv_BLC,
         [attention.kv_lora_rank, attention.qk_rope_head_dim],
         dim=-1,
     )
-    kv_BLR = F.layer_norm(
-        kv_BLR,
-        attention.kv_norm.normalized_shape,
-        attention.kv_norm.weight,
-        attention.kv_norm.bias,
-        attention.kv_norm.eps,
-    )
+    kv_BLR = _reference_rms_norm(kv_BLR, attention.kv_norm)
     k_rope_BL1R = k_rope_BL1R.unsqueeze(2)
     rope_cache_BL1R2 = attention.rope.cache[positions_BL].unsqueeze(2)
     q_rope_complex_BLNR2 = torch.view_as_complex(
@@ -142,14 +138,24 @@ def _reference_sparse_attention(
     sparse_mask_B1LL = attention_masks_B1LL.masked_fill(
         ~selected_BLL.unsqueeze(1), torch.finfo(x_BLD.dtype).min
     )
-    scores_BNLL = torch.matmul(
-        q_BLNH.transpose(1, 2), k_BLNH.transpose(1, 2).transpose(-1, -2)
-    ) * attention.softmax_scale
+    scores_BNLL = (
+        torch.matmul(q_BLNH.transpose(1, 2), k_BLNH.transpose(1, 2).transpose(-1, -2))
+        * attention.softmax_scale
+    )
     scores_BNLL = scores_BNLL + sparse_mask_B1LL
     probs_BNLL = F.softmax(scores_BNLL, dim=-1, dtype=torch.float32).to(q_BLNH.dtype)
     output_BLNV = torch.matmul(probs_BNLL, v_BLNV.transpose(1, 2)).transpose(1, 2)
     return F.linear(
         output_BLNV.contiguous().view(B, L, -1), attention.wo.weight, attention.wo.bias
+    )
+
+
+def _reference_rms_norm(x_BLD: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
+    eps = torch.finfo(x_BLD.dtype).eps if norm.eps is None else norm.eps
+    return (
+        x_BLD
+        * torch.rsqrt(x_BLD.square().mean(dim=-1, keepdim=True) + eps)
+        * norm.weight
     )
 
 
@@ -348,3 +354,34 @@ class TestGlm5Attention(unittest.TestCase):
         self.assertTrue(
             all(parameter.grad is None for parameter in attention.indexer.parameters())
         )
+
+    def test_attention_rejects_malformed_additive_masks(self):
+        attention = _attention_config().build()
+        attention.init_states()
+        x_BLD = torch.randn(2, 4, 16)
+        positions_BL = torch.arange(4).expand(2, -1)
+        mask_B1LL = _dense_causal_mask(positions_BL, dtype=x_BLD.dtype)
+        invalid_masks = {
+            "rank": mask_B1LL[:, 0],
+            "channels": torch.zeros(2, 2, 4, 4),
+            "batch": torch.zeros(1, 1, 4, 4),
+            "length": torch.zeros(2, 1, 4, 3),
+            "dtype": torch.zeros(2, 1, 4, 4, dtype=torch.int32),
+            "device": torch.zeros(2, 1, 4, 4, device="meta"),
+        }
+        for case, invalid_mask_B1LL in invalid_masks.items():
+            with self.subTest(case=case):
+                with self.assertRaisesRegex(ValueError, "attention_masks"):
+                    attention(x_BLD, invalid_mask_B1LL, positions_BL)
+
+    def test_attention_config_rejects_zero_mla_dimensions(self):
+        invalid_configs = {
+            "kv_lora_rank": ({"kv_lora_rank": 0}, "kv_lora_rank"),
+            "qk_nope_head_dim": ({"qk_nope_head_dim": 0}, "qk_nope_head_dim"),
+            "qk_head_dim": ({"qk_rope_head_dim": -4}, "qk_head_dim"),
+            "v_head_dim": ({"v_head_dim": 0}, "v_head_dim"),
+        }
+        for case, (changes, message) in invalid_configs.items():
+            with self.subTest(case=case):
+                with self.assertRaisesRegex(ValueError, message):
+                    dataclasses.replace(_attention_config(), **changes)
