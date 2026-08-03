@@ -544,6 +544,48 @@ class TestGlm5Model(unittest.TestCase):
 
         self.assertEqual(logits_BLV.shape, (2, 12, 2048))
 
+    def test_debug_model_cpu_forward_loss_backward(self):
+        torch.manual_seed(29)
+        config = glm5_configs["debugmodel"]()
+        model = config.build()
+        model.init_states()
+        model.train()
+        tokens_BL = torch.randint(0, config.vocab_size, (2, 16))
+        positions_BL = torch.arange(16).expand(2, -1)
+        labels_BL = torch.randint(0, config.vocab_size, (2, 16))
+        logits_BLV = model(tokens_BL, positions=positions_BL)
+        loss = F.cross_entropy(logits_BLV.float().flatten(0, 1), labels_BL.flatten())
+        loss.backward()
+
+        self.assertTrue(torch.isfinite(loss))
+        self.assertIsNotNone(model.tok_embeddings.weight.grad)
+        self.assertIsNotNone(model.layers["0"].feed_forward.w1.weight.grad)
+        self.assertIsNotNone(
+            model.layers["1"].moe.routed_experts.inner_experts.w1_EFD.grad
+        )
+        self.assertTrue(
+            all(
+                parameter.grad is None
+                for layer in model.layers.values()
+                for parameter in layer.attention.indexer.parameters()
+            )
+        )
+
+    def test_debug_model_reports_exact_positive_nparams_and_flops(self):
+        config = glm5_configs["debugmodel"]()
+        model = config.build()
+        model.init_states()
+
+        nparams, flops = config.get_nparams_and_flops(model, seq_len=16)
+
+        self.assertIsInstance(nparams, int)
+        self.assertIsInstance(flops, int)
+        self.assertGreater(nparams, 0)
+        self.assertGreater(flops, 0)
+        self.assertEqual(
+            nparams, sum(parameter.numel() for parameter in model.parameters())
+        )
+
 
 class TestGlm5Registration(unittest.TestCase):
     def test_model_registry_has_single_device_glm5_hooks(self):
