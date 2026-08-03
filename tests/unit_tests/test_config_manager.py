@@ -217,6 +217,15 @@ class TestConfigManager(unittest.TestCase):
         assert config.model_spec.name == "deepseek_v3"
         assert config.model_spec.flavor == "debugmodel"
 
+    def test_glm5_config(self):
+        """Test that --module glm5 --config glm5_debugmodel works."""
+        config_manager = ConfigManager()
+        config = config_manager.parse_args(
+            ["--module", "glm5", "--config", "glm5_debugmodel"]
+        )
+        assert config.model_spec.name == "glm5"
+        assert config.model_spec.flavor == "debugmodel"
+
     def test_fqn_module_with_config_registry(self):
         """--module torchtitan.models.llama3.config_registry works."""
         config_manager = ConfigManager()

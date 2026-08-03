@@ -10,6 +10,7 @@ from functools import partial
 
 import torch.nn as nn
 
+from torchtitan.components.optimizer import register_moe_load_balancing_hook
 from torchtitan.models.common import (
     ComplexRoPE,
     Embedding,
@@ -26,8 +27,11 @@ from torchtitan.models.common.config_utils import (
     make_router_config,
 )
 from torchtitan.models.common.param_init import depth_scaled_std
+from torchtitan.protocols.model_spec import ModelSpec
 
 from .model import Glm5Attention, Glm5DsaIndexer, Glm5Model, Glm5TransformerBlock
+from .parallelize import parallelize_glm5
+from .sharding import validate_glm5_parallelism
 from .state_dict_adapter import Glm5StateDictAdapter
 
 __all__ = [
@@ -39,6 +43,9 @@ __all__ = [
     "build_glm5_layers",
     "glm5_configs",
     "make_glm5_attention_config",
+    "model_registry",
+    "parallelize_glm5",
+    "validate_glm5_parallelism",
 ]
 
 
@@ -329,3 +336,15 @@ def _debugmodel() -> Glm5Model.Config:
 
 
 glm5_configs = {"debugmodel": _debugmodel}
+
+
+def model_registry(flavor: str = "debugmodel") -> ModelSpec:
+    return ModelSpec(
+        name="glm5",
+        flavor=flavor,
+        model=glm5_configs[flavor](),
+        parallelize_fn=parallelize_glm5,
+        pipelining_fn=None,
+        post_optimizer_build_fn=register_moe_load_balancing_hook,
+        state_dict_adapter=Glm5StateDictAdapter,
+    )

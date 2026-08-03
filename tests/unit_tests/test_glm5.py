@@ -10,7 +10,11 @@ from unittest import mock
 
 import torch
 import torch.nn.functional as F
+import torchtitan.models.glm5 as glm5
 
+from torchtitan.components.optimizer import register_moe_load_balancing_hook
+from torchtitan.config import ParallelismConfig
+from torchtitan.distributed import ParallelDims
 from torchtitan.models.common import (
     ComplexRoPE,
     FlexAttention,
@@ -19,6 +23,7 @@ from torchtitan.models.common import (
     RMSNorm,
 )
 from torchtitan.models.glm5 import build_glm5_layers, glm5_configs, Glm5StateDictAdapter
+from torchtitan.models.glm5.config_registry import glm5_debugmodel
 from torchtitan.models.glm5.model import (
     Glm5Attention,
     Glm5DsaIndexer,
@@ -538,6 +543,92 @@ class TestGlm5Model(unittest.TestCase):
         logits_BLV = model(tokens_BL, positions=positions_BL)
 
         self.assertEqual(logits_BLV.shape, (2, 12, 2048))
+
+
+class TestGlm5Registration(unittest.TestCase):
+    def test_model_registry_has_single_device_glm5_hooks(self):
+        spec = glm5.model_registry("debugmodel")
+
+        self.assertEqual(spec.name, "glm5")
+        self.assertEqual(spec.flavor, "debugmodel")
+        self.assertIsInstance(spec.model, Glm5Model.Config)
+        self.assertIs(spec.state_dict_adapter, Glm5StateDictAdapter)
+        self.assertIsNone(spec.pipelining_fn)
+        self.assertIs(spec.post_optimizer_build_fn, register_moe_load_balancing_hook)
+
+    def test_debug_training_config_uses_single_device_defaults(self):
+        config = glm5_debugmodel()
+
+        self.assertEqual(config.training.local_batch_size, 2)
+        self.assertEqual(config.training.seq_len, 128)
+        self.assertEqual(config.training.steps, 10)
+        self.assertEqual(config.metrics.log_freq, 1)
+        self.assertEqual(config.checkpoint.interval, 10)
+        self.assertEqual(config.dataloader.dataset, "c4_test")
+        self.assertEqual(config.hf_assets_path, "./tests/assets/tokenizer")
+        self.assertEqual(config.optimizer.param_groups[0].optimizer_kwargs["lr"], 8e-4)
+        self.assertFalse(config.compile.enable)
+        self.assertIsNone(config.activation_checkpoint)
+        self.assertEqual(config.parallelism, ParallelismConfig())
+
+    def test_parallelism_allows_only_one_unresolved_single_device_layout(self):
+        validate = glm5.validate_glm5_parallelism
+
+        self.assertIsNone(validate(ParallelismConfig()))
+        single_rank_dims = ParallelDims(
+            dp_replicate=1,
+            dp_shard=-1,
+            cp=1,
+            tp=1,
+            pp=1,
+            ep=1,
+            world_size=1,
+        )
+        self.assertIsNone(validate(ParallelismConfig(), single_rank_dims))
+
+    def test_parallelism_rejects_each_multi_rank_mode(self):
+        validate = glm5.validate_glm5_parallelism
+        invalid_configs = {
+            "TP": ParallelismConfig(tensor_parallel_degree=2),
+            "CP": ParallelismConfig(context_parallel_degree=2),
+            "PP": ParallelismConfig(pipeline_parallel_degree=2),
+            "EP": ParallelismConfig(expert_parallel_degree=2),
+            "DP replicate": ParallelismConfig(data_parallel_replicate_degree=2),
+            "DP shard": ParallelismConfig(data_parallel_shard_degree=2),
+            "SPMD backend": ParallelismConfig(spmd_backend="full_dtensor"),
+        }
+
+        for mode, parallelism in invalid_configs.items():
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(NotImplementedError, mode):
+                    validate(parallelism)
+
+    def test_parallelism_reports_every_offending_mode_together(self):
+        validate = glm5.validate_glm5_parallelism
+
+        with self.assertRaisesRegex(NotImplementedError, "TP.*CP.*DP shard"):
+            validate(
+                ParallelismConfig(
+                    tensor_parallel_degree=2,
+                    context_parallel_degree=2,
+                    data_parallel_shard_degree=2,
+                )
+            )
+
+    def test_parallelism_rejects_resolved_multi_rank_world(self):
+        validate = glm5.validate_glm5_parallelism
+        multi_rank_dims = ParallelDims(
+            dp_replicate=1,
+            dp_shard=-1,
+            cp=1,
+            tp=1,
+            pp=1,
+            ep=1,
+            world_size=2,
+        )
+
+        with self.assertRaisesRegex(NotImplementedError, "DP shard.*world_size"):
+            validate(ParallelismConfig(), multi_rank_dims)
 
 
 class TestGlm5StateDictAdapter(unittest.TestCase):
