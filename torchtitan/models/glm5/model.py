@@ -381,7 +381,8 @@ class Glm5Model(Decoder):
             )
             return nparams, base_flops + dsa_flops
 
-    def get_attention_masks(self, positions_BL: torch.Tensor) -> torch.Tensor:
+    def get_attention_masks(self, positions: torch.Tensor) -> torch.Tensor:
+        positions_BL = positions
         B, L = positions_BL.shape
         token_dtype = self.tok_embeddings.weight.dtype
         document_ids_BL = (positions_BL == 0).cumsum(dim=1)

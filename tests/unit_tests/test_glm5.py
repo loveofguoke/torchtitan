@@ -535,6 +535,14 @@ class TestGlm5Model(unittest.TestCase):
         self.assertEqual(mask_B1LL[0, 0, 4, 1].item(), min_value)
         self.assertEqual(mask_B1LL[0, 0, 1, 2].item(), min_value)
 
+    def test_dense_mask_accepts_decoder_positions_keyword(self):
+        model = _build_debug_model()
+        positions_BL = torch.arange(4).unsqueeze(0)
+
+        mask_B1LL = model.get_attention_masks(positions=positions_BL)
+
+        self.assertEqual(mask_B1LL.shape, (1, 1, 4, 4))
+
     def test_debug_model_forward_shape(self):
         model = _build_debug_model()
         tokens_BL = torch.randint(0, 2048, (2, 12))
