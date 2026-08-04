@@ -20,6 +20,8 @@ from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import TokenChoiceTopKRouter
 from torchtitan.models.glm5 import glm5_configs, Glm5StateDictAdapter
 
+_TRANSFORMERS_IMPORT_ERROR = None
+
 try:
     from transformers import GlmMoeDsaConfig, GlmMoeDsaForCausalLM
 except Exception as _TRANSFORMERS_IMPORT_ERROR:  # pragma: no cover - environment dependent
