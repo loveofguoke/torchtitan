@@ -336,28 +336,73 @@ def _set_hf_routed_expert_compute_dtype(
     hf_model: torch.nn.Module,
     compute_dtype: torch.dtype,
 ) -> None:
-    """Run only HF routed-expert math under the requested autocast dtype."""
+    """Run HF routed experts with TorchTitan's explicit dtype boundaries."""
+    if compute_dtype is not torch.bfloat16:
+        raise ValueError(
+            "the routed-expert reference currently supports only torch.bfloat16"
+        )
+
     num_wrapped = 0
     for layer in hf_model.model.layers:
         experts = getattr(layer.mlp, "experts", None)
         if experts is None:
             continue
-        original_forward = experts.forward
 
-        def forward_with_autocast(
+        def forward_with_explicit_dtype(
             self,
-            *args,
-            _original_forward=original_forward,
-            **kwargs,
-        ):
-            hidden_states = args[0] if args else kwargs["hidden_states"]
-            with torch.autocast(
-                device_type=hidden_states.device.type,
-                dtype=compute_dtype,
-            ):
-                return _original_forward(*args, **kwargs)
+            hidden_states: torch.Tensor,
+            top_k_index: torch.Tensor,
+            top_k_weights: torch.Tensor,
+            _compute_dtype=compute_dtype,
+        ) -> torch.Tensor:
+            # Mirror GroupedExperts.forward: input and all three expert
+            # projections run in BF16, then expert outputs return to the model
+            # dtype before routing scores are applied and tokens are combined.
+            final_hidden_states = torch.zeros_like(hidden_states)
+            with torch.no_grad():
+                expert_mask = F.one_hot(
+                    top_k_index, num_classes=self.num_experts
+                ).permute(2, 1, 0)
+                expert_hit = torch.greater(
+                    expert_mask.sum(dim=(-1, -2)), 0
+                ).nonzero()
 
-        experts.forward = MethodType(forward_with_autocast, experts)
+            for expert_index_tensor in expert_hit:
+                expert_index = expert_index_tensor[0]
+                top_k_position, token_index = torch.where(
+                    expert_mask[expert_index]
+                )
+                current_state = hidden_states[token_index].to(_compute_dtype)
+                gate_weight, up_weight = self.gate_up_proj[expert_index].chunk(
+                    2, dim=0
+                )
+                gate = F.linear(
+                    current_state, gate_weight.to(_compute_dtype)
+                )
+                up = F.linear(
+                    current_state, up_weight.to(_compute_dtype)
+                )
+                current_hidden_states = self.act_fn(gate) * up
+                current_hidden_states = F.linear(
+                    current_hidden_states,
+                    self.down_proj[expert_index].to(_compute_dtype),
+                ).to(hidden_states.dtype)
+
+                # TorchTitan combines the BF16 expert result in the model
+                # dtype and applies its FP32 routing scores at this boundary.
+                routed_weights = top_k_weights[
+                    token_index, top_k_position, None
+                ].to(current_hidden_states.dtype)
+                final_hidden_states.index_add_(
+                    0,
+                    token_index,
+                    current_hidden_states * routed_weights,
+                )
+
+            return final_hidden_states
+
+        experts.forward = MethodType(forward_with_explicit_dtype, experts)
+        experts._parity_compute_dtype = compute_dtype
         num_wrapped += 1
     if num_wrapped == 0:
         raise ValueError("HF model has no routed-expert modules to wrap")
