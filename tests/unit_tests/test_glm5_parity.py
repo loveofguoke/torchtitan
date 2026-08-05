@@ -29,6 +29,7 @@ import unittest
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from html import escape
+from types import MethodType
 from typing import Any, Callable, Iterator
 
 import torch
@@ -329,6 +330,37 @@ def _build_pair(
     if precision.dtype is not torch.float32:
         pair.convert(precision)
     return pair
+
+
+def _set_hf_routed_expert_compute_dtype(
+    hf_model: torch.nn.Module,
+    compute_dtype: torch.dtype,
+) -> None:
+    """Run only HF routed-expert math under the requested autocast dtype."""
+    num_wrapped = 0
+    for layer in hf_model.model.layers:
+        experts = getattr(layer.mlp, "experts", None)
+        if experts is None:
+            continue
+        original_forward = experts.forward
+
+        def forward_with_autocast(
+            self,
+            *args,
+            _original_forward=original_forward,
+            **kwargs,
+        ):
+            hidden_states = args[0] if args else kwargs["hidden_states"]
+            with torch.autocast(
+                device_type=hidden_states.device.type,
+                dtype=compute_dtype,
+            ):
+                return _original_forward(*args, **kwargs)
+
+        experts.forward = MethodType(forward_with_autocast, experts)
+        num_wrapped += 1
+    if num_wrapped == 0:
+        raise ValueError("HF model has no routed-expert modules to wrap")
 
 
 def _build_models(
@@ -1872,6 +1904,7 @@ class ComponentParityMixin:
             hf_layer = self.pair.hf_layer(layer_index)
             titan_moe = self.pair.titan_layer(layer_index).moe
             normalized = self._normalized(layer_index)
+            # 比较topk索引和对应权重
             _, hf_weights, hf_indices = hf_layer.mlp.gate(normalized)
             titan_weights, titan_indices, _ = titan_moe.router(
                 normalized, titan_moe.expert_bias_E
@@ -2077,6 +2110,7 @@ class _ParityComponentTests(ComponentParityMixin):
         title: str,
     ) -> str:
         """Publish one test now or register it with the active suite report."""
+        recorder.precision_label = self._configured_report_label()
         recorder.title = (
             f"{title} [{recorder.precision_label}] "
             f"(layers={self.LAYER_INDICES})"
@@ -2153,6 +2187,7 @@ class TestGlm5Parity(
     ``GLM5_PARITY_COMPONENTS=indexer,router,gradient``
     ``GLM5_PARITY_DATA_CASE=random|zeros|ones|extreme|alternating``
     ``GLM5_PARITY_COMPONENT_EXECUTION=independent|sequential``
+    ``GLM5_PARITY_HF_ROUTED_EXPERT_COMPUTE=model|bf16``
 
     The test methods do not construct a precision-specific class.  They use
     the models and batches prepared here.  Fixed runners preserve the original
@@ -2175,6 +2210,9 @@ class TestGlm5Parity(
     COMPONENT_EXECUTION = os.environ.get(
         "GLM5_PARITY_COMPONENT_EXECUTION", "independent"
     )
+    HF_ROUTED_EXPERT_COMPUTE = os.environ.get(
+        "GLM5_PARITY_HF_ROUTED_EXPERT_COMPUTE", "model"
+    ).lower()
 
     @staticmethod
     def _endpoint(value: str) -> ModelEndpoint:
@@ -2215,6 +2253,10 @@ class TestGlm5Parity(
         cls.device = torch.device("cuda")
         cls.actual_endpoint, cls.expected_endpoint = cls._configured_endpoints()
         cls.precision = cls.actual_endpoint.precision
+        if cls.HF_ROUTED_EXPERT_COMPUTE not in {"model", "bf16"}:
+            raise ValueError(
+                "GLM5_PARITY_HF_ROUTED_EXPERT_COMPUTE must be model or bf16"
+            )
 
         # Build the endpoint table once.  Test methods only select from this
         # table and never perform ad hoc dtype conversion.
@@ -2229,6 +2271,8 @@ class TestGlm5Parity(
         for precision_name in sorted(precisions):
             precision = BF16 if precision_name == BF16.name else FP32
             pair = _build_pair(cls.device, precision=precision, seed=61)
+            if cls.HF_ROUTED_EXPERT_COMPUTE == "bf16":
+                _set_hf_routed_expert_compute_dtype(pair.hf, torch.bfloat16)
             cls.pairs[precision.name] = pair
             cls.models[("hf", precision.name)] = pair.hf
             cls.models[("titan", precision.name)] = pair.titan
@@ -2291,6 +2335,25 @@ class TestGlm5Parity(
             component="model",
             rtol=tolerance[0],
             atol=tolerance[1],
+        )
+
+    def _configured_report_label(self) -> str:
+        def endpoint_label(endpoint: ModelEndpoint) -> str:
+            expert_compute = (
+                "bf16"
+                if endpoint.implementation == "titan"
+                else self.HF_ROUTED_EXPERT_COMPUTE
+            )
+            if expert_compute == "model":
+                expert_compute = endpoint.precision.name
+            label = endpoint.label
+            if expert_compute != endpoint.precision.name:
+                label += f"(routed_experts={expert_compute})"
+            return label
+
+        return (
+            f"{endpoint_label(self.actual_endpoint)} vs "
+            f"{endpoint_label(self.expected_endpoint)}"
         )
 
     def _component_enabled(self, name: str) -> bool:
@@ -3247,7 +3310,8 @@ class TestGlm5Parity(
             self.skipTest(self.gpu_skip_reason)
         spec = self._configured_spec()
         suite_report = ParitySuiteReport(
-            f"GLM-5 parity: {spec.label}; data={self.DATA_CASE}; "
+            f"GLM-5 parity: {self._configured_report_label()}; "
+            f"data={self.DATA_CASE}; "
             f"layers={self.LAYER_INDICES}"
         )
         self._active_suite_report = suite_report
