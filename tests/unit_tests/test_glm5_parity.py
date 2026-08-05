@@ -193,9 +193,9 @@ def _format_parity_diagnostics(
     records: dict[str, dict[int, torch.Tensor | None]],
     positions_BL: torch.Tensor,
 ) -> str:
-    """Format structured GLM-5 parity diagnostics (block, indexer, router).
+    """Format GLM-5 parity diagnostics as a compact table.
 
-    Output is organized into per-layer sections followed by a summary.
+    Output is a per-layer table followed by a summary section.
     """
     expected_record_names = (
         "hf_blocks",
@@ -218,7 +218,6 @@ def _format_parity_diagnostics(
             for layer_index in records[record_name]
         }
     )
-    # Determine MoE layers: those present in hf_router or titan_router
     moe_layer_indices: set[int] = set()
     for record_name in ("hf_router", "titan_router"):
         moe_layer_indices.update(records.get(record_name, {}).keys())
@@ -230,144 +229,146 @@ def _format_parity_diagnostics(
     lines.append("")
 
     discrete_mismatches: list[tuple[int, int, str]] = []
-    layer_count = len(layer_indices)
 
-    for i, layer_index in enumerate(layer_indices):
+    # --- Table header ---
+    lines.append("  Layer  Type     Block        Indexer              Router")
+    lines.append(" " + "-" * 62)
+
+    for layer_index in layer_indices:
         is_moe = layer_index in moe_layer_indices
         layer_type = "MoE" if is_moe else "dense"
-        lines.append(
-            f" --- Layer {layer_index} ({layer_type}) "
-            + "-" * max(1, 55 - len(str(layer_index)) - len(layer_type))
-        )
+        layer_label = f"{layer_index:<6}"
 
         hf_block = records["hf_blocks"].get(layer_index)
         titan_block = records["titan_blocks"].get(layer_index)
 
-        # --- Block comparison ---
+        # --- Block column ---
         if hf_block is None or titan_block is None:
-            lines.append(
-                f"   block   : records=missing"
-                f" (hf={hf_block is not None}, titan={titan_block is not None})"
-            )
+            block_col = "rec_missing"
         elif (
             hf_block.ndim != 3
             or titan_block.ndim != 3
             or hf_block.shape[:2] != positions_BL.shape
             or titan_block.shape[:2] != positions_BL.shape
         ):
-            lines.append(
-                "   block   : shape_error=expected [B, L, D] compatible with positions"
-            )
+            block_col = "shape_err"
         elif hf_block.shape != titan_block.shape:
-            lines.append(
-                f"   block   : shape_mismatch="
-                f"hf{tuple(hf_block.shape)} != titan{tuple(titan_block.shape)}"
-            )
+            block_col = f"shape_mismatch"
         else:
             block_difference = (hf_block.float() - titan_block.float()).abs()
             position_max_L = block_difference.amax(dim=(0, 2)).detach().cpu()
             max_diff = float(position_max_L.max())
-            lines.append(f"   block   : max_abs_diff={max_diff:.6g}")
+            block_col = f"{max_diff:.6g}"
 
-            # Only show non-zero per-position values (filter noise < 1e-10)
-            nonzero_positions = [
-                f"{p}:{float(v):.6g}"
-                for p, v in enumerate(position_max_L)
-                if float(v) > 1e-10
-            ]
-            if nonzero_positions:
-                pos_str = ", ".join(nonzero_positions)
-                lines.append(f"             per-position=[{pos_str}]")
-            else:
-                lines.append("             per-position=[all zero]")
+        block_col = f"{block_col:<13}"
 
-        # --- Indexer & Router comparison ---
-        for source in ("indexer", "router"):
-            hf_records = records[f"hf_{source}"]
-            titan_records = records[f"titan_{source}"]
-            if layer_index not in hf_records and layer_index not in titan_records:
-                continue
-            hf_selection = hf_records.get(layer_index)
-            titan_selection = titan_records.get(layer_index)
+        # --- Indexer column ---
+        indexer_col = ""
+        hf_indexer_records = records["hf_indexer"]
+        titan_indexer_records = records["titan_indexer"]
+        if layer_index in hf_indexer_records or layer_index in titan_indexer_records:
+            hf_selection = hf_indexer_records.get(layer_index)
+            titan_selection = titan_indexer_records.get(layer_index)
             if hf_selection is None or titan_selection is None:
-                lines.append(
-                    f"   {source:8s}: records=missing"
-                    f" (hf={hf_selection is not None}, "
-                    f"titan={titan_selection is not None})"
-                )
-                continue
-            try:
-                mismatch_positions = _selection_mismatch_positions(
-                    titan_selection,
-                    hf_selection,
-                    positions_BL if source == "indexer" else None,
-                )
-            except ValueError as error:
-                lines.append(f"   {source:8s}: comparison_error={error}")
-                continue
+                hf_ok = hf_selection is not None
+                tit_ok = titan_selection is not None
+                indexer_col = f"rec_missing hf={hf_ok} tit={tit_ok}"
+            else:
+                try:
+                    mismatch_positions = _selection_mismatch_positions(
+                        titan_selection,
+                        hf_selection,
+                        positions_BL,
+                    )
+                except ValueError as error:
+                    indexer_col = f"err={error}"
+                else:
+                    count = len(mismatch_positions)
+                    if count == 0:
+                        indexer_col = "0"
+                    else:
+                        pos_str = ",".join(str(p) for p in sorted(set(mismatch_positions)))
+                        indexer_col = f"{count} [{pos_str}]"
+                    discrete_mismatches.extend(
+                        (layer_index, position, "indexer") for position in mismatch_positions
+                    )
+        else:
+            indexer_col = "-"
 
-            count = len(mismatch_positions)
-            positions_str = (
-                f" positions={sorted(set(mismatch_positions))}" if count > 0 else ""
-            )
-            flag = "  <<<" if count > 0 else ""
-            lines.append(f"   {source:8s}: mismatches={count}{positions_str}{flag}")
-            discrete_mismatches.extend(
-                (layer_index, position, source) for position in mismatch_positions
-            )
+        indexer_col = f"{indexer_col:<20}"
 
-        if i < layer_count - 1:
-            lines.append("")
+        # --- Router column ---
+        router_col = ""
+        hf_router_records = records["hf_router"]
+        titan_router_records = records["titan_router"]
+        if layer_index in hf_router_records or layer_index in titan_router_records:
+            hf_selection = hf_router_records.get(layer_index)
+            titan_selection = titan_router_records.get(layer_index)
+            if hf_selection is None or titan_selection is None:
+                hf_ok = hf_selection is not None
+                tit_ok = titan_selection is not None
+                router_col = f"rec_missing hf={hf_ok} tit={tit_ok}"
+            else:
+                try:
+                    mismatch_positions = _selection_mismatch_positions(
+                        titan_selection,
+                        hf_selection,
+                        None,
+                    )
+                except ValueError as error:
+                    router_col = f"err={error}"
+                else:
+                    count = len(mismatch_positions)
+                    if count == 0:
+                        router_col = "0"
+                    else:
+                        pos_str = ",".join(str(p) for p in sorted(set(mismatch_positions)))
+                        router_col = f"{count} [{pos_str}]"
+                    discrete_mismatches.extend(
+                        (layer_index, position, "router") for position in mismatch_positions
+                    )
+        else:
+            router_col = "N/A" if not is_moe else "-"
+
+        router_col = f"{router_col:<20}"
+
+        lines.append(f"  {layer_label}{layer_type:<8}{block_col}{indexer_col}{router_col}")
+
+    lines.append(" " + "-" * 62)
 
     # --- Summary ---
-    lines.append(
-        " --- Summary -------------------------------------------------------------------"
-    )
+    lines.append("  Summary")
     if discrete_mismatches:
         layer_index, position, source = min(discrete_mismatches)
         lines.append(
-            f"   first_discrete_mismatch       : layer {layer_index}, position {position}, source={source}"
+            f"    first_discrete_mismatch       : layer {layer_index}, position {position}, source={source}"
         )
-        # Count layers with block errors (max_abs_diff > 1e-6)
+        lines.append(f"    total_discrete_mismatches    : {len(discrete_mismatches)}")
         layers_with_block_errors = []
         for li in layer_indices:
             hf_b = records["hf_blocks"].get(li)
             tit_b = records["titan_blocks"].get(li)
-            if (
-                hf_b is not None
-                and tit_b is not None
-                and hf_b.ndim == 3
-                and tit_b.ndim == 3
-                and hf_b.shape == tit_b.shape
-            ):
-                diff = (
-                    (hf_b.float() - tit_b.float()).abs().amax(dim=(0, 2)).max().item()
-                )
+            if hf_b is not None and tit_b is not None and hf_b.ndim == 3 and tit_b.ndim == 3 and hf_b.shape == tit_b.shape:
+                diff = (hf_b.float() - tit_b.float()).abs().amax(dim=(0, 2)).max().item()
                 if diff > 1e-6:
                     layers_with_block_errors.append(li)
         if layers_with_block_errors:
-            lines.append(
-                f"   layers_with_block_errors     : {layers_with_block_errors}"
-            )
+            lines.append(f"    layers_with_block_errors     : {layers_with_block_errors}")
         layers_with_indexer_mismatches = sorted(
             {li for li, _, src in discrete_mismatches if src == "indexer"}
         )
         if layers_with_indexer_mismatches:
-            lines.append(
-                f"   layers_with_indexer_mismatches: {layers_with_indexer_mismatches}"
-            )
+            lines.append(f"    layers_with_indexer_mismatches: {layers_with_indexer_mismatches}")
         layers_with_router_mismatches = sorted(
             {li for li, _, src in discrete_mismatches if src == "router"}
         )
         if layers_with_router_mismatches:
-            lines.append(
-                f"   layers_with_router_mismatches : {layers_with_router_mismatches}"
-            )
-        lines.append(f"   total_discrete_mismatches    : {len(discrete_mismatches)}")
+            lines.append(f"    layers_with_router_mismatches : {layers_with_router_mismatches}")
     else:
-        lines.append("   first_discrete_mismatch       : none")
+        lines.append("    first_discrete_mismatch       : none")
 
     return "\n".join(lines)
+
 
 
 class TestGlm5ParityDiagnostics(unittest.TestCase):
@@ -390,11 +391,9 @@ class TestGlm5ParityDiagnostics(unittest.TestCase):
 
         diagnostics = _format_parity_diagnostics(records, torch.tensor([[0, 1, 2]]))
 
-        self.assertIn("max_abs_diff=0", diagnostics)
-        self.assertIn("max_abs_diff=0.5", diagnostics)
-        self.assertIn("per-position=[1:0.5]", diagnostics)
-        self.assertIn("indexer : mismatches=1", diagnostics)
-        self.assertIn("router  : mismatches=1", diagnostics)
+        self.assertIn("0.5", diagnostics)
+        self.assertIn("1 [2]", diagnostics)
+        self.assertIn("1 [1]", diagnostics)
         self.assertIn(
             "first_discrete_mismatch       : layer 1, position 1, source=router",
             diagnostics,
@@ -414,8 +413,8 @@ class TestGlm5ParityDiagnostics(unittest.TestCase):
 
         diagnostics = _format_parity_diagnostics(records, torch.tensor([[0, 1]]))
 
-        self.assertIn("indexer : records=missing", diagnostics)
-        self.assertIn("router  : records=missing", diagnostics)
+        self.assertIn("rec_missing hf=False tit=False", diagnostics)
+        self.assertIn("rec_missing hf=True tit=False", diagnostics)
 
     def test_format_reports_incompatible_block_shape(self) -> None:
         malformed_blocks = torch.zeros(2, 2)
@@ -431,7 +430,7 @@ class TestGlm5ParityDiagnostics(unittest.TestCase):
         diagnostics = _format_parity_diagnostics(records, torch.tensor([[0, 1]]))
 
         self.assertIn(
-            "block   : shape_error=expected [B, L, D] compatible with positions",
+            "shape_err",
             diagnostics,
         )
 
