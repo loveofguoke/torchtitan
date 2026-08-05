@@ -81,7 +81,7 @@ def _build_models(
 
     titan_config = glm5_configs["debugmodel"]()
     titan_model = titan_config.build()
-    titan_model.init_states() # Decoder的方法
+    titan_model.init_states()  # Decoder的方法
     adapter = Glm5StateDictAdapter(titan_config, hf_assets_path=None)
     # HF随机初始化，提取HF state dict，通过adapter加载到TorchTitan模型
     # 保证两者权重完全一致
@@ -193,7 +193,10 @@ def _format_parity_diagnostics(
     records: dict[str, dict[int, torch.Tensor | None]],
     positions_BL: torch.Tensor,
 ) -> str:
-    """Format layer-local block, Indexer, and router parity evidence."""
+    """Format structured GLM-5 parity diagnostics (block, indexer, router).
+
+    Output is organized into per-layer sections followed by a summary.
+    """
     expected_record_names = (
         "hf_blocks",
         "titan_blocks",
@@ -215,16 +218,36 @@ def _format_parity_diagnostics(
             for layer_index in records[record_name]
         }
     )
+    # Determine MoE layers: those present in hf_router or titan_router
+    moe_layer_indices: set[int] = set()
+    for record_name in ("hf_router", "titan_router"):
+        moe_layer_indices.update(records.get(record_name, {}).keys())
+
     lines: list[str] = []
+    lines.append("=" * 67)
+    lines.append(" GLM-5 Parity Diagnostics")
+    lines.append("=" * 67)
+    lines.append("")
+
     discrete_mismatches: list[tuple[int, int, str]] = []
-    for layer_index in layer_indices:
-        layer_parts = [f"layer {layer_index}:"]
+    layer_count = len(layer_indices)
+
+    for i, layer_index in enumerate(layer_indices):
+        is_moe = layer_index in moe_layer_indices
+        layer_type = "MoE" if is_moe else "dense"
+        lines.append(
+            f" --- Layer {layer_index} ({layer_type}) "
+            + "-" * max(1, 55 - len(str(layer_index)) - len(layer_type))
+        )
+
         hf_block = records["hf_blocks"].get(layer_index)
         titan_block = records["titan_blocks"].get(layer_index)
+
+        # --- Block comparison ---
         if hf_block is None or titan_block is None:
-            layer_parts.append(
-                "block_records=missing"
-                f"(hf={hf_block is not None}, titan={titan_block is not None})"
+            lines.append(
+                f"   block   : records=missing"
+                f" (hf={hf_block is not None}, titan={titan_block is not None})"
             )
         elif (
             hf_block.ndim != 3
@@ -232,24 +255,33 @@ def _format_parity_diagnostics(
             or hf_block.shape[:2] != positions_BL.shape
             or titan_block.shape[:2] != positions_BL.shape
         ):
-            layer_parts.append(
-                "block_shape_error=expected [B, L, D] compatible with positions"
+            lines.append(
+                "   block   : shape_error=expected [B, L, D] compatible with positions"
             )
         elif hf_block.shape != titan_block.shape:
-            layer_parts.append(
-                "block_shape_mismatch="
-                f"hf{tuple(hf_block.shape)}!=titan{tuple(titan_block.shape)}"
+            lines.append(
+                f"   block   : shape_mismatch="
+                f"hf{tuple(hf_block.shape)} != titan{tuple(titan_block.shape)}"
             )
         else:
             block_difference = (hf_block.float() - titan_block.float()).abs()
             position_max_L = block_difference.amax(dim=(0, 2)).detach().cpu()
-            layer_parts.append(f"block_max_abs={float(position_max_L.max()):.6g}")
-            position_values = ", ".join(
-                f"{position}:{float(value):.6g}"
-                for position, value in enumerate(position_max_L)
-            )
-            layer_parts.append(f"block_position_max_abs=[{position_values}]")
+            max_diff = float(position_max_L.max())
+            lines.append(f"   block   : max_abs_diff={max_diff:.6g}")
 
+            # Only show non-zero per-position values (filter noise < 1e-10)
+            nonzero_positions = [
+                f"{p}:{float(v):.6g}"
+                for p, v in enumerate(position_max_L)
+                if float(v) > 1e-10
+            ]
+            if nonzero_positions:
+                pos_str = ", ".join(nonzero_positions)
+                lines.append(f"             per-position=[{pos_str}]")
+            else:
+                lines.append("             per-position=[all zero]")
+
+        # --- Indexer & Router comparison ---
         for source in ("indexer", "router"):
             hf_records = records[f"hf_{source}"]
             titan_records = records[f"titan_{source}"]
@@ -258,9 +290,9 @@ def _format_parity_diagnostics(
             hf_selection = hf_records.get(layer_index)
             titan_selection = titan_records.get(layer_index)
             if hf_selection is None or titan_selection is None:
-                layer_parts.append(
-                    f"{source}_records=missing"
-                    f"(hf={hf_selection is not None}, "
+                lines.append(
+                    f"   {source:8s}: records=missing"
+                    f" (hf={hf_selection is not None}, "
                     f"titan={titan_selection is not None})"
                 )
                 continue
@@ -271,25 +303,70 @@ def _format_parity_diagnostics(
                     positions_BL if source == "indexer" else None,
                 )
             except ValueError as error:
-                layer_parts.append(f"{source}_comparison_error={error}")
+                lines.append(f"   {source:8s}: comparison_error={error}")
                 continue
-            layer_parts.append(
-                f"{source}_mismatched_queries={len(mismatch_positions)} "
-                f"positions={sorted(set(mismatch_positions))}"
+
+            count = len(mismatch_positions)
+            positions_str = (
+                f" positions={sorted(set(mismatch_positions))}" if count > 0 else ""
             )
+            flag = "  <<<" if count > 0 else ""
+            lines.append(f"   {source:8s}: mismatches={count}{positions_str}{flag}")
             discrete_mismatches.extend(
                 (layer_index, position, source) for position in mismatch_positions
             )
-        lines.append(" ".join(layer_parts))
 
+        if i < layer_count - 1:
+            lines.append("")
+
+    # --- Summary ---
+    lines.append(
+        " --- Summary -------------------------------------------------------------------"
+    )
     if discrete_mismatches:
         layer_index, position, source = min(discrete_mismatches)
         lines.append(
-            "first_discrete_mismatch="
-            f"layer {layer_index} position {position} source={source}"
+            f"   first_discrete_mismatch       : layer {layer_index}, position {position}, source={source}"
         )
+        # Count layers with block errors (max_abs_diff > 1e-6)
+        layers_with_block_errors = []
+        for li in layer_indices:
+            hf_b = records["hf_blocks"].get(li)
+            tit_b = records["titan_blocks"].get(li)
+            if (
+                hf_b is not None
+                and tit_b is not None
+                and hf_b.ndim == 3
+                and tit_b.ndim == 3
+                and hf_b.shape == tit_b.shape
+            ):
+                diff = (
+                    (hf_b.float() - tit_b.float()).abs().amax(dim=(0, 2)).max().item()
+                )
+                if diff > 1e-6:
+                    layers_with_block_errors.append(li)
+        if layers_with_block_errors:
+            lines.append(
+                f"   layers_with_block_errors     : {layers_with_block_errors}"
+            )
+        layers_with_indexer_mismatches = sorted(
+            {li for li, _, src in discrete_mismatches if src == "indexer"}
+        )
+        if layers_with_indexer_mismatches:
+            lines.append(
+                f"   layers_with_indexer_mismatches: {layers_with_indexer_mismatches}"
+            )
+        layers_with_router_mismatches = sorted(
+            {li for li, _, src in discrete_mismatches if src == "router"}
+        )
+        if layers_with_router_mismatches:
+            lines.append(
+                f"   layers_with_router_mismatches : {layers_with_router_mismatches}"
+            )
+        lines.append(f"   total_discrete_mismatches    : {len(discrete_mismatches)}")
     else:
-        lines.append("first_discrete_mismatch=none")
+        lines.append("   first_discrete_mismatch       : none")
+
     return "\n".join(lines)
 
 
@@ -313,13 +390,13 @@ class TestGlm5ParityDiagnostics(unittest.TestCase):
 
         diagnostics = _format_parity_diagnostics(records, torch.tensor([[0, 1, 2]]))
 
-        self.assertIn("layer 0: block_max_abs=0", diagnostics)
-        self.assertIn("layer 1: block_max_abs=0.5", diagnostics)
-        self.assertIn("block_position_max_abs=[0:0, 1:0.5, 2:0]", diagnostics)
-        self.assertIn("indexer_mismatched_queries=1 positions=[2]", diagnostics)
-        self.assertIn("router_mismatched_queries=1 positions=[1]", diagnostics)
+        self.assertIn("max_abs_diff=0", diagnostics)
+        self.assertIn("max_abs_diff=0.5", diagnostics)
+        self.assertIn("per-position=[1:0.5]", diagnostics)
+        self.assertIn("indexer : mismatches=1", diagnostics)
+        self.assertIn("router  : mismatches=1", diagnostics)
         self.assertIn(
-            "first_discrete_mismatch=layer 1 position 1 source=router",
+            "first_discrete_mismatch       : layer 1, position 1, source=router",
             diagnostics,
         )
 
@@ -337,8 +414,8 @@ class TestGlm5ParityDiagnostics(unittest.TestCase):
 
         diagnostics = _format_parity_diagnostics(records, torch.tensor([[0, 1]]))
 
-        self.assertIn("indexer_records=missing(hf=False, titan=False)", diagnostics)
-        self.assertIn("router_records=missing(hf=True, titan=False)", diagnostics)
+        self.assertIn("indexer : records=missing", diagnostics)
+        self.assertIn("router  : records=missing", diagnostics)
 
     def test_format_reports_incompatible_block_shape(self) -> None:
         malformed_blocks = torch.zeros(2, 2)
@@ -354,7 +431,7 @@ class TestGlm5ParityDiagnostics(unittest.TestCase):
         diagnostics = _format_parity_diagnostics(records, torch.tensor([[0, 1]]))
 
         self.assertIn(
-            "block_shape_error=expected [B, L, D] compatible with positions",
+            "block   : shape_error=expected [B, L, D] compatible with positions",
             diagnostics,
         )
 
@@ -448,11 +525,11 @@ class TestGlm5TransformersComponentParity(unittest.TestCase):
         cls.hidden_states = torch.randn(
             cls.batch_size,
             cls.sequence_length,
-            256, # hidden_size, 最好不要硬编码
+            256,  # hidden_size, 最好不要硬编码
             device=cls.device,
             dtype=torch.float32,
         )
-        # 给seq创建自然位置编号[0, 1, 2, ..., sequence_length-1], 
+        # 给seq创建自然位置编号[0, 1, 2, ..., sequence_length-1],
         cls.positions = torch.arange(
             cls.sequence_length, device=cls.device, dtype=torch.long
         ).expand(cls.batch_size, -1)
