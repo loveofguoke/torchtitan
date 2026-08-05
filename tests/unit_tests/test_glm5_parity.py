@@ -17,8 +17,8 @@ The module separates five concerns:
 * The single test class declares the component, layers, precision, and data.
 
 The reference model is optional and all HF comparisons are CUDA-gated.  The
-native router precision tests remain CPU-safe.  Reports include canonical
-module paths, mismatch positions, and endpoint precision labels.
+native router precision tests remain CPU-safe.  Reports use canonical paths,
+compact numeric summaries, and explicit discrete selections.
 """
 
 from __future__ import annotations
@@ -428,19 +428,159 @@ class ComparisonResult:
     level: int = 0
     node_kind: str = "checkpoint"
     checkpoint: bool = True
+    actual_summary: str = ""
+    expected_summary: str = ""
 
 
 class ParityRecorder:
     """Collect comparable scalar rows and render a compact report."""
 
-    def __init__(self, precision: PrecisionPolicy, *, precision_label: str | None = None):
+    def __init__(
+        self,
+        precision: PrecisionPolicy,
+        *,
+        precision_label: str | None = None,
+        title: str | None = None,
+    ):
         self.precision = precision
         self.precision_label = precision_label or precision.name
+        self.title = title or self.precision_label
         self.results: list[ComparisonResult] = []
 
     @staticmethod
     def _cpu(tensor: torch.Tensor) -> torch.Tensor:
         return tensor.detach().float().cpu()
+
+    @staticmethod
+    def _numeric_summary(tensor: torch.Tensor) -> str:
+        value = tensor.detach().cpu()
+        if value.numel() <= 8:
+            values = value.reshape(-1).tolist()
+            formatted = []
+            for item in values:
+                formatted.append(
+                    str(int(item)) if isinstance(item, int) else f"{float(item):.6g}"
+                )
+            return "[" + ", ".join(formatted) + "]"
+        return f"shape={tuple(value.shape)}"
+
+    @staticmethod
+    def _discrete_summary(
+        tensor: torch.Tensor,
+        positions: torch.Tensor | None,
+        mismatch_positions: list[int],
+    ) -> str:
+        value = tensor.detach().cpu()
+        if value.ndim == 3:
+            sequence_length = value.shape[1]
+            selected = sorted(set(mismatch_positions)) or [0]
+            entries = []
+            for position in selected[:8]:
+                if position >= sequence_length:
+                    continue
+                entries.append(
+                    f"p{position}={value[0, position].reshape(-1).tolist()}"
+                )
+            suffix = "" if len(selected) <= 8 else f" ... (+{len(selected) - 8})"
+            return "; ".join(entries) + suffix
+        return str(value.reshape(-1).tolist())
+
+    @staticmethod
+    def _canonical_module_path(module_path: str) -> str:
+        raw = module_path.split("<->", 1)[0].strip()
+        if ":" in raw:
+            raw = raw.rsplit(":", 1)[-1]
+        replacements = (
+            ("model.layers.", "layers."),
+            (".self_attn.indexer", ".attention.indexer"),
+            (".self_attn", ".attention"),
+            (".input_layernorm", ".attention_norm"),
+            (".post_attention_layernorm", ".ffn_norm"),
+            (".q_a_proj", ".wq_a"),
+            (".q_a_layernorm", ".q_norm"),
+            (".q_b_proj", ".wq_b"),
+            (".kv_a_proj_with_mqa", ".wkv_a"),
+            (".kv_a_layernorm", ".kv_norm"),
+            (".kv_b_proj", ".wkv_b"),
+            (".o_proj", ".wo"),
+            (".mlp.gate_proj", ".feed_forward.w1"),
+            (".mlp.up_proj", ".feed_forward.w3"),
+            (".mlp.down_proj", ".feed_forward.w2"),
+            (".mlp.gate", ".moe.router"),
+            ("model.embed_tokens", "tok_embeddings"),
+            ("model.norm", "norm"),
+        )
+        for source, target in replacements:
+            raw = raw.replace(source, target)
+        return raw
+
+    @classmethod
+    def _display_path(cls, result: ComparisonResult) -> str:
+        if result.component in {"logits", "loss"}:
+            return result.component
+        if result.module_path:
+            canonical = cls._canonical_module_path(result.module_path)
+            if canonical:
+                if result.component == "router_indices":
+                    return f"{canonical}.indices"
+                if result.component == "router_weights":
+                    return f"{canonical}.weights"
+                return canonical
+        if result.parent_path == "layers" and isinstance(result.layer, int):
+            return f"layers.{result.layer}"
+        if result.parent_path:
+            return f"{result.parent_path}.{result.component}"
+        if result.component:
+            return result.component
+        return cls._canonical_module_path(result.module_path)
+
+    @classmethod
+    def _path_key(cls, result: ComparisonResult) -> tuple[tuple[int, object], ...]:
+        path = cls._display_path(result)
+        parts = [part for part in re.split(r"(\d+)", path) if part]
+        return tuple(
+            (0, int(part)) if part.isdigit() else (1, part)
+            for part in parts
+        )
+
+    @staticmethod
+    def _phase(result: ComparisonResult) -> int:
+        """Keep forward evidence ahead of outputs, backward, and parameters."""
+        if result.component in {"logits", "loss"}:
+            return 1
+        if result.scope == "activation_gradient":
+            return 2
+        if result.scope == "gradient":
+            return 3
+        if result.scope == "parameters":
+            return 4
+        return 0
+
+    @classmethod
+    def _result_key(
+        cls, result: ComparisonResult
+    ) -> tuple[int, tuple[tuple[int, object], ...]]:
+        return cls._phase(result), cls._path_key(result)
+
+    def ordered_results(self) -> list[ComparisonResult]:
+        return sorted(self.results, key=self._result_key)
+
+    def summary(self) -> str:
+        checkpoint_total = sum(result.checkpoint for result in self.results)
+        trace_total = len(self.results) - checkpoint_total
+        passed = checkpoint_total - len(self.failed)
+        rate = (
+            100.0
+            if checkpoint_total == 0
+            else 100.0 * passed / checkpoint_total
+        )
+        component_names = sorted({result.component for result in self.results})
+        return (
+            f"rows={len(self.results)} checkpoints={checkpoint_total} "
+            f"trace_rows={trace_total} passed={passed} "
+            f"failed={len(self.failed)} pass_rate={rate:.1f}% "
+            f"components={','.join(component_names)}"
+        )
 
     def tensor(
         self,
@@ -471,6 +611,8 @@ class ParityRecorder:
                 level=level,
                 node_kind=node_kind,
                 checkpoint=checkpoint,
+                actual_summary=f"shape={tuple(actual_cpu.shape)}",
+                expected_summary=f"shape={tuple(expected_cpu.shape)}",
             )
         else:
             diff = (actual_cpu - expected_cpu).abs()
@@ -508,6 +650,8 @@ class ParityRecorder:
                 level=level,
                 node_kind=node_kind,
                 checkpoint=checkpoint,
+                actual_summary=self._numeric_summary(actual_cpu),
+                expected_summary=self._numeric_summary(expected_cpu),
             )
         self.results.append(result)
         return result
@@ -575,6 +719,12 @@ class ParityRecorder:
             level=level,
             node_kind=node_kind,
             checkpoint=checkpoint,
+            actual_summary=self._discrete_summary(
+                actual_cpu, positions, sorted(mismatch_positions)
+            ),
+            expected_summary=self._discrete_summary(
+                expected_cpu, positions, sorted(mismatch_positions)
+            ),
         )
         self.results.append(result)
         return result
@@ -606,6 +756,8 @@ class ParityRecorder:
             level=level,
             node_kind=node_kind,
             checkpoint=checkpoint,
+            actual_summary="present" if "actual=True" in detail else "missing",
+            expected_summary="present" if "expected=True" in detail else "missing",
         )
         self.results.append(result)
         return result
@@ -625,12 +777,21 @@ class ParityRecorder:
 
     def table(self, *, color: bool = False) -> str:
         headers = (
-            "scope", "level", "parent", "component", "node_kind", "checkpoint",
-            "module_path", "precision", "layer", "samples", "status", "max_abs",
-            "max_rel", "mismatches", "positions", "detail",
+            "component",
+            "actual",
+            "expected",
+            "max_abs",
+            "max_rel",
+            "mismatches",
+            "status",
         )
-        lines = [" | ".join(headers), "-|-|-|-|-|-|-|-|-|-|-|-|-|-|-| "]
-        for result in self.results:
+        lines = [
+            f"GLM-5 parity report: {self.title}",
+            "",
+            " | ".join(headers),
+            "-|-|-|-|-|-|-| ",
+        ]
+        for result in self.ordered_results():
             status = self._status(result)
             if color:
                 status = (
@@ -643,96 +804,71 @@ class ParityRecorder:
             lines.append(
                 " | ".join(
                     (
-                        result.scope,
-                        str(result.level),
-                        result.parent_path,
-                        result.component,
-                        result.node_kind,
-                        "yes" if result.checkpoint else "no",
-                        result.module_path,
-                        result.precision,
-                        str(result.layer),
-                        str(result.samples),
-                        status,
+                        self._display_path(result),
+                        result.actual_summary or "-",
+                        result.expected_summary or "-",
                         "-" if result.max_abs is None else f"{result.max_abs:.6g}",
                         "-" if result.max_rel is None else f"{result.max_rel:.6g}",
                         str(result.mismatch_count),
-                        str(result.mismatch_positions),
-                        result.detail
-                        + ("; " if result.detail and result.peak_position is not None else "")
-                        + (
-                            f"peak_position={result.peak_position}"
-                            if result.peak_position is not None
-                            and "peak_position=" not in result.detail
-                            else ""
-                        ),
+                        status,
                     )
                 )
             )
-        checkpoint_total = sum(result.checkpoint for result in self.results)
-        trace_total = len(self.results) - checkpoint_total
-        passed = checkpoint_total - len(self.failed)
-        rate = (
-            100.0
-            if checkpoint_total == 0
-            else 100.0 * passed / checkpoint_total
-        )
         lines.append("")
-        lines.append(
-            f"summary: precision={self.precision_label} rows={len(self.results)} "
-            f"checkpoints={checkpoint_total} trace_rows={trace_total} "
-            f"passed={passed} failed={len(self.failed)} pass_rate={rate:.1f}%"
-        )
+        lines.append(f"summary: {self.summary()}")
         return "\n".join(lines)
+
+    def html_table(self) -> str:
+        rows = []
+        for result in self.ordered_results():
+            status = self._status(result)
+            status_class = (
+                "pass" if status == "PASS"
+                else "fail" if status == "FAIL" else "trace"
+            )
+            rows.append(
+                "<tr>"
+                f"<td>{escape(self._display_path(result))}</td>"
+                f"<td>{escape(result.actual_summary or '-')}</td>"
+                f"<td>{escape(result.expected_summary or '-')}</td>"
+                f"<td>{'-' if result.max_abs is None else f'{result.max_abs:.6g}'}</td>"
+                f"<td>{'-' if result.max_rel is None else f'{result.max_rel:.6g}'}</td>"
+                f"<td>{result.mismatch_count}</td>"
+                f"<td class='{status_class}'>{status}</td>"
+                "</tr>"
+            )
+        return (
+            "<table><thead><tr><th>component</th><th>actual</th>"
+            "<th>expected</th><th>max_abs</th><th>max_rel</th>"
+            "<th>mismatches</th><th>status</th></tr></thead><tbody>"
+            + "".join(rows)
+            + "</tbody></table>"
+        )
+
+    def html_section(self, section_id: str) -> str:
+        failed_class = "fail" if self.failed else "pass"
+        return (
+            f"<section id='{escape(section_id)}'>"
+            f"<h2>{escape(self.title)}</h2>"
+            f"<p class='{failed_class}'>{escape(self.summary())}</p>"
+            f"{self.html_table()}</section>"
+        )
 
     def write(self, path: str | None = None) -> str:
         report = self.table(color=False)
         output_path = path or os.environ.get("GLM5_PARITY_REPORT")
         if output_path:
             if output_path.lower().endswith(".html"):
-                rows = []
-                for result in self.results:
-                    status = self._status(result)
-                    status_class = (
-                        "pass" if status == "PASS"
-                        else "fail" if status == "FAIL" else "trace"
-                    )
-                    rows.append(
-                        "<tr>"
-                        f"<td>{escape(result.scope)}</td>"
-                        f"<td>{result.level}</td>"
-                        f"<td>{escape(result.parent_path)}</td>"
-                        f"<td>{escape(result.component)}</td>"
-                        f"<td>{escape(result.node_kind)}</td>"
-                        f"<td>{'yes' if result.checkpoint else 'no'}</td>"
-                        f"<td>{escape(result.module_path)}</td>"
-                        f"<td>{escape(result.precision)}</td>"
-                        f"<td>{escape(str(result.layer))}</td>"
-                        f"<td>{result.samples}</td>"
-                        f"<td class='{status_class}'>{status}</td>"
-                        f"<td>{'-' if result.max_abs is None else f'{result.max_abs:.6g}'}</td>"
-                        f"<td>{'-' if result.max_rel is None else f'{result.max_rel:.6g}'}</td>"
-                        f"<td>{result.mismatch_count}</td>"
-                        f"<td>{escape(str(result.mismatch_positions))}</td>"
-                        f"<td>{escape(result.detail)}</td>"
-                        "</tr>"
-                    )
                 html_report = (
                     "<!doctype html><html><head><meta charset='utf-8'>"
                     "<style>body{font-family:monospace}table{border-collapse:collapse}"
                     "th,td{border:1px solid #bbb;padding:4px 8px}"
+                    "td:first-child{white-space:nowrap}"
                     ".pass{color:#087f23;font-weight:bold}.fail{color:#b00020;font-weight:bold}"
                     ".trace{color:#007c91;font-weight:bold}"
                     "</style></head><body>"
-                    f"<h2>GLM-5 parity report ({escape(self.precision_label)})</h2>"
-                    "<table><tr><th>scope</th><th>level</th><th>parent</th>"
-                    "<th>component</th><th>node_kind</th><th>checkpoint</th>"
-                    "<th>module_path</th><th>precision</th>"
-                    "<th>layer</th><th>samples</th><th>status</th><th>max_abs</th>"
-                    "<th>max_rel</th><th>mismatches</th><th>positions</th><th>detail</th></tr>"
-                    + "".join(rows)
-                    + "</table>"
-                    f"<p>{escape(report.splitlines()[-1])}</p></body></html>\n"
+                    f"<h1>GLM-5 parity report</h1>{self.html_section('result')}"
+                    "</body></html>\n"
                 )
                 with open(output_path, "w", encoding="utf-8") as file:
                     file.write(html_report)
@@ -744,6 +880,64 @@ class ParityRecorder:
     def assert_all_passed(self) -> None:
         if self.failed:
             raise AssertionError(self.table(color=False))
+
+
+@dataclass
+class ParityReportSection:
+    section_id: str
+    recorder: ParityRecorder
+
+
+class ParitySuiteReport:
+    """Render independently executed parity tests into one HTML document."""
+
+    def __init__(self, title: str):
+        self.title = title
+        self.sections: list[ParityReportSection] = []
+
+    def add(self, section_id: str, recorder: ParityRecorder) -> None:
+        self.sections.append(ParityReportSection(section_id, recorder))
+
+    @property
+    def failed(self) -> list[ParityReportSection]:
+        return [section for section in self.sections if section.recorder.failed]
+
+    def write(self, path: str) -> None:
+        if not path.lower().endswith(".html"):
+            raise ValueError("GLM5_PARITY_REPORT must end with .html")
+        links = "".join(
+            f"<li><a href='#{escape(section.section_id)}'>"
+            f"{escape(section.recorder.title)}</a></li>"
+            for section in self.sections
+        )
+        sections = "".join(
+            section.recorder.html_section(section.section_id)
+            for section in self.sections
+        )
+        document = (
+            "<!doctype html><html><head><meta charset='utf-8'>"
+            "<style>"
+            "body{font-family:ui-monospace,Consolas,monospace;margin:24px}"
+            "nav{position:sticky;top:0;background:#fff;padding:8px 0;border-bottom:1px solid #bbb}"
+            "nav ul{display:flex;gap:18px;flex-wrap:wrap;list-style:none;padding:0}"
+            "section{margin:36px 0}table{border-collapse:collapse;width:100%}"
+            "th,td{border:1px solid #bbb;padding:4px 8px;text-align:left}"
+            "th{position:sticky;top:72px;background:#f5f5f5}"
+            "td:first-child{white-space:nowrap}"
+            ".pass{color:#087f23;font-weight:bold}"
+            ".fail{color:#b00020;font-weight:bold}"
+            ".trace{color:#007c91;font-weight:bold}"
+            "</style></head><body>"
+            f"<h1>{escape(self.title)}</h1>"
+            f"<nav><ul>{links}</ul></nav>{sections}</body></html>\n"
+        )
+        with open(path, "w", encoding="utf-8") as file:
+            file.write(document)
+
+    def failure_message(self) -> str:
+        return "\n\n".join(
+            section.recorder.table(color=False) for section in self.failed
+        )
 
 
 def _format_parity_diagnostics(
@@ -1170,7 +1364,9 @@ class ComponentParityMixin:
         layer_indices: list[int],
         recorder: ParityRecorder,
     ) -> None:
-        """Trace the complete selected layers for a component-level test."""
+        """Trace the selected component subtree across the requested layers."""
+        if not layer_indices:
+            return
         actual = ModelEndpoint("titan", self.precision)
         expected = ModelEndpoint("hf", self.precision)
         endpoints = {
@@ -1203,7 +1399,15 @@ class ComponentParityMixin:
                         self.batch.positions,
                     )
         self._record_recursive_trace(
-            spec, trace, recorder, layer_indices=layer_indices
+            spec,
+            trace,
+            recorder,
+            layer_indices=layer_indices,
+            component_filter=self._normalize_component_name(
+                layer_indices[0], component
+            ),
+            composition_checkpoints=False,
+            skip_layer_roots=False,
         )
 
     def _normalized(self, layer_index: int) -> torch.Tensor:
@@ -1575,7 +1779,11 @@ class ComponentParityMixin:
             "block": self.compare_blocks,
         }
         if component in runners and spec is None and not sequential:
-            return runners[component](layer_indices)
+            recorder = runners[component](layer_indices)
+            self._record_component_trace(
+                component, layer_indices, recorder
+            )
+            return recorder
         return self.compare_component_trace(
             component, layer_indices, spec=spec, sequential=sequential
         )
@@ -1618,7 +1826,6 @@ class ComponentParityMixin:
                 level=4,
                 node_kind="discrete_checkpoint",
             )
-        self._record_component_trace("indexer", layer_indices, recorder)
         return recorder
 
     def compare_router(self, layer_indices: list[int]) -> ParityRecorder:
@@ -1650,7 +1857,6 @@ class ComponentParityMixin:
                 level=4,
                 node_kind="activation_checkpoint",
             )
-        self._record_component_trace("router", layer_indices, recorder)
         return recorder
 
     def compare_attention(self, layer_indices: list[int]) -> ParityRecorder:
@@ -1674,7 +1880,6 @@ class ComponentParityMixin:
                 level=3,
                 node_kind="attention_checkpoint",
             )
-        self._record_component_trace("attention", layer_indices, recorder)
         return recorder
 
     def compare_blocks(self, layer_indices: list[int]) -> ParityRecorder:
@@ -1700,7 +1905,6 @@ class ComponentParityMixin:
                 level=2,
                 node_kind="layer_checkpoint",
             )
-        self._record_component_trace("block", layer_indices, recorder)
         return recorder
 
 
@@ -1826,203 +2030,70 @@ class _ParityRouterPrecision:
 
 
 class _ParityComponentTests(ComponentParityMixin):
-    def _assert_recorder(self, recorder: ParityRecorder) -> None:
-        report_path = os.environ.get("GLM5_PARITY_REPORT")
-        if report_path:
-            root, extension = os.path.splitext(report_path)
-            safe_name = self.id().split(".")[-1]
-            report_path = f"{root}__{safe_name}{extension or '.txt'}"
-        recorder.write(report_path)
-        recorder.assert_all_passed()
+    _active_suite_report: ParitySuiteReport | None = None
 
-    def _check_indexer_topk_matches_transformers(self) -> None:
-        self._assert_recorder(self.compare_indexer(self._selected_layers()))
-
-    def _check_router_selection_and_weights(self) -> None:
-        layers = [
-            layer
-            for layer in self._selected_layers()
-            if self.pair.titan_layer(layer).moe_enabled
-        ]
-        self._assert_recorder(self.compare_router(layers))
-
-    def _check_attention_output(self) -> None:
-        self._assert_recorder(self.compare_attention(self._selected_layers()))
-
-    def _check_dense_block_output(self) -> None:
-        self._assert_recorder(self.compare_blocks(self._selected_layers()))
-
-
-class _ParityTrainingTests:
-    """Reusable training-path checks for the selected runtime precision."""
-
-    def _check_end_to_end_output_loss_moe_and_gradients(self) -> None:
-        assert self.batch.tokens is not None
-        labels = self.batch.tokens.clone()
-        layer_indices = list(range(len(self.pair.hf.model.layers)))
-        recorder = ParityRecorder(self.precision)
-        self.pair.hf.zero_grad(set_to_none=True)
-        self.pair.titan.zero_grad(set_to_none=True)
-        # Keep the original routed-MoE block probe in addition to the full
-        # model trace.  It isolates the first MoE layer from later error
-        # accumulation.
-        with torch.no_grad():
-            moe_input = self.pair.hf.model.embed_tokens(self.batch.tokens)
-            hf_moe_position_embeddings = self.pair.hf.model.rotary_emb(
-                moe_input, position_ids=self.batch.positions
-            )
-            hf_moe_output = self.pair.hf.model.layers[1](
-                moe_input,
-                attention_mask=self.batch.causal_mask,
-                position_ids=self.batch.positions,
-                position_embeddings=hf_moe_position_embeddings,
-                use_cache=False,
-            )[0]
-            titan_moe_output = self.pair.titan.layers["1"](
-                moe_input, self.batch.causal_mask, self.batch.positions
-            )
-        recorder.tensor(
-            scope="component",
-            component="moe_block_direct",
-            layer=1,
-            actual=titan_moe_output,
-            expected=hf_moe_output,
-            module_path=(
-                "hf:model.layers.1.mlp <-> titan:layers.1.moe"
-            ),
+    def _publish_recorder(
+        self,
+        recorder: ParityRecorder,
+        section_id: str,
+        title: str,
+    ) -> str:
+        """Publish one test now or register it with the active suite report."""
+        recorder.title = (
+            f"{title} [{recorder.precision_label}] "
+            f"(layers={self.LAYER_INDICES})"
         )
-        with LayerTrace.install(self.pair, layer_indices) as trace:
-            hf_outputs = self.pair.hf(
-                input_ids=self.batch.tokens,
-                position_ids=self.batch.positions,
-                attention_mask=self.batch.causal_mask,
-                labels=labels,
-                use_cache=False,
-            )
-            titan_logits = self.pair.titan(
-                self.batch.tokens, positions=self.batch.positions,
-                attention_masks=self.batch.causal_mask,
-            )
-
-        for layer_index in layer_indices:
-            if layer_index in trace.blocks_hf and layer_index in trace.blocks_titan:
-                recorder.tensor(
-                    scope="e2e", component="decoder_block", layer=layer_index,
-                    actual=trace.blocks_titan[layer_index],
-                    expected=trace.blocks_hf[layer_index],
-                    module_path=f"layers.{layer_index}",
-                )
-            if layer_index in trace.indexer_hf and layer_index in trace.indexer_titan:
-                recorder.discrete(
-                    scope="e2e", component="indexer", layer=layer_index,
-                    actual=trace.indexer_titan[layer_index],
-                    expected=trace.indexer_hf[layer_index],
-                    positions=self.batch.positions,
-                    module_path=f"layers.{layer_index}.attention.indexer",
-                )
-            if layer_index in trace.router_hf and layer_index in trace.router_titan:
-                recorder.discrete(
-                    scope="e2e", component="router", layer=layer_index,
-                    actual=trace.router_titan[layer_index],
-                    expected=trace.router_hf[layer_index],
-                    module_path=f"layers.{layer_index}.moe.router",
-                )
-
-        hf_loss = hf_outputs.loss
-        titan_loss = F.cross_entropy(
-            titan_logits[:, :-1].float().reshape(-1, titan_logits.shape[-1]),
-            labels[:, 1:].reshape(-1),
-        )
-        recorder.tensor(
-            scope="e2e", component="logits", layer="all",
-            actual=titan_logits, expected=hf_outputs.logits,
-            module_path="lm_head",
-        )
-        recorder.tensor(
-            scope="e2e", component="loss", layer="all",
-            actual=titan_loss, expected=hf_loss,
-            module_path="loss",
-        )
-
-        hf_loss.backward()
-        titan_loss.backward()
-        hf_layer0 = self.pair.hf.model.layers[0]
-        titan_layer0 = self.pair.titan.layers["0"]
-        hf_layer1 = self.pair.hf.model.layers[1]
-        titan_layer1 = self.pair.titan.layers["1"]
-        expert_width = self.pair.hf.config.moe_intermediate_size
-        gradient_pairs = (
-            (
-                "embedding",
-                self.pair.hf.model.embed_tokens.weight.grad,
-                self.pair.titan.tok_embeddings.weight.grad,
-                "hf:model.embed_tokens.weight <-> titan:tok_embeddings.weight",
-            ),
-            (
-                "q_a_proj",
-                hf_layer0.self_attn.q_a_proj.weight.grad,
-                titan_layer0.attention.wq_a.weight.grad,
-                "hf:model.layers.0.self_attn.q_a_proj.weight <-> "
-                "titan:layers.0.attention.wq_a.weight",
-            ),
-            (
-                "dense_gate_proj",
-                hf_layer0.mlp.gate_proj.weight.grad,
-                titan_layer0.feed_forward.w1.weight.grad,
-                "hf:model.layers.0.mlp.gate_proj.weight <-> titan:layers.0.feed_forward.w1.weight",
-            ),
-            (
-                "router_gate",
-                hf_layer1.mlp.gate.weight.grad,
-                titan_layer1.moe.router.gate.weight.grad,
-                "hf:model.layers.1.mlp.gate.weight <-> titan:layers.1.moe.router.gate.weight",
-            ),
-            (
-                "routed_gate_up",
-                hf_layer1.mlp.experts.gate_up_proj.grad[:, :expert_width],
-                titan_layer1.moe.routed_experts.inner_experts.w1_EFD.grad,
-                "hf:model.layers.1.mlp.experts.gate_up_proj[:, :expert_width] <-> "
-                "titan:layers.1.moe.routed_experts.inner_experts.w1_EFD",
-            ),
-            (
-                "routed_up",
-                hf_layer1.mlp.experts.gate_up_proj.grad[:, expert_width:],
-                titan_layer1.moe.routed_experts.inner_experts.w3_EFD.grad,
-                "hf:model.layers.1.mlp.experts.gate_up_proj[:, expert_width:] <-> "
-                "titan:layers.1.moe.routed_experts.inner_experts.w3_EFD",
-            ),
-            (
-                "routed_down",
-                hf_layer1.mlp.experts.down_proj.grad,
-                titan_layer1.moe.routed_experts.inner_experts.w2_EDF.grad,
-                "hf:model.layers.1.mlp.experts.down_proj <-> "
-                "titan:layers.1.moe.routed_experts.inner_experts.w2_EDF",
-            ),
-            (
-                "lm_head",
-                self.pair.hf.lm_head.weight.grad,
-                self.pair.titan.lm_head.weight.grad,
-                "hf:lm_head.weight <-> titan:lm_head.weight",
-            ),
-        )
-        for name, hf_gradient, titan_gradient, module_path in gradient_pairs:
-            self.assertIsNotNone(hf_gradient, f"HF {name} gradient is missing")
-            self.assertIsNotNone(titan_gradient, f"TorchTitan {name} gradient is missing")
-            assert hf_gradient is not None and titan_gradient is not None
-            recorder.tensor(
-                scope="gradient", component=name, layer="all",
-                actual=titan_gradient, expected=hf_gradient,
-                module_path=module_path,
-            )
-        for model in (self.pair.hf, self.pair.titan):
-            for name, parameter in model.named_parameters():
-                if ".indexer." in name:
-                    self.assertIsNone(parameter.grad, f"indexer gradient found: {name}")
-
-        report_path = os.environ.get("GLM5_PARITY_REPORT")
-        report = recorder.write(report_path)
+        if self._active_suite_report is not None:
+            self._active_suite_report.add(section_id, recorder)
+            return recorder.table(color=False)
+        report = recorder.write(os.environ.get("GLM5_PARITY_REPORT"))
         if recorder.failed:
-            raise AssertionError(report)
+            recorder.assert_all_passed()
+        return report
+
+    def _uses_exact_transformers_component_path(self) -> bool:
+        spec = self._configured_spec()
+        return (
+            spec.actual.implementation == "titan"
+            and spec.expected.implementation == "hf"
+            and spec.actual.precision is spec.expected.precision
+        )
+
+    def _configured_component_recorder(self, component: str) -> ParityRecorder:
+        """Select the exact or generic compare implementation from config."""
+        layers = self._selected_layers()
+        exact_components = {"indexer", "router", "attention", "block"}
+        if (
+            self._uses_exact_transformers_component_path()
+            and component in exact_components
+        ):
+            if component == "router":
+                layers = [
+                    layer
+                    for layer in layers
+                    if self.pair.titan_layer(layer).moe_enabled
+                ]
+            return self.compare_components(component, layers)
+        return self.compare_component_trace(
+            component,
+            layers,
+            spec=self._configured_spec(),
+            sequential=self.COMPONENT_EXECUTION.lower() == "sequential",
+        )
+
+    def _check_indexer_topk_matches_transformers(self) -> ParityRecorder:
+        return self._configured_component_recorder("indexer")
+
+    def _check_router_selection_and_weights(self) -> ParityRecorder:
+        return self._configured_component_recorder("router")
+
+    def _check_attention_output(self) -> ParityRecorder:
+        return self._configured_component_recorder("attention")
+
+    def _check_dense_block_output(self) -> ParityRecorder:
+        return self._configured_component_recorder("block")
+
+
 
 
 class TestGlm5Parity(
@@ -2030,7 +2101,6 @@ class TestGlm5Parity(
     _ParityDiagnostics,
     _ParityRouterPrecision,
     _ParityComponentTests,
-    _ParityTrainingTests,
 ):
     """Single configurable GLM-5 parity suite.
 
@@ -2049,8 +2119,12 @@ class TestGlm5Parity(
     The test methods do not construct a precision-specific class.  They use
     the models and batches prepared here.  Fixed runners preserve the original
     checks, while ``compare_component`` can trace any named module path.
+    ``test_configured_precision_suite`` is the complete entry point.  It calls
+    the independent component and end-to-end tests, then combines their tables
+    into the single HTML file selected by ``GLM5_PARITY_REPORT``.
     """
 
+    # Runtime test configuration.
     ACTUAL_ENDPOINT = os.environ.get("GLM5_PARITY_ACTUAL", "titan:fp32")
     EXPECTED_ENDPOINT = os.environ.get("GLM5_PARITY_EXPECTED", "hf:fp32")
     PRECISION_OVERRIDE = os.environ.get("GLM5_PARITY_PRECISION")
@@ -2264,6 +2338,8 @@ class TestGlm5Parity(
         *,
         layer_indices: list[int] | None = None,
         component_filter: str | None = None,
+        composition_checkpoints: bool = True,
+        skip_layer_roots: bool = True,
     ) -> None:
         """Add every captured module activation to the hierarchical report."""
         selected_layers = (
@@ -2299,10 +2375,27 @@ class TestGlm5Parity(
                 logical_path = self._logical_activation_path(endpoint, endpoint_path)
                 logical.setdefault(logical_path, {})[label] = (endpoint_path, value)
 
-        explicit_paths = {
-            f"layers.{layer}"
-            for layer in selected_layers
-        }
+        # HF composition modules may return tuples while TorchTitan returns a
+        # tensor.  Compare the first tensor leaf under the common module path.
+        normalized_logical: dict[str, dict[str, tuple[str, torch.Tensor]]] = {}
+        for logical_path, values in logical.items():
+            base_path = logical_path.split("[", 1)[0]
+            target_path = (
+                base_path
+                if re.fullmatch(r"layers\.\d+", base_path)
+                or base_path.endswith((".attention", ".moe", ".feed_forward"))
+                else logical_path
+            )
+            target_values = normalized_logical.setdefault(target_path, {})
+            for label, value in values.items():
+                target_values.setdefault(label, value)
+        logical = normalized_logical
+
+        explicit_paths = (
+            {f"layers.{layer}" for layer in selected_layers}
+            if skip_layer_roots
+            else set()
+        )
         if normalized_filter is None:
             explicit_paths.update(
                 path
@@ -2337,8 +2430,9 @@ class TestGlm5Parity(
             parent_path = base_logical.rpartition(".")[0]
             level = len(logical_path.split(".")) - 1
             component = logical_path.rsplit(".", 1)[-1]
-            checkpoint = base_logical.endswith(
-                (".attention", ".moe", ".feed_forward")
+            checkpoint = (
+                composition_checkpoints
+                and base_logical.endswith((".attention", ".moe", ".feed_forward"))
             ) or base_logical in filter_paths or (
                 leaf_filter and base_logical.endswith(f".{normalized_filter}")
             )
@@ -2364,7 +2458,7 @@ class TestGlm5Parity(
                     parent_path=parent_path,
                     level=level,
                     node_kind=node_kind,
-                    checkpoint=False,
+                    checkpoint=checkpoint,
                     detail=(
                         f"trace-only missing actual={actual_value is not None}, "
                         f"expected={expected_value is not None}"
@@ -2379,6 +2473,31 @@ class TestGlm5Parity(
                     actual=actual_value[1],
                     expected=expected_value[1],
                     positions=self._batch_for(spec.actual).positions,
+                    module_path=module_path,
+                    parent_path=parent_path,
+                    level=level,
+                    node_kind="discrete_checkpoint",
+                    checkpoint=checkpoint,
+                )
+                continue
+            if actual_value[1].dtype in {
+                torch.int8,
+                torch.int16,
+                torch.int32,
+                torch.int64,
+                torch.uint8,
+            }:
+                recorder.discrete(
+                    scope="trace",
+                    component=component,
+                    layer=layer,
+                    actual=actual_value[1],
+                    expected=expected_value[1],
+                    positions=(
+                        self._batch_for(spec.actual).positions
+                        if actual_value[1].ndim == 3
+                        else None
+                    ),
                     module_path=module_path,
                     parent_path=parent_path,
                     level=level,
@@ -2440,6 +2559,18 @@ class TestGlm5Parity(
             for endpoint_path, value in trace.gradients[label].items():
                 logical_path = self._logical_activation_path(endpoint, endpoint_path)
                 logical.setdefault(logical_path, {})[label] = (endpoint_path, value)
+        normalized_logical: dict[str, dict[str, tuple[str, torch.Tensor]]] = {}
+        for logical_path, values in logical.items():
+            base_path = logical_path.split("[", 1)[0]
+            target_path = (
+                base_path
+                if base_path.endswith((".attention", ".moe", ".feed_forward"))
+                else logical_path
+            )
+            target_values = normalized_logical.setdefault(target_path, {})
+            for label, value in values.items():
+                target_values.setdefault(label, value)
+        logical = normalized_logical
         for logical_path in sorted(logical):
             base_logical = logical_path.split("[", 1)[0]
             selected_match = bool(
@@ -2996,69 +3127,45 @@ class TestGlm5Parity(
     def test_indexer_topk_matches_transformers_exactly(self) -> None:
         if not self.gpu_ready:
             self.skipTest(self.gpu_skip_reason)
-        self._check_indexer_topk_matches_transformers()
+        self._publish_recorder(
+            self._check_indexer_topk_matches_transformers(),
+            "component-indexer",
+            "Indexer parity",
+        )
 
     def test_router_selection_and_weights_match_transformers_exactly(self) -> None:
         if not self.gpu_ready:
             self.skipTest(self.gpu_skip_reason)
-        self._check_router_selection_and_weights()
-
-    def test_attention_output_matches_transformers_fp32(self) -> None:
-        if not self.gpu_ready:
-            self.skipTest(self.gpu_skip_reason)
-        self._check_attention_output()
-
-    def test_dense_block_output_matches_transformers_fp32(self) -> None:
-        if not self.gpu_ready:
-            self.skipTest(self.gpu_skip_reason)
-        self._check_dense_block_output()
-
-    def test_end_to_end_bfloat16_output_loss_moe_and_gradients(self) -> None:
-        if not self.gpu_ready:
-            self.skipTest(self.gpu_skip_reason)
-        spec = ComparisonSpec(
-            actual=ModelEndpoint("titan", BF16),
-            expected=ModelEndpoint("hf", BF16),
-            scope="legacy_bf16",
-            component="model",
-            rtol=BF16.rtol,
-            atol=BF16.atol,
+        self._publish_recorder(
+            self._check_router_selection_and_weights(),
+            "component-router",
+            "Router parity",
         )
-        recorder = self.compare_end_to_end(spec)
-        report_path = os.environ.get("GLM5_PARITY_REPORT")
-        if report_path:
-            root, extension = os.path.splitext(report_path)
-            report_path = f"{root}__legacy_bf16{extension or '.txt'}"
-        report = recorder.write(report_path)
-        if recorder.failed:
-            raise AssertionError(report)
 
-    def test_configured_precision_suite(self) -> None:
-        """Run the selected precision pair and all applicable comparisons."""
+    def test_attention_output_matches_transformers(self) -> None:
         if not self.gpu_ready:
             self.skipTest(self.gpu_skip_reason)
-        spec = self._configured_spec()
-        recorder = self.compare_end_to_end(spec)
-
-        same_precision = spec.actual.precision is spec.expected.precision
-        cross_implementation = (
-            spec.actual.implementation != spec.expected.implementation
+        self._publish_recorder(
+            self._check_attention_output(),
+            "component-attention",
+            "Attention parity",
         )
-        if same_precision and cross_implementation:
-            if self._component_enabled("indexer"):
-                self._check_indexer_topk_matches_transformers()
-            if self._component_enabled("router"):
-                self._check_router_selection_and_weights()
-            if self._component_enabled("attention"):
-                self._check_attention_output()
-            if self._component_enabled("block"):
-                self._check_dense_block_output()
-        selected_components = {
-            item.strip().lower()
-            for item in self.RUN_COMPONENTS.split(",")
-            if item.strip() and item.strip().lower() != "all"
-        }
+
+    def test_dense_block_output_matches_transformers(self) -> None:
+        if not self.gpu_ready:
+            self.skipTest(self.gpu_skip_reason)
+        self._publish_recorder(
+            self._check_dense_block_output(),
+            "component-block",
+            "Decoder block parity",
+        )
+
+    def test_selected_component_parity(self) -> None:
+        """Run generic compare functions for configured custom components."""
+        if not self.gpu_ready:
+            self.skipTest(self.gpu_skip_reason)
         fixed_components = {
+            "all",
             "indexer",
             "router",
             "attention",
@@ -3070,30 +3177,55 @@ class TestGlm5Parity(
             "model",
             "e2e",
         }
-        for component in sorted(selected_components - fixed_components):
-            component_recorder = self.compare_component_trace(
-                component,
-                self._selected_layers(),
-                spec=spec,
-                sequential=self.COMPONENT_EXECUTION.lower() == "sequential",
+        selected = {
+            item.strip().lower()
+            for item in self.RUN_COMPONENTS.split(",")
+            if item.strip()
+        }
+        for component in sorted(selected - fixed_components):
+            safe_component = re.sub(r"[^A-Za-z0-9_.-]+", "-", component)
+            self._publish_recorder(
+                self._configured_component_recorder(component),
+                f"component-{safe_component}",
+                f"Component parity: {component}",
             )
-            component_report_path = None
-            configured_report = os.environ.get("GLM5_PARITY_REPORT")
-            if configured_report:
-                root, extension = os.path.splitext(configured_report)
-                safe_component = re.sub(r"[^A-Za-z0-9_.-]+", "_", component)
-                component_report_path = (
-                    f"{root}__component_{safe_component}"
-                    f"{extension or '.txt'}"
-                )
-            component_report = component_recorder.write(component_report_path)
-            if component_recorder.failed:
-                raise AssertionError(component_report)
+
+    def test_end_to_end_output_loss_and_gradients(self) -> None:
+        if not self.gpu_ready:
+            self.skipTest(self.gpu_skip_reason)
+        self._publish_recorder(
+            self.compare_end_to_end(self._configured_spec()),
+            "end-to-end",
+            "End-to-end parity",
+        )
+
+    # Complete entry point for the configured end-to-end and component tests.
+    def test_configured_precision_suite(self) -> None:
+        """Call independent tests and combine their results into one report."""
+        if not self.gpu_ready:
+            self.skipTest(self.gpu_skip_reason)
+        spec = self._configured_spec()
+        suite_report = ParitySuiteReport(
+            f"GLM-5 parity: {spec.label}; data={self.DATA_CASE}; "
+            f"layers={self.LAYER_INDICES}"
+        )
+        self._active_suite_report = suite_report
+        try:
+            if self._component_enabled("indexer"):
+                self.test_indexer_topk_matches_transformers_exactly()
+            if self._component_enabled("router"):
+                self.test_router_selection_and_weights_match_transformers_exactly()
+            if self._component_enabled("attention"):
+                self.test_attention_output_matches_transformers()
+            if self._component_enabled("block"):
+                self.test_dense_block_output_matches_transformers()
+            self.test_selected_component_parity()
+            self.test_end_to_end_output_loss_and_gradients()
+        finally:
+            self._active_suite_report = None
+
         report_path = os.environ.get("GLM5_PARITY_REPORT")
         if report_path:
-            root, extension = os.path.splitext(report_path)
-            safe_label = spec.label.replace(":", "_").replace(" ", "_")
-            report_path = f"{root}__{safe_label}{extension or '.txt'}"
-        report = recorder.write(report_path)
-        if recorder.failed:
-            raise AssertionError(report)
+            suite_report.write(report_path)
+        if suite_report.failed:
+            raise AssertionError(suite_report.failure_message())
