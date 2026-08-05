@@ -38,6 +38,7 @@ import torch.nn.functional as F
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import TokenChoiceTopKRouter
 from torchtitan.models.glm5 import Glm5StateDictAdapter, glm5_configs
+from torchtitan.ops.scatter_add import deterministic_scatter_add
 
 _TRANSFORMERS_IMPORT_ERROR: Exception | None = None
 try:
@@ -335,6 +336,8 @@ def _build_pair(
 def _set_hf_routed_expert_compute_dtype(
     hf_model: torch.nn.Module,
     compute_dtype: torch.dtype,
+    *,
+    use_grouped_mm: bool,
 ) -> None:
     """Run HF routed experts with TorchTitan's explicit dtype boundaries."""
     if compute_dtype is not torch.bfloat16:
@@ -354,55 +357,95 @@ def _set_hf_routed_expert_compute_dtype(
             top_k_index: torch.Tensor,
             top_k_weights: torch.Tensor,
             _compute_dtype=compute_dtype,
+            _use_grouped_mm=use_grouped_mm,
         ) -> torch.Tensor:
-            # Mirror GroupedExperts.forward: input and all three expert
-            # projections run in BF16, then expert outputs return to the model
-            # dtype before routing scores are applied and tokens are combined.
-            final_hidden_states = torch.zeros_like(hidden_states)
-            with torch.no_grad():
+            if not _use_grouped_mm:
+                final_hidden_states = torch.zeros_like(hidden_states)
                 expert_mask = F.one_hot(
                     top_k_index, num_classes=self.num_experts
                 ).permute(2, 1, 0)
                 expert_hit = torch.greater(
                     expert_mask.sum(dim=(-1, -2)), 0
                 ).nonzero()
+                for expert_index_tensor in expert_hit:
+                    expert_index = expert_index_tensor[0]
+                    top_k_position, token_index = torch.where(
+                        expert_mask[expert_index]
+                    )
+                    current_state = hidden_states[token_index].to(_compute_dtype)
+                    gate_weight, up_weight = self.gate_up_proj[
+                        expert_index
+                    ].chunk(2, dim=0)
+                    gate = F.linear(
+                        current_state, gate_weight.to(_compute_dtype)
+                    )
+                    up = F.linear(
+                        current_state, up_weight.to(_compute_dtype)
+                    )
+                    current_hidden_states = self.act_fn(gate) * up
+                    current_hidden_states = F.linear(
+                        current_hidden_states,
+                        self.down_proj[expert_index].to(_compute_dtype),
+                    ).to(hidden_states.dtype)
+                    routed_weights = top_k_weights[
+                        token_index, top_k_position, None
+                    ].to(current_hidden_states.dtype)
+                    final_hidden_states.index_add_(
+                        0,
+                        token_index,
+                        current_hidden_states * routed_weights,
+                    )
+                return final_hidden_states
 
-            for expert_index_tensor in expert_hit:
-                expert_index = expert_index_tensor[0]
-                top_k_position, token_index = torch.where(
-                    expert_mask[expert_index]
-                )
-                current_state = hidden_states[token_index].to(_compute_dtype)
-                gate_weight, up_weight = self.gate_up_proj[expert_index].chunk(
-                    2, dim=0
-                )
-                gate = F.linear(
-                    current_state, gate_weight.to(_compute_dtype)
-                )
-                up = F.linear(
-                    current_state, up_weight.to(_compute_dtype)
-                )
-                current_hidden_states = self.act_fn(gate) * up
-                current_hidden_states = F.linear(
-                    current_hidden_states,
-                    self.down_proj[expert_index].to(_compute_dtype),
-                ).to(hidden_states.dtype)
+            # Mirror LocalTokenDispatcher._local_reorder exactly.  Stable
+            # expert sorting determines both grouped-MM rows and combine order.
+            top_k = top_k_index.shape[-1]
+            expert_order = torch.argsort(top_k_index.reshape(-1), stable=True)
+            token_indices = expert_order // top_k
+            routed_input = hidden_states[token_indices]
+            routed_scores = top_k_weights.reshape(-1)[expert_order]
 
-                # TorchTitan combines the BF16 expert result in the model
-                # dtype and applies its FP32 routing scores at this boundary.
-                routed_weights = top_k_weights[
-                    token_index, top_k_position, None
-                ].to(current_hidden_states.dtype)
-                final_hidden_states.index_add_(
-                    0,
-                    token_index,
-                    current_hidden_states * routed_weights,
-                )
+            routing_map = torch.zeros(
+                hidden_states.shape[0],
+                self.num_experts,
+                dtype=torch.bool,
+                device=hidden_states.device,
+            ).scatter_(1, top_k_index, True)
+            tokens_per_expert = routing_map.sum(dim=0)
+            offsets = torch.cumsum(tokens_per_expert, dim=0, dtype=torch.int32)
 
-            return final_hidden_states
+            gate_weight, up_weight = self.gate_up_proj.chunk(2, dim=1)
+            gate = torch._grouped_mm(
+                routed_input.to(_compute_dtype),
+                gate_weight.to(_compute_dtype).transpose(-2, -1),
+                offs=offsets,
+            )
+            up = torch._grouped_mm(
+                routed_input.to(_compute_dtype),
+                up_weight.to(_compute_dtype).transpose(-2, -1),
+                offs=offsets,
+            )
+            routed_output = torch._grouped_mm(
+                self.act_fn(gate) * up,
+                self.down_proj.to(_compute_dtype).transpose(-2, -1),
+                offs=offsets,
+            ).to(hidden_states.dtype)
+
+            # Mirror LocalTokenDispatcher.combine: scores multiply in FP32,
+            # then deterministic scatter-add restores original token order.
+            routed_output = (
+                routed_output.to(torch.float32) * routed_scores.reshape(-1, 1)
+            ).to(hidden_states.dtype)
+            final_hidden_states = torch.zeros_like(hidden_states)
+            return deterministic_scatter_add(
+                final_hidden_states,
+                token_indices.reshape(-1, 1).expand_as(routed_output),
+                routed_output,
+            )
 
         experts.forward = MethodType(forward_with_explicit_dtype, experts)
         experts._parity_compute_dtype = compute_dtype
+        experts._parity_uses_grouped_mm = use_grouped_mm
         num_wrapped += 1
     if num_wrapped == 0:
         raise ValueError("HF model has no routed-expert modules to wrap")
@@ -1259,6 +1302,9 @@ class EndpointTrace:
     blocks: dict[str, dict[int, torch.Tensor]] = field(default_factory=dict)
     indexer: dict[str, dict[int, torch.Tensor]] = field(default_factory=dict)
     router: dict[str, dict[int, torch.Tensor]] = field(default_factory=dict)
+    router_weights: dict[str, dict[int, torch.Tensor]] = field(default_factory=dict)
+    expert_load: dict[str, dict[int, torch.Tensor]] = field(default_factory=dict)
+    moe_inputs: dict[str, dict[int, torch.Tensor]] = field(default_factory=dict)
 
     @staticmethod
     @contextmanager
@@ -1274,6 +1320,9 @@ class EndpointTrace:
             trace.blocks[label] = {}
             trace.indexer[label] = {}
             trace.router[label] = {}
+            trace.router_weights[label] = {}
+            trace.expert_load[label] = {}
+            trace.moe_inputs[label] = {}
             layers = model.model.layers if endpoint.implementation == "hf" else model.layers
             for layer_index in layer_indices:
                 layer = (
@@ -1307,22 +1356,53 @@ class EndpointTrace:
                 )
                 handles.append(indexer.register_forward_hook(capture_indexer))
                 if endpoint.implementation == "hf" and hasattr(layer.mlp, "gate"):
+                    def capture_moe_input(
+                        _module, inputs, *, label=label, layer_index=layer_index
+                    ) -> None:
+                        trace.moe_inputs[label][layer_index] = inputs[0].detach()
+
+                    handles.append(
+                        layer.mlp.register_forward_pre_hook(capture_moe_input)
+                    )
+
                     def capture_hf_router(
                         _module, inputs, output, *, label=label, layer_index=layer_index
                     ) -> None:
                         batch_size, sequence_length = inputs[0].shape[:2]
-                        trace.router[label][layer_index] = (
-                            output[2].view(batch_size, sequence_length, -1)
-                            .detach()
-                            .cpu()
+                        indices = output[2].view(batch_size, sequence_length, -1)
+                        weights = output[1].view(batch_size, sequence_length, -1)
+                        trace.router[label][layer_index] = indices.detach().cpu()
+                        trace.router_weights[label][layer_index] = (
+                            weights.detach().cpu()
                         )
+                        trace.expert_load[label][layer_index] = F.one_hot(
+                            indices,
+                            num_classes=_module.num_experts,
+                        ).sum(dim=(0, 1, 2)).detach().cpu()
 
                     handles.append(layer.mlp.gate.register_forward_hook(capture_hf_router))
                 elif getattr(layer, "moe_enabled", False):
+                    def capture_moe_input(
+                        _module, inputs, *, label=label, layer_index=layer_index
+                    ) -> None:
+                        trace.moe_inputs[label][layer_index] = inputs[0].detach()
+
+                    handles.append(
+                        layer.moe.register_forward_pre_hook(capture_moe_input)
+                    )
+
                     def capture_titan_router(
                         _module, _inputs, output, *, label=label, layer_index=layer_index
                     ) -> None:
-                        trace.router[label][layer_index] = output[1].detach().cpu()
+                        indices = output[1]
+                        trace.router[label][layer_index] = indices.detach().cpu()
+                        trace.router_weights[label][layer_index] = (
+                            output[0].detach().cpu()
+                        )
+                        trace.expert_load[label][layer_index] = F.one_hot(
+                            indices,
+                            num_classes=_module.num_experts,
+                        ).sum(dim=(0, 1, 2)).detach().cpu()
 
                     handles.append(layer.moe.router.register_forward_hook(capture_titan_router))
         try:
@@ -2232,7 +2312,7 @@ class TestGlm5Parity(
     ``GLM5_PARITY_COMPONENTS=indexer,router,gradient``
     ``GLM5_PARITY_DATA_CASE=random|zeros|ones|extreme|alternating``
     ``GLM5_PARITY_COMPONENT_EXECUTION=independent|sequential``
-    ``GLM5_PARITY_HF_ROUTED_EXPERT_COMPUTE=model|bf16``
+    ``GLM5_PARITY_HF_ROUTED_EXPERT_COMPUTE=model|bf16|grouped_mm``
 
     The test methods do not construct a precision-specific class.  They use
     the models and batches prepared here.  Fixed runners preserve the original
@@ -2298,9 +2378,14 @@ class TestGlm5Parity(
         cls.device = torch.device("cuda")
         cls.actual_endpoint, cls.expected_endpoint = cls._configured_endpoints()
         cls.precision = cls.actual_endpoint.precision
-        if cls.HF_ROUTED_EXPERT_COMPUTE not in {"model", "bf16"}:
+        if cls.HF_ROUTED_EXPERT_COMPUTE not in {
+            "model",
+            "bf16",
+            "grouped_mm",
+        }:
             raise ValueError(
-                "GLM5_PARITY_HF_ROUTED_EXPERT_COMPUTE must be model or bf16"
+                "GLM5_PARITY_HF_ROUTED_EXPERT_COMPUTE must be "
+                "model, bf16, or grouped_mm"
             )
 
         # Build the endpoint table once.  Test methods only select from this
@@ -2316,8 +2401,14 @@ class TestGlm5Parity(
         for precision_name in sorted(precisions):
             precision = BF16 if precision_name == BF16.name else FP32
             pair = _build_pair(cls.device, precision=precision, seed=61)
-            if cls.HF_ROUTED_EXPERT_COMPUTE == "bf16":
-                _set_hf_routed_expert_compute_dtype(pair.hf, torch.bfloat16)
+            if cls.HF_ROUTED_EXPERT_COMPUTE != "model":
+                _set_hf_routed_expert_compute_dtype(
+                    pair.hf,
+                    torch.bfloat16,
+                    use_grouped_mm=(
+                        cls.HF_ROUTED_EXPERT_COMPUTE == "grouped_mm"
+                    ),
+                )
             cls.pairs[precision.name] = pair
             cls.models[("hf", precision.name)] = pair.hf
             cls.models[("titan", precision.name)] = pair.titan
@@ -2385,12 +2476,14 @@ class TestGlm5Parity(
     def _configured_report_label(self) -> str:
         def endpoint_label(endpoint: ModelEndpoint) -> str:
             expert_compute = (
-                "bf16"
+                "bf16_grouped_mm"
                 if endpoint.implementation == "titan"
                 else self.HF_ROUTED_EXPERT_COMPUTE
             )
             if expert_compute == "model":
                 expert_compute = endpoint.precision.name
+            elif expert_compute == "grouped_mm":
+                expert_compute = "bf16_grouped_mm"
             label = endpoint.label
             if expert_compute != endpoint.precision.name:
                 label += f"(routed_experts={expert_compute})"
@@ -2465,6 +2558,7 @@ class TestGlm5Parity(
             (".mlp.shared_experts.down_proj", ".moe.shared_experts.w2"),
             (".mlp.experts.gate_up_proj", ".moe.routed_experts"),
             (".mlp.experts.down_proj", ".moe.routed_experts"),
+            (".mlp.experts", ".moe.routed_experts"),
             (".mlp.gate", ".moe.router"),
             (".mlp.gate_proj", ".feed_forward.w1"),
             (".mlp.up_proj", ".feed_forward.w3"),
@@ -2614,13 +2708,26 @@ class TestGlm5Parity(
                     ),
                 )
                 continue
+            actual_tensor = actual_value[1]
+            expected_tensor = expected_value[1]
+            if (
+                base_logical.endswith(".moe.routed_experts")
+                and actual_tensor.shape != expected_tensor.shape
+                and actual_tensor.numel() == expected_tensor.numel()
+            ):
+                # HF experts flatten B/L while TorchTitan routed experts keep
+                # [B, L, D].  They represent the same token-major tensor.
+                if actual_tensor.ndim > expected_tensor.ndim:
+                    expected_tensor = expected_tensor.reshape_as(actual_tensor)
+                else:
+                    actual_tensor = actual_tensor.reshape_as(expected_tensor)
             if base_logical.endswith(".attention.indexer"):
                 recorder.discrete(
                     scope="trace",
                     component=component,
                     layer=layer,
-                    actual=actual_value[1],
-                    expected=expected_value[1],
+                    actual=actual_tensor,
+                    expected=expected_tensor,
                     positions=self._batch_for(spec.actual).positions,
                     module_path=module_path,
                     parent_path=parent_path,
@@ -2629,7 +2736,7 @@ class TestGlm5Parity(
                     checkpoint=checkpoint,
                 )
                 continue
-            if actual_value[1].dtype in {
+            if actual_tensor.dtype in {
                 torch.int8,
                 torch.int16,
                 torch.int32,
@@ -2640,11 +2747,11 @@ class TestGlm5Parity(
                     scope="trace",
                     component=component,
                     layer=layer,
-                    actual=actual_value[1],
-                    expected=expected_value[1],
+                    actual=actual_tensor,
+                    expected=expected_tensor,
                     positions=(
                         self._batch_for(spec.actual).positions
-                        if actual_value[1].ndim == 3
+                        if actual_tensor.ndim == 3
                         else None
                     ),
                     module_path=module_path,
@@ -2658,8 +2765,8 @@ class TestGlm5Parity(
                 scope="trace",
                 component=component,
                 layer=layer,
-                actual=actual_value[1],
-                expected=expected_value[1],
+                actual=actual_tensor,
+                expected=expected_tensor,
                 rtol=spec.rtol,
                 atol=spec.atol,
                 module_path=module_path,
@@ -2792,6 +2899,150 @@ class TestGlm5Parity(
                 checkpoint=checkpoint,
             )
 
+    def _run_routed_experts_on_input(
+        self,
+        endpoint: ModelEndpoint,
+        layer_index: int,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run one routed-expert branch without the shared expert branch."""
+        model = self._model(endpoint)
+        hidden_states = hidden_states.to(
+            device=self.device,
+            dtype=endpoint.precision.dtype,
+        )
+        if endpoint.implementation == "hf":
+            mlp = model.model.layers[layer_index].mlp
+            _, weights, indices = mlp.gate(hidden_states)
+            routed = mlp.experts(
+                hidden_states.reshape(-1, hidden_states.shape[-1]),
+                indices,
+                weights,
+            ).reshape_as(hidden_states)
+            indices = indices.reshape(*hidden_states.shape[:2], -1)
+            weights = weights.reshape(*hidden_states.shape[:2], -1)
+            num_experts = mlp.experts.num_experts
+        else:
+            moe = model.layers[str(layer_index)].moe
+            weights, indices, scores = moe.router(
+                hidden_states, moe.expert_bias_E
+            )
+            routing_map = torch.zeros_like(scores, dtype=torch.bool).scatter_(
+                -1, indices, True
+            )
+            expert_load = routing_map.sum(dim=(0, 1))
+            routed = moe.routed_experts(
+                hidden_states,
+                weights,
+                indices,
+                expert_load,
+                num_local_tokens_after_seq_dim_padding=(
+                    hidden_states.shape[0] * hidden_states.shape[1]
+                ),
+            )
+            return routed, weights, indices, expert_load
+
+        expert_load = F.one_hot(
+            indices,
+            num_classes=num_experts,
+        ).sum(dim=(0, 1, 2))
+        return routed, weights, indices, expert_load
+
+    def _record_common_input_moe_replay(
+        self,
+        spec: ComparisonSpec,
+        trace: EndpointTrace,
+        recorder: ParityRecorder,
+        layer_indices: list[int],
+    ) -> None:
+        """Separate propagated MoE input error from routed-expert local error."""
+        for layer in layer_indices:
+            actual_input = trace.moe_inputs[spec.actual.label].get(layer)
+            expected_input = trace.moe_inputs[spec.expected.label].get(layer)
+            if actual_input is None and expected_input is None:
+                continue
+            if actual_input is None or expected_input is None:
+                continue
+
+            parent_path = f"layers.{layer}.moe"
+            recorder.tensor(
+                scope="causal_replay",
+                component="input",
+                layer=layer,
+                actual=actual_input,
+                expected=expected_input,
+                rtol=spec.rtol,
+                atol=spec.atol,
+                module_path=(
+                    f"{spec.actual.label}:{parent_path}.input <-> "
+                    f"{spec.expected.label}:{parent_path}.input"
+                ),
+                parent_path=parent_path,
+                level=3,
+                node_kind="input_checkpoint",
+            )
+
+            # Use one FP32 source tensor, then cast it only at each configured
+            # endpoint boundary.  This removes upstream activation divergence.
+            common_input = expected_input.to(torch.float32)
+            with torch.no_grad():
+                actual = self._run_routed_experts_on_input(
+                    spec.actual, layer, common_input
+                )
+                expected = self._run_routed_experts_on_input(
+                    spec.expected, layer, common_input
+                )
+
+            common_path = f"{parent_path}.routed_experts.common_input"
+            recorder.discrete(
+                scope="causal_replay",
+                component="indices",
+                layer=layer,
+                actual=actual[2],
+                expected=expected[2],
+                module_path=common_path,
+                parent_path=f"{parent_path}.routed_experts",
+                level=4,
+                node_kind="discrete_checkpoint",
+            )
+            recorder.tensor(
+                scope="causal_replay",
+                component="weights",
+                layer=layer,
+                actual=actual[1],
+                expected=expected[1],
+                rtol=spec.rtol,
+                atol=spec.atol,
+                module_path=common_path,
+                parent_path=f"{parent_path}.routed_experts",
+                level=4,
+                node_kind="activation_checkpoint",
+            )
+            recorder.discrete(
+                scope="causal_replay",
+                component="expert_load",
+                layer=layer,
+                actual=actual[3],
+                expected=expected[3],
+                module_path=common_path,
+                parent_path=f"{parent_path}.routed_experts",
+                level=4,
+                node_kind="discrete_checkpoint",
+            )
+            recorder.tensor(
+                scope="causal_replay",
+                component="common_input",
+                layer=layer,
+                actual=actual[0],
+                expected=expected[0],
+                rtol=spec.rtol,
+                atol=spec.atol,
+                module_path=common_path,
+                parent_path=f"{parent_path}.routed_experts",
+                level=4,
+                node_kind="activation_checkpoint",
+            )
+
     def compare_end_to_end(self, spec: ComparisonSpec) -> ParityRecorder:
         """Compare every decoder layer plus final logits and loss."""
         actual_model = self._model(spec.actual)
@@ -2833,6 +3084,10 @@ class TestGlm5Parity(
             actual_loss.backward()
             if expected_model is not actual_model:
                 expected_loss.backward()
+
+        self._record_common_input_moe_replay(
+            spec, trace, recorder, layer_indices
+        )
 
         self._record_recursive_trace(
             spec, module_trace, recorder, layer_indices=layer_indices
@@ -2942,6 +3197,38 @@ class TestGlm5Parity(
                     level=4,
                     node_kind="discrete_checkpoint",
                 )
+
+                actual_weights = trace.router_weights[spec.actual.label].get(layer)
+                expected_weights = trace.router_weights[spec.expected.label].get(layer)
+                if actual_weights is not None and expected_weights is not None:
+                    recorder.tensor(
+                        scope=spec.scope,
+                        component="router_weights",
+                        layer=layer,
+                        actual=actual_weights,
+                        expected=expected_weights,
+                        rtol=spec.rtol,
+                        atol=spec.atol,
+                        module_path=router_path,
+                        parent_path=f"layers.{layer}.moe",
+                        level=4,
+                        node_kind="activation_checkpoint",
+                    )
+
+                actual_load = trace.expert_load[spec.actual.label].get(layer)
+                expected_load = trace.expert_load[spec.expected.label].get(layer)
+                if actual_load is not None and expected_load is not None:
+                    recorder.discrete(
+                        scope=spec.scope,
+                        component="expert_load",
+                        layer=layer,
+                        actual=actual_load,
+                        expected=expected_load,
+                        module_path=router_path,
+                        parent_path=f"layers.{layer}.moe",
+                        level=4,
+                        node_kind="discrete_checkpoint",
+                    )
 
         recorder.tensor(
             scope=spec.scope,
