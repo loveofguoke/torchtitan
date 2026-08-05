@@ -469,6 +469,7 @@ class ParityRecorder:
         tensor: torch.Tensor,
         positions: torch.Tensor | None,
         mismatch_positions: list[int],
+        value_name: str,
     ) -> str:
         value = tensor.detach().cpu()
         if value.ndim == 3:
@@ -479,11 +480,12 @@ class ParityRecorder:
                 if position >= sequence_length:
                     continue
                 entries.append(
-                    f"p{position}={value[0, position].reshape(-1).tolist()}"
+                    f"p{position}: {value_name}="
+                    f"{value[0, position].reshape(-1).tolist()}"
                 )
             suffix = "" if len(selected) <= 8 else f" ... (+{len(selected) - 8})"
             return "; ".join(entries) + suffix
-        return str(value.reshape(-1).tolist())
+        return f"{value_name}={value.reshape(-1).tolist()}"
 
     @staticmethod
     def _canonical_module_path(module_path: str) -> str:
@@ -534,6 +536,22 @@ class ParityRecorder:
             return result.component
         return cls._canonical_module_path(result.module_path)
 
+    @staticmethod
+    def _hf_module_path(result: ComparisonResult) -> str:
+        for endpoint_path in result.module_path.split("<->"):
+            value = endpoint_path.strip()
+            if not value.startswith("hf:"):
+                continue
+            path = value.removeprefix("hf:")
+            for precision in ("fp32:", "bf16:", "bfloat16:"):
+                if path.startswith(precision):
+                    path = path.removeprefix(precision)
+                    break
+            if path.startswith("layers."):
+                return "-"
+            return path
+        return "-"
+
     @classmethod
     def _path_key(cls, result: ComparisonResult) -> tuple[tuple[int, object], ...]:
         path = cls._display_path(result)
@@ -557,10 +575,19 @@ class ParityRecorder:
         return 0
 
     @classmethod
-    def _result_key(
-        cls, result: ComparisonResult
-    ) -> tuple[int, tuple[tuple[int, object], ...]]:
-        return cls._phase(result), cls._path_key(result)
+    def _result_key(cls, result: ComparisonResult) -> tuple[Any, ...]:
+        path = cls._display_path(result)
+        layer_match = re.match(r"layers\.(\d+)(?:\.|$)", path)
+        if layer_match:
+            dependency_order = -1 if result.component == "q_residual" else 0
+            return (
+                cls._phase(result),
+                0,
+                int(layer_match.group(1)),
+                dependency_order,
+                cls._path_key(result),
+            )
+        return cls._phase(result), 1, 0, 0, cls._path_key(result)
 
     def ordered_results(self) -> list[ComparisonResult]:
         return sorted(self.results, key=self._result_key)
@@ -720,10 +747,16 @@ class ParityRecorder:
             node_kind=node_kind,
             checkpoint=checkpoint,
             actual_summary=self._discrete_summary(
-                actual_cpu, positions, sorted(mismatch_positions)
+                actual_cpu,
+                positions,
+                sorted(mismatch_positions),
+                "topk" if component == "indexer" else "indices",
             ),
             expected_summary=self._discrete_summary(
-                expected_cpu, positions, sorted(mismatch_positions)
+                expected_cpu,
+                positions,
+                sorted(mismatch_positions),
+                "topk" if component == "indexer" else "indices",
             ),
         )
         self.results.append(result)
@@ -778,6 +811,7 @@ class ParityRecorder:
     def table(self, *, color: bool = False) -> str:
         headers = (
             "component",
+            "hf_path",
             "actual",
             "expected",
             "max_abs",
@@ -789,7 +823,7 @@ class ParityRecorder:
             f"GLM-5 parity report: {self.title}",
             "",
             " | ".join(headers),
-            "-|-|-|-|-|-|-| ",
+            "-|-|-|-|-|-|-|-| ",
         ]
         for result in self.ordered_results():
             status = self._status(result)
@@ -805,6 +839,7 @@ class ParityRecorder:
                 " | ".join(
                     (
                         self._display_path(result),
+                        self._hf_module_path(result),
                         result.actual_summary or "-",
                         result.expected_summary or "-",
                         "-" if result.max_abs is None else f"{result.max_abs:.6g}",
@@ -829,6 +864,7 @@ class ParityRecorder:
             rows.append(
                 "<tr>"
                 f"<td>{escape(self._display_path(result))}</td>"
+                f"<td>{escape(self._hf_module_path(result))}</td>"
                 f"<td>{escape(result.actual_summary or '-')}</td>"
                 f"<td>{escape(result.expected_summary or '-')}</td>"
                 f"<td>{'-' if result.max_abs is None else f'{result.max_abs:.6g}'}</td>"
@@ -838,7 +874,8 @@ class ParityRecorder:
                 "</tr>"
             )
         return (
-            "<table><thead><tr><th>component</th><th>actual</th>"
+            "<table><thead><tr><th>component</th><th>hf_path</th>"
+            "<th>actual</th>"
             "<th>expected</th><th>max_abs</th><th>max_rel</th>"
             "<th>mismatches</th><th>status</th></tr></thead><tbody>"
             + "".join(rows)
@@ -1408,6 +1445,7 @@ class ComponentParityMixin:
             ),
             composition_checkpoints=False,
             skip_layer_roots=False,
+            skip_filter_roots=True,
         )
 
     def _normalized(self, layer_index: int) -> torch.Tensor:
@@ -2340,6 +2378,7 @@ class TestGlm5Parity(
         component_filter: str | None = None,
         composition_checkpoints: bool = True,
         skip_layer_roots: bool = True,
+        skip_filter_roots: bool = False,
     ) -> None:
         """Add every captured module activation to the hierarchical report."""
         selected_layers = (
@@ -2408,6 +2447,8 @@ class TestGlm5Parity(
         for logical_path in sorted(logical):
             base_logical = logical_path.split("[", 1)[0]
             if base_logical in explicit_paths and base_logical not in filter_paths:
+                continue
+            if skip_filter_roots and base_logical in filter_paths:
                 continue
             selected_match = bool(
                 filter_paths
