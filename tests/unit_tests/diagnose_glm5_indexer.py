@@ -23,6 +23,10 @@ fails on the full logits.  This script walks that failure down to its source:
   Section 5 -- RoPE isolation: pre-rotation q/k must be bitwise identical; the
                post-rotation q/k are compared against a shared FP32 reference
                to quantify the BF16 rounding noise each implementation adds.
+  Section 6 -- layer byte trace: hooks every submodule of the first diverging
+               layer and prints the first bitwise-divergent tensor, plus a
+               manual comparison of the MAIN MLA RoPE (ComplexRoPE vs HF
+               BF16 interleave).
 
 Every section prints directly and the script exits 0: it is a diagnostic, not
 an assertion, so it can be re-run after a fix to confirm convergence.
@@ -110,6 +114,183 @@ def _reference_rotation_f32(
     real = even * cos - odd * sin
     imag = even * sin + odd * cos
     return torch.stack([real, imag], dim=-1).reshape(q_rot.shape).to(q_rot.dtype)
+
+
+def _main_rope_check(
+    hf_layer: torch.nn.Module,
+    titan_layer: torch.nn.Module,
+    captured: dict,
+    hf_pos: tuple[torch.Tensor, torch.Tensor],
+    positions: torch.Tensor,
+    cos_f32: torch.Tensor,
+    sin_f32: torch.Tensor,
+    batch_size: int,
+    seq_len: int,
+) -> None:
+    """Compare the MAIN MLA RoPE (ComplexRoPE vs HF BF16 interleave)."""
+    hf_attn = hf_layer.self_attn
+    titan_attn = titan_layer.attention
+    n_heads = titan_attn.n_heads
+    qk_nope = titan_attn.qk_nope_head_dim
+    qk_rope = titan_attn.qk_rope_head_dim
+    qk_head = titan_attn.qk_head_dim
+    kv_lora = titan_attn.kv_lora_rank
+
+    q_b_out = captured[("hf", "q_b_proj")]  # [B, L, H*D]
+    q_states = q_b_out.view(batch_size, seq_len, n_heads, qk_head).transpose(1, 2)
+    _q_pass, q_rot_hf = torch.split(q_states, [qk_nope, qk_rope], dim=-1)
+
+    kv_a_out = captured[("hf", "kv_a_proj")]  # [B, L, kv_lora + R]
+    _kv_pass, k_rot_flat = torch.split(kv_a_out, [kv_lora, qk_rope], dim=-1)
+    k_rot_hf = k_rot_flat.view(batch_size, 1, seq_len, qk_rope)
+
+    cos, sin = hf_pos
+    hf_q_rot, hf_k_rot = apply_rotary_pos_emb_interleave(
+        q_rot_hf, k_rot_hf, cos, sin, unsqueeze_dim=1
+    )
+
+    titan_q_rot, titan_k_rot = titan_attn.rope(
+        q_rot_hf.transpose(1, 2), k_rot_hf.transpose(1, 2), positions
+    )
+    hf_q_adj = _interleave_to_adjacent(hf_q_rot).transpose(1, 2)
+    hf_k_adj = _interleave_to_adjacent(hf_k_rot).transpose(1, 2)
+
+    print("    -- main q_rot/k_rot post-rotation vs shared FP32 reference --")
+    ref_q = _reference_rotation_f32(q_rot_hf.transpose(1, 2), cos_f32, sin_f32)
+    ref_k = _reference_rotation_f32(k_rot_hf.transpose(1, 2), cos_f32, sin_f32)
+    _report_tensor_pair("titan main q_rot vs ref", titan_q_rot, ref_q)
+    _report_tensor_pair("hf    main q_rot vs ref", hf_q_adj, ref_q)
+    _report_tensor_pair("titan main k_rot vs ref", titan_k_rot, ref_k)
+    _report_tensor_pair("hf    main k_rot vs ref", hf_k_adj, ref_k)
+    print("    -- main q_rot/k_rot titan vs hf (the exact score-input gap) --")
+    _report_tensor_pair("main q_rot", titan_q_rot, hf_q_adj)
+    _report_tensor_pair("main k_rot", titan_k_rot, hf_k_adj)
+
+
+def _byte_trace_layer0(
+    hf_model: torch.nn.Module,
+    titan_model: torch.nn.Module,
+    hf_inputs: dict[int, torch.Tensor],
+    causal_mask: torch.Tensor,
+    positions: torch.Tensor,
+    batch_size: int,
+    seq_len: int,
+    layer_index: int = 0,
+) -> None:
+    """Bisect a layer by comparing every submodule output bitwise."""
+    print()
+    print("=" * 78)
+    print(f"Section 6 -- layer {layer_index} byte trace (first divergent tensor)")
+    print("=" * 78)
+    hf_layer = hf_model.model.layers[layer_index]
+    titan_layer = titan_model.layers[str(layer_index)]
+    common_hidden = hf_inputs[layer_index]
+    hf_pos = hf_model.model.rotary_emb(common_hidden, position_ids=positions)
+    cos_f32, sin_f32 = _hf_cos_sin_f32(hf_model, common_hidden, positions)
+
+    pairs = [
+        ("attention_norm", hf_layer.input_layernorm, titan_layer.attention_norm),
+        ("q_a_proj", hf_layer.self_attn.q_a_proj, titan_layer.attention.wq_a),
+        (
+            "q_a_layernorm",
+            hf_layer.self_attn.q_a_layernorm,
+            titan_layer.attention.q_norm,
+        ),
+        ("q_b_proj", hf_layer.self_attn.q_b_proj, titan_layer.attention.wq_b),
+        (
+            "kv_a_proj",
+            hf_layer.self_attn.kv_a_proj_with_mqa,
+            titan_layer.attention.wkv_a,
+        ),
+        (
+            "kv_a_layernorm",
+            hf_layer.self_attn.kv_a_layernorm,
+            titan_layer.attention.kv_norm,
+        ),
+        ("kv_b_proj", hf_layer.self_attn.kv_b_proj, titan_layer.attention.wkv_b),
+        ("o_proj", hf_layer.self_attn.o_proj, titan_layer.attention.wo),
+        ("indexer", hf_layer.self_attn.indexer, titan_layer.attention.indexer),
+        ("attention_out", hf_layer.self_attn, titan_layer.attention),
+        (
+            "post_attn_norm",
+            hf_layer.post_attention_layernorm,
+            titan_layer.ffn_norm,
+        ),
+        ("gate_proj", hf_layer.mlp.gate_proj, titan_layer.feed_forward.w1),
+        ("up_proj", hf_layer.mlp.up_proj, titan_layer.feed_forward.w3),
+        ("down_proj", hf_layer.mlp.down_proj, titan_layer.feed_forward.w2),
+        ("layer_out", hf_layer, titan_layer),
+    ]
+    captured: dict[tuple[str, str], torch.Tensor] = {}
+    handles = []
+    for label, hf_module, titan_module in pairs:
+
+        def capture_hf(_m, _i, output, label=label):
+            captured[("hf", label)] = (
+                output[0] if isinstance(output, tuple) else output
+            ).detach()
+
+        def capture_titan(_m, _i, output, label=label):
+            captured[("titan", label)] = output.detach()
+
+        handles.append(hf_module.register_forward_hook(capture_hf))
+        handles.append(titan_module.register_forward_hook(capture_titan))
+
+    try:
+        with torch.no_grad():
+            hf_layer(
+                common_hidden,
+                attention_mask=causal_mask,
+                position_ids=positions,
+                position_embeddings=hf_pos,
+                use_cache=False,
+            )
+            titan_layer(common_hidden, causal_mask, positions)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    print(f"  {'component':<16}{'unequal/total':<20}{'max_abs_diff':<15}verdict")
+    first_divergent = None
+    for label, _hf_module, _titan_module in pairs:
+        hf_value = captured.get(("hf", label))
+        titan_value = captured.get(("titan", label))
+        if hf_value is None or titan_value is None:
+            print(
+                f"  {label:<16}{'rec_missing':<20}"
+                f"hf={hf_value is not None} tit={titan_value is not None}"
+            )
+            continue
+        if hf_value.shape != titan_value.shape:
+            print(
+                f"  {label:<16} SHAPE MISMATCH "
+                f"{tuple(hf_value.shape)} vs {tuple(titan_value.shape)}"
+            )
+            continue
+        unequal, total = _count_unequal(hf_value, titan_value)
+        max_diff = _max_abs_diff(hf_value, titan_value)
+        if unequal > 0 and first_divergent is None:
+            first_divergent = label
+            verdict = "FIRST DIVERGENT"
+        else:
+            verdict = "same" if unequal == 0 else "diff"
+        print(f"  {label:<16}{f'{unequal}/{total}':<20}{max_diff:<15.3e}{verdict}")
+
+    _main_rope_check(
+        hf_layer,
+        titan_layer,
+        captured,
+        hf_pos,
+        positions,
+        cos_f32,
+        sin_f32,
+        batch_size,
+        seq_len,
+    )
+    if first_divergent is not None:
+        print(f"  => first bitwise-divergent layer-0 component: {first_divergent}")
+    else:
+        print("  => no bitwise divergence found in layer-0 module outputs")
 
 
 def main() -> None:
@@ -345,11 +526,24 @@ def main() -> None:
                 print("    => indexer internally bitwise-identical on common inputs")
 
     # ------------------------------------------------------------------ #
-    # Section 6: verdict.                                                 #
+    # Section 6: layer-0 byte trace.                                     #
+    # ------------------------------------------------------------------ #
+    _byte_trace_layer0(
+        hf_model,
+        titan_model,
+        hf_inputs,
+        causal_mask,
+        positions,
+        batch_size,
+        seq_len,
+    )
+
+    # ------------------------------------------------------------------ #
+    # Section 7: verdict.                                                 #
     # ------------------------------------------------------------------ #
     print()
     print("=" * 78)
-    print("Section 6 -- verdict")
+    print("Section 7 -- verdict")
     print("=" * 78)
     if common_mismatch_layers:
         print("  indexer top-k differs even with IDENTICAL q_resid and hidden_states.")
