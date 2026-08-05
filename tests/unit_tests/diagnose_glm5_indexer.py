@@ -34,6 +34,8 @@ an assertion, so it can be re-run after a fix to confirm convergence.
 
 from __future__ import annotations
 
+import traceback
+
 import torch
 
 from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import (
@@ -114,6 +116,115 @@ def _reference_rotation_f32(
     real = even * cos - odd * sin
     imag = even * sin + odd * cos
     return torch.stack([real, imag], dim=-1).reshape(q_rot.shape).to(q_rot.dtype)
+
+
+def _self_test_helpers() -> None:
+    """Smoke-test the rotation helpers on CPU to catch helper bugs early."""
+    batch, length, heads, dim = 1, 4, 2, 8
+    q = torch.randn(batch, length, heads, dim, dtype=torch.bfloat16)
+    cos = torch.randn(batch, length, dim, dtype=torch.bfloat16)
+    sin = torch.randn(batch, length, dim, dtype=torch.bfloat16)
+    hf_q, hf_k = apply_rotary_pos_emb_interleave(q, q, cos, sin, unsqueeze_dim=2)
+    adj = _interleave_to_adjacent(hf_q)
+    ref = _reference_rotation_f32(q, cos.float(), sin.float())
+    assert hf_q.shape == q.shape and hf_k.shape == q.shape
+    assert adj.shape == q.shape and ref.shape == q.shape
+    print(
+        f"  helper self-test OK (shapes q={tuple(q.shape)} "
+        f"-> interleave/adjacent/reference all valid)"
+    )
+
+
+def _isolate_layer(
+    hf_model: torch.nn.Module,
+    titan_model: torch.nn.Module,
+    hf_inputs: dict[int, torch.Tensor],
+    causal_mask: torch.Tensor,
+    positions: torch.Tensor,
+    batch_size: int,
+    seq_len: int,
+    li: int,
+    common_mismatch_layers: list[int],
+    q_resid_diff_layers: list[int],
+    rot_gap_layers: list[int],
+) -> None:
+    """Run the Sections 3-5 isolation for one layer; raise on failure."""
+    hf_layer = hf_model.model.layers[li]
+    titan_layer = titan_model.layers[str(li)]
+    hf_attn = hf_layer.self_attn
+    titan_attn = titan_layer.attention
+
+    common_hidden = hf_inputs[li]
+    hf_pos = hf_model.model.rotary_emb(common_hidden, position_ids=positions)
+    cos_f32, sin_f32 = _hf_cos_sin_f32(hf_model, common_hidden, positions)
+
+    # --- Section 4: q_resid source ---
+    print("  [Section 4] q_resid (linear + RMSNorm on identical input)")
+    hf_wq_a_out = hf_attn.q_a_proj(common_hidden)
+    titan_wq_a_out = titan_attn.wq_a(common_hidden)
+    _report_tensor_pair("pre-norm (wq_a)", titan_wq_a_out, hf_wq_a_out)
+    common_q_resid = hf_attn.q_a_layernorm(hf_wq_a_out)
+    titan_q_resid = titan_attn.q_norm(titan_wq_a_out)
+    q_resid_equal = _report_tensor_pair(
+        "q_resid (after norm)", titan_q_resid, common_q_resid
+    )
+    if not q_resid_equal:
+        q_resid_diff_layers.append(li)
+
+    # --- Section 3: indexer with identical inputs ---
+    print("  [Section 3] indexer top-k on identical inputs")
+    hf_topk = hf_attn.indexer(
+        common_hidden, common_q_resid, hf_pos, causal_mask[:, 0], positions
+    )
+    titan_topk = titan_attn.indexer(
+        common_hidden, common_q_resid, positions, causal_mask[:, 0]
+    )
+    mism = _selection_mismatch_positions(titan_topk, hf_topk, positions)
+    print(f"    indexer_topk_mismatch_positions: {sorted(set(mism))}")
+    if mism:
+        common_mismatch_layers.append(li)
+
+    # --- Section 5: RoPE arithmetic ---
+    print("  [Section 5] indexer RoPE arithmetic")
+    head_dim = titan_attn.indexer.head_dim
+    rope_dim = titan_attn.indexer.qk_rope_head_dim
+    hf_q_pre = hf_attn.indexer.wq_b(common_q_resid).view(
+        batch_size, seq_len, hf_attn.indexer.n_heads, head_dim
+    )
+    titan_q_pre = titan_attn.indexer.wq_b(common_q_resid).view(
+        batch_size, seq_len, titan_attn.indexer.n_heads, head_dim
+    )
+    pre_q_equal = _report_tensor_pair("pre-rotation q (wq_b)", titan_q_pre, hf_q_pre)
+    hf_k_pre = hf_attn.indexer.k_norm(hf_attn.indexer.wk(common_hidden))
+    titan_k_pre = titan_attn.indexer.k_norm(titan_attn.indexer.wk(common_hidden))
+    pre_k_equal = _report_tensor_pair(
+        "pre-rotation k (wk+k_norm)", titan_k_pre, hf_k_pre
+    )
+
+    q_rot = titan_q_pre[..., :rope_dim]
+    k_rot = titan_k_pre[..., :rope_dim].unsqueeze(2)
+    titan_q_rot, titan_k_rot = titan_attn.indexer.rope(q_rot, k_rot, positions)
+    hf_q_rot_hf, hf_k_rot_hf = apply_rotary_pos_emb_interleave(
+        q_rot, k_rot, hf_pos[0], hf_pos[1], unsqueeze_dim=2
+    )
+    hf_q_rot_adj = _interleave_to_adjacent(hf_q_rot_hf)
+    hf_k_rot_adj = _interleave_to_adjacent(hf_k_rot_hf)
+
+    ref_q = _reference_rotation_f32(q_rot, cos_f32, sin_f32)
+    ref_k = _reference_rotation_f32(k_rot, cos_f32, sin_f32)
+    print("    -- post-rotation vs shared FP32 reference --")
+    _report_tensor_pair("titan q_rot vs ref", titan_q_rot, ref_q)
+    _report_tensor_pair("hf    q_rot vs ref", hf_q_rot_adj, ref_q)
+    _report_tensor_pair("titan k_rot vs ref", titan_k_rot, ref_k)
+    _report_tensor_pair("hf    k_rot vs ref", hf_k_rot_adj, ref_k)
+    print("    -- post-rotation titan vs hf (the exact score-input gap) --")
+    q_rot_equal = _report_tensor_pair("q_rot", titan_q_rot, hf_q_rot_adj)
+    k_rot_equal = _report_tensor_pair("k_rot", titan_k_rot, hf_k_rot_adj)
+    if not (q_rot_equal and k_rot_equal):
+        rot_gap_layers.append(li)
+
+    if pre_q_equal and pre_k_equal and q_rot_equal and k_rot_equal:
+        print("    => indexer internally bitwise-identical on common inputs")
 
 
 def _main_rope_check(
@@ -297,6 +408,12 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise SystemExit("GLM-5 parity diagnostics require one CUDA device")
 
+    print(
+        "GLM-5 BF16 parity diagnostic "
+        "(version with layer byte trace + per-layer error handling)"
+    )
+    _self_test_helpers()
+
     device = torch.device("cuda")
     seed = 53
     batch_size, seq_len = 1, 16
@@ -439,91 +556,27 @@ def main() -> None:
 
     with torch.no_grad():
         for li in layer_indices:
-            print(f"\n  --- layer {li} ---")
-            hf_layer = hf_model.model.layers[li]
-            titan_layer = titan_model.layers[str(li)]
-            hf_attn = hf_layer.self_attn
-            titan_attn = titan_layer.attention
-
-            common_hidden = hf_inputs[li]
-            hf_pos = hf_model.model.rotary_emb(common_hidden, position_ids=positions)
-            cos_f32, sin_f32 = _hf_cos_sin_f32(hf_model, common_hidden, positions)
-
-            # --- Section 4: q_resid source ---
-            print("  [Section 4] q_resid (linear + RMSNorm on identical input)")
-            hf_wq_a_out = hf_attn.q_a_proj(common_hidden)
-            titan_wq_a_out = titan_attn.wq_a(common_hidden)
-            _report_tensor_pair("pre-norm (wq_a)", titan_wq_a_out, hf_wq_a_out)
-            common_q_resid = hf_attn.q_a_layernorm(hf_wq_a_out)
-            titan_q_resid = titan_attn.q_norm(titan_wq_a_out)
-            q_resid_equal = _report_tensor_pair(
-                "q_resid (after norm)", titan_q_resid, common_q_resid
-            )
-            if not q_resid_equal:
-                q_resid_diff_layers.append(li)
-
-            # --- Section 3: indexer with identical inputs ---
-            print("  [Section 3] indexer top-k on identical inputs")
-            hf_topk = hf_attn.indexer(
-                common_hidden,
-                common_q_resid,
-                hf_pos,
-                causal_mask[:, 0],
-                positions,
-            )
-            titan_topk = titan_attn.indexer(
-                common_hidden, common_q_resid, positions, causal_mask[:, 0]
-            )
-            mism = _selection_mismatch_positions(titan_topk, hf_topk, positions)
-            print(f"    indexer_topk_mismatch_positions: {sorted(set(mism))}")
-            if mism:
-                common_mismatch_layers.append(li)
-
-            # --- Section 5: RoPE arithmetic ---
-            print("  [Section 5] indexer RoPE arithmetic")
-            head_dim = titan_attn.indexer.head_dim
-            rope_dim = titan_attn.indexer.qk_rope_head_dim
-            hf_q_pre = hf_attn.indexer.wq_b(common_q_resid).view(
-                batch_size, seq_len, hf_attn.indexer.n_heads, head_dim
-            )
-            titan_q_pre = titan_attn.indexer.wq_b(common_q_resid).view(
-                batch_size, seq_len, titan_attn.indexer.n_heads, head_dim
-            )
-            pre_q_equal = _report_tensor_pair(
-                "pre-rotation q (wq_b)", titan_q_pre, hf_q_pre
-            )
-            hf_k_pre = hf_attn.indexer.k_norm(hf_attn.indexer.wk(common_hidden))
-            titan_k_pre = titan_attn.indexer.k_norm(
-                titan_attn.indexer.wk(common_hidden)
-            )
-            pre_k_equal = _report_tensor_pair(
-                "pre-rotation k (wk+k_norm)", titan_k_pre, hf_k_pre
-            )
-
-            q_rot = titan_q_pre[..., :rope_dim]
-            k_rot = titan_k_pre[..., :rope_dim].unsqueeze(2)
-            titan_q_rot, titan_k_rot = titan_attn.indexer.rope(q_rot, k_rot, positions)
-            hf_q_rot_hf, hf_k_rot_hf = apply_rotary_pos_emb_interleave(
-                q_rot, k_rot, hf_pos[0], hf_pos[1], unsqueeze_dim=2
-            )
-            hf_q_rot_adj = _interleave_to_adjacent(hf_q_rot_hf)
-            hf_k_rot_adj = _interleave_to_adjacent(hf_k_rot_hf)
-
-            ref_q = _reference_rotation_f32(q_rot, cos_f32, sin_f32)
-            ref_k = _reference_rotation_f32(k_rot, cos_f32, sin_f32)
-            print("    -- post-rotation vs shared FP32 reference --")
-            _report_tensor_pair("titan q_rot vs ref", titan_q_rot, ref_q)
-            _report_tensor_pair("hf    q_rot vs ref", hf_q_rot_adj, ref_q)
-            _report_tensor_pair("titan k_rot vs ref", titan_k_rot, ref_k)
-            _report_tensor_pair("hf    k_rot vs ref", hf_k_rot_adj, ref_k)
-            print("    -- post-rotation titan vs hf (the exact score-input gap) --")
-            q_rot_equal = _report_tensor_pair("q_rot", titan_q_rot, hf_q_rot_adj)
-            k_rot_equal = _report_tensor_pair("k_rot", titan_k_rot, hf_k_rot_adj)
-            if not (q_rot_equal and k_rot_equal):
-                rot_gap_layers.append(li)
-
-            if pre_q_equal and pre_k_equal and q_rot_equal and k_rot_equal:
-                print("    => indexer internally bitwise-identical on common inputs")
+            print(f"\n  --- layer {li} ---", flush=True)
+            try:
+                _isolate_layer(
+                    hf_model,
+                    titan_model,
+                    hf_inputs,
+                    causal_mask,
+                    positions,
+                    batch_size,
+                    seq_len,
+                    li,
+                    common_mismatch_layers,
+                    q_resid_diff_layers,
+                    rot_gap_layers,
+                )
+            except Exception as error:
+                print(
+                    f"  [ERROR] layer {li} isolation: "
+                    f"{type(error).__name__}: {error}"
+                )
+                traceback.print_exc()
 
     # ------------------------------------------------------------------ #
     # Section 6: layer-0 byte trace.                                     #
