@@ -4,6 +4,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+# NOTE: 测试torchtitan glm的实现是否完全符合数学定义，以及模型配置、非法行为、精度规范、边界行为、错误处理等
+# NOTE: 保证所有行为合理，遵循自我规范
+
 import dataclasses
 import unittest
 from unittest import mock
@@ -289,10 +292,13 @@ def _reference_indexer_topk(
     return index_scores_BLL.topk(topk, dim=-1).indices.to(torch.int32)
 
 
+# DSA Indexer模块测试
 class TestGlm5DsaIndexer(unittest.TestCase):
+    # 测试torchtitan indexer自身的基本契约
     def test_indexer_returns_masked_int32_topk(self):
         indexer = _indexer_config().build()
         indexer.init_states()
+        # 构造输入数据, 完全随机, 只测试indexer的行为
         hidden_states_BLD = torch.randn(2, 5, 16)
         q_resid_BLR = torch.randn(2, 5, 8)
         positions_BL = torch.arange(5).expand(2, -1)
@@ -308,8 +314,11 @@ class TestGlm5DsaIndexer(unittest.TestCase):
             attention_mask_BLL,
         )
 
+        # 输出 dtype 是 torch.int32
         self.assertEqual(topk_indices_BLK.dtype, torch.int32)
+        # 输出 shape 是 [B, S, topk]
         self.assertEqual(topk_indices_BLK.shape, (2, 5, 3))
+        # top-k 不超过配置的 index_topk
         full_topk_queries_B = positions_BL >= topk_indices_BLK.shape[-1] - 1
         self.assertTrue(
             torch.all(
@@ -317,6 +326,7 @@ class TestGlm5DsaIndexer(unittest.TestCase):
                 <= positions_BL[full_topk_queries_B].unsqueeze(-1)
             )
         )
+        # causal 条件下不能选择未来 token
         self.assertTrue(
             torch.all(
                 torch.any(
@@ -326,10 +336,12 @@ class TestGlm5DsaIndexer(unittest.TestCase):
             )
         )
 
+    # 测试torchtitan indexer的行为与独立实现的reference indexer一致
     def test_indexer_matches_independent_reference(self):
         torch.manual_seed(17)
         indexer = _indexer_config().build()
         indexer.init_states()
+        # 构造输入数据, 完全随机, 只测试indexer的行为
         hidden_states_BLD = torch.randn(1, 4, 16)
         q_resid_BLR = torch.randn(1, 4, 8)
         positions_BL = torch.arange(4).unsqueeze(0)
@@ -351,12 +363,18 @@ class TestGlm5DsaIndexer(unittest.TestCase):
             positions_BL,
             attention_mask_BLL,
         )
+        # 检查 TorchTitan indexer 的代码实现是否与数学 reference 一致
         self.assertTrue(torch.equal(actual_BLK, expected_BLK))
 
+    # 测试torchtitan indexer 符合 glm5 indexer的特殊设计
+    # 1. indexer 是离散选择模块
+    # 2. indexer 参数不参与 LM loss
+    # 3. indexer head weight 保持 FP32
     def test_indexer_is_no_grad_and_keeps_weights_projection_fp32(self):
         indexer = _indexer_config().build()
         indexer.init_states()
         indexer.bfloat16()
+        # 测试 BF16 转换后 weights_proj.weight 仍是 FP32
         self.assertEqual(indexer.weights_proj.weight.dtype, torch.float32)
         out_BLK = indexer(
             torch.randn(1, 4, 16, dtype=torch.bfloat16),
@@ -364,9 +382,11 @@ class TestGlm5DsaIndexer(unittest.TestCase):
             torch.arange(4).unsqueeze(0),
             torch.zeros(1, 4, 4, dtype=torch.bfloat16),
         )
+        # 测试 indexer 输出不需要梯度
         self.assertFalse(out_BLK.requires_grad)
 
 
+# glm5 MLA+DSA Attention模块测试
 class TestGlm5Attention(unittest.TestCase):
     def test_attention_topk_cannot_reopen_causal_mask(self):
         attention = _attention_config().build()

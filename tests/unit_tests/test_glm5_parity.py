@@ -4,6 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+# 测试torchtitan glm和hf glm的精度一致性
+
 """Optional CUDA component-parity checks for the GLM-5 debug model.
 
 These checks intentionally exercise the real Transformers implementation and
@@ -67,18 +69,22 @@ def _hf_config():
     )
 
 
+# 构造 HF 模型和 TorchTitan 模型，并加载相同权重
 def _build_models(
     device: torch.device, *, seed: int = 41
 ) -> tuple[torch.nn.Module, torch.nn.Module]:
     """Construct exact FP32 peers and load the HF tensors through the adapter."""
     assert GlmMoeDsaForCausalLM is not None
     torch.manual_seed(seed)
+    # 配置化构造模型实例
     hf_model = GlmMoeDsaForCausalLM(_hf_config()).float()
 
     titan_config = glm5_configs["debugmodel"]()
     titan_model = titan_config.build()
-    titan_model.init_states()
+    titan_model.init_states() # Decoder的方法
     adapter = Glm5StateDictAdapter(titan_config, hf_assets_path=None)
+    # HF随机初始化，提取HF state dict，通过adapter加载到TorchTitan模型
+    # 保证两者权重完全一致
     titan_model.load_state_dict(adapter.from_hf(hf_model.state_dict()), strict=True)
 
     hf_model = hf_model.to(device).eval()
@@ -135,7 +141,10 @@ def _causal_mask(positions_BL: torch.Tensor, dtype: torch.dtype) -> torch.Tensor
     )
 
 
+# 检测torchtitan glm moe Router的精度是否符合数学定义, 并且在BF16下不会降低离散选择的精度
+# 测试自我规范和数学定义
 class TestGlm5Bfloat16RouterPrecision(unittest.TestCase):
+    # 测试Router的gate在BF16下仍然保持FP32精度, 并且路由结果与FP32计算一致
     def test_router_gate_is_evaluated_in_float32(self) -> None:
         """BF16 activations must not reduce the discrete router's precision."""
         titan_model = glm5_configs["debugmodel"]().build()
@@ -148,11 +157,15 @@ class TestGlm5Bfloat16RouterPrecision(unittest.TestCase):
         expected_scores = torch.sigmoid(
             F.linear(hidden_states.float(), router.gate.weight.float())
         )
+        # 模型参数和输入hidden states BF16下gate参数及route scores保持FP32精度
+        # 不会降低离散选择的精度
         self.assertEqual(scores.dtype, torch.float32)
+        # 且计算结果与FP32计算完全一致, bitwise equality
         torch.testing.assert_close(scores, expected_scores, rtol=0, atol=0)
 
     def test_router_uses_gate_forward_for_fp32_biased_computation(self) -> None:
         """FP32 routing must retain the gate module's hooks and gradients."""
+        # 测试correction bias是否参与route
         router = TokenChoiceTopKRouter.Config(
             num_experts=4,
             gate=Linear.Config(in_features=3, out_features=4, bias=True),
@@ -163,16 +176,19 @@ class TestGlm5Bfloat16RouterPrecision(unittest.TestCase):
         hidden_states = torch.randn(1, 2, 3, dtype=torch.bfloat16)
         gate_call_count = 0
 
+        # hook函数用于统计gate的前向调用次数, 确保gate forward hook能生效
         def count_gate_calls(*_args) -> None:
             nonlocal gate_call_count
             gate_call_count += 1
 
+        # 测试gate forward hook能否生效
         hook = router.gate.register_forward_hook(count_gate_calls)
         try:
             _, _, scores = router(hidden_states)
         finally:
             hook.remove()
 
+        # 测试correction bias是否参与route
         expected_scores = torch.sigmoid(
             F.linear(
                 hidden_states.float(),
@@ -185,39 +201,49 @@ class TestGlm5Bfloat16RouterPrecision(unittest.TestCase):
         torch.testing.assert_close(scores, expected_scores, rtol=0, atol=0)
 
         scores.sum().backward()
+        # 检测gate 梯度是否存在
         self.assertIsNotNone(router.gate.weight.grad)
         self.assertIsNotNone(router.gate.bias.grad)
 
 
+# 测试torchtitan glm和hf glm在新增结构上的精度一致性
 class TestGlm5TransformersComponentParity(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
+        # 如果 Transformers GLM-MoE-DSA 不可用，则跳过测试
         if _TRANSFORMERS_IMPORT_ERROR is not None:
             raise unittest.SkipTest(
                 "Transformers GLM-MoE-DSA is unavailable: "
                 f"{_TRANSFORMERS_IMPORT_ERROR!r}"
             )
+        # 如果没有可用的 CUDA 设备，则跳过测试
         if not torch.cuda.is_available():
             raise unittest.SkipTest(
                 "GLM-5 Transformers parity requires one CUDA device"
             )
 
         cls.device = torch.device("cuda")
+        # 得到hf模型和torchtitan模型实例
         cls.hf_model, cls.titan_model = _build_models(cls.device)
+        # 统一创建测试输入，直接使用随机生成的FP32激活
         cls.batch_size = 2
         cls.sequence_length = 16
         torch.manual_seed(41)
         cls.hidden_states = torch.randn(
             cls.batch_size,
             cls.sequence_length,
-            256,
+            256, # hidden_size, 最好不要硬编码
             device=cls.device,
             dtype=torch.float32,
         )
+        # 给seq创建自然位置编号[0, 1, 2, ..., sequence_length-1], 
         cls.positions = torch.arange(
             cls.sequence_length, device=cls.device, dtype=torch.long
         ).expand(cls.batch_size, -1)
+        # 创建causal mask
         cls.causal_mask = _causal_mask(cls.positions, cls.hidden_states.dtype)
+        # 计算hf的旋转位置编码, (cos, sin)
+        # 这两个张量会传给 HF indexer; HF indexer API 需要显式接收 position embeddings；TorchTitan indexer 则在内部根据 positions 计算 RoPE
         cls.hf_position_embeddings = cls.hf_model.model.rotary_emb(
             cls.hidden_states, position_ids=cls.positions
         )
@@ -227,15 +253,34 @@ class TestGlm5TransformersComponentParity(unittest.TestCase):
             self.hidden_states
         )
 
+    # 在相同的输入、相同的权重、相同的 mask 和相同的位置编码下，验证 HF 与 TorchTitan 的 DSA indexer 是否选择完全相同的 top-k 历史 token
     def test_indexer_topk_matches_transformers_exactly(self) -> None:
         layer_index = 0
+        # 取出第 0 层的两个 attention 模块
+        # 第 0 层的选择有两个原因：
+        # 1. debugmodel 的第 0 层是 dense FFN，但 attention/indexer 仍然完整存在；
+        # 2. 测试只关注 attention/indexer，不需要 MoE router，因此选择第 0 层可以隔离 MoE 影响。
         hf_attention = self.hf_model.model.layers[layer_index].self_attn
         titan_attention = self.titan_model.layers[str(layer_index)].attention
+        # 得到attention的输入(经过 pre layernorm 的 hidden states)
+        # NOTE: HF 和 TorchTitan 并没有分别调用各自的 layer input norm；两边共享同一个 HF layernorm 的输出作为 attention 输入
+        # NOTE: 因为这是单元测试，关注indexer的行为，需要统一其他模块的行为
         hidden_states = self._normalized_hidden_states(layer_index)
+        # 计算q_latent, [B, S, q_lora_rank], 用于计算dsa中的q
+        # HF: 自定义 RMSNorm，显式转 FP32
+        # TorchTitan: torch.nn.RMSNorm，可能选择不同 fused kernel
+        # TODO: 分析RMSNorm的实现差异
         hf_q_resid = hf_attention.q_a_layernorm(hf_attention.q_a_proj(hidden_states))
         titan_q_resid = titan_attention.q_norm(titan_attention.wq_a(hidden_states))
+        # pytorch的判断条件: abs(actual - expected) <= atol + rtol * abs(expected)
+        # 要求绝对精度为0，意味着两边的计算结果必须完全一致，不能有任何差异, 也就是 bitwise equality
+        # TODO: 这里220 / 4096 元素不相等, 最大绝对差 2.3841858e-7
+        # TODO: 如果误差很小，可以放宽
         torch.testing.assert_close(titan_q_resid, hf_q_resid, rtol=0, atol=0)
 
+        # TODO: 没有比较indexer的topk scores, 只比较了topk索引
+
+        # 调用indexer，得到top-k的token索引
         hf_topk = hf_attention.indexer(
             hidden_states,
             hf_q_resid,
@@ -249,25 +294,36 @@ class TestGlm5TransformersComponentParity(unittest.TestCase):
             self.positions,
             self.causal_mask[:, 0],
         )
+        # 验证两边的 top-k 索引完全一致
+        # 要求shape、元素位置（顺序）、元素值完全一致
+        # 因为 topk() 默认返回按 score 排序后的索引
         self.assertTrue(torch.equal(titan_topk, hf_topk))
 
+    # 验证两种实现在moe router上的行为
     def test_router_selection_and_weights_match_transformers_exactly(self) -> None:
         layer_index = 1
         hf_layer = self.hf_model.model.layers[layer_index]
         titan_moe = self.titan_model.layers[str(layer_index)].moe
         normalized_hidden_states = self._normalized_hidden_states(layer_index)
 
+        # 计算路由权重和专家索引
         _, hf_weights_RK, hf_indices_RK = hf_layer.mlp.gate(normalized_hidden_states)
         titan_weights_BLK, titan_indices_BLK, _ = titan_moe.router(
             normalized_hidden_states, titan_moe.expert_bias_E
         )
+        # 验证 HF fused router 输出与 TorchTitan router 输出 shape 对齐
         hf_weights_BLK = hf_weights_RK.view_as(titan_weights_BLK)
         hf_indices_BLK = hf_indices_RK.view_as(titan_indices_BLK)
+        # 验证专家索引完全一致
         self.assertTrue(torch.equal(titan_indices_BLK, hf_indices_BLK))
+        # 验证路由权重数值接近
         torch.testing.assert_close(
             titan_weights_BLK, hf_weights_BLK, rtol=1e-6, atol=1e-7
         )
 
+    # 验证完整 attention 输出
+    # MLA + DSA top-k + sparse mask + softmax + value aggregation + output projection
+    # 有误差再缩小测试粒度
     def test_attention_output_matches_transformers_fp32(self) -> None:
         layer_index = 0
         hf_attention = self.hf_model.model.layers[layer_index].self_attn
@@ -283,10 +339,13 @@ class TestGlm5TransformersComponentParity(unittest.TestCase):
         titan_output_BLD = titan_attention(
             normalized_hidden_states, self.causal_mask, self.positions
         )
+        # 验证完整attention输出数值接近
         torch.testing.assert_close(
             titan_output_BLD, hf_output_BLD, rtol=1e-4, atol=1e-5
         )
 
+    # 验证完整 dense block 输出
+    # input norm + attetion + FFN
     def test_dense_block_output_matches_transformers_fp32(self) -> None:
         layer_index = 0
         hf_layer = self.hf_model.model.layers[layer_index]
@@ -302,11 +361,13 @@ class TestGlm5TransformersComponentParity(unittest.TestCase):
         titan_output_BLD = titan_layer(
             self.hidden_states, self.causal_mask, self.positions
         )
+        # 验证完整dense block输出数值接近
         torch.testing.assert_close(
             titan_output_BLD, hf_output_BLD, rtol=1e-4, atol=1e-5
         )
 
 
+# BF16端到端
 class TestGlm5TransformersBfloat16Parity(unittest.TestCase):
     """Single-GPU BF16 output, routed-MoE, and gradient parity acceptance."""
 
@@ -324,6 +385,7 @@ class TestGlm5TransformersBfloat16Parity(unittest.TestCase):
 
         cls.device = torch.device("cuda")
         cls.hf_model, cls.titan_model = _build_models(cls.device, seed=53)
+        # 统一将模型转换为 BF16
         _convert_models_to_bfloat16(cls.hf_model, cls.titan_model, cls.device)
         cls.batch_size = 1
         cls.sequence_length = 16
@@ -340,6 +402,8 @@ class TestGlm5TransformersBfloat16Parity(unittest.TestCase):
         ).expand(cls.batch_size, -1)
         cls.causal_mask = _causal_mask(cls.positions, torch.bfloat16)
 
+    # 验证端到端的 BF16 输出、loss 和梯度与 HF 模型一致
+    # TODO: 每一层都需要对比，判断逐层误差累积情况; 然后基于结果逐层对比相关模块
     def test_end_to_end_bfloat16_output_loss_moe_and_gradients(self) -> None:
         """Mapped GLM-5 peers agree across the complete debug training path."""
         self.hf_model.zero_grad(set_to_none=True)
@@ -347,6 +411,7 @@ class TestGlm5TransformersBfloat16Parity(unittest.TestCase):
 
         # Exercise the second decoder block from an identical BF16 activation.
         # Layer 1 is the first routed-MoE layer in the debug configuration.
+        # 验证routed MoE block output
         with torch.no_grad():
             moe_input = self.hf_model.model.embed_tokens(self.tokens)
             hf_position_embeddings = self.hf_model.model.rotary_emb(
@@ -369,6 +434,7 @@ class TestGlm5TransformersBfloat16Parity(unittest.TestCase):
             atol=5e-2,
         )
 
+        # 验证模型端到端完整logits和loss
         labels = self.tokens.clone()
         hf_outputs = self.hf_model(
             input_ids=self.tokens,
@@ -395,6 +461,8 @@ class TestGlm5TransformersBfloat16Parity(unittest.TestCase):
         hf_layer1 = self.hf_model.model.layers[1]
         titan_layer1 = self.titan_model.layers["1"]
         expert_width = self.hf_model.config.moe_intermediate_size
+        # 验证梯度数值接近, embedding/attention/dense ffn/router gate/expert up&down/lm_head gradient
+        # 验证indexer参数不参与梯度计算
         gradient_pairs = (
             (
                 "embedding",
