@@ -451,6 +451,77 @@ def _set_hf_routed_expert_compute_dtype(
         raise ValueError("HF model has no routed-expert modules to wrap")
 
 
+def _set_titan_routed_expert_compute_dtype(
+    titan_model: torch.nn.Module,
+    compute_dtype: torch.dtype,
+) -> None:
+    """Run test-model TorchTitan inner experts with eager FP32 linears."""
+    if compute_dtype is not torch.float32:
+        raise ValueError(
+            "the TorchTitan routed-expert experiment supports only FP32"
+        )
+
+    num_wrapped = 0
+    for layer in titan_model.layers.values():
+        if not getattr(layer, "moe_enabled", False):
+            continue
+        experts = layer.moe.routed_experts.inner_experts
+
+        def forward_with_fp32(
+            self,
+            x_RD: torch.Tensor,
+            num_tokens_per_expert_E: torch.Tensor,
+            _compute_dtype=compute_dtype,
+        ) -> torch.Tensor:
+            def local_tensor(value: torch.Tensor) -> torch.Tensor:
+                return value.to_local() if hasattr(value, "to_local") else value
+
+            w1 = local_tensor(self.w1_EFD)
+            w2 = local_tensor(self.w2_EDF)
+            w3 = local_tensor(self.w3_EFD)
+            token_counts = [
+                int(value)
+                for value in num_tokens_per_expert_E.detach().cpu().tolist()
+            ]
+            if sum(token_counts) != x_RD.shape[0]:
+                raise ValueError(
+                    "expert token counts do not match the dispatched input: "
+                    f"counts={sum(token_counts)}, rows={x_RD.shape[0]}"
+                )
+
+            outputs: list[torch.Tensor] = []
+            start = 0
+            for expert_index, token_count in enumerate(token_counts):
+                end = start + token_count
+                if token_count:
+                    current = x_RD[start:end].to(_compute_dtype)
+                    hidden = F.silu(
+                        F.linear(current, w1[expert_index].to(_compute_dtype))
+                    )
+                    hidden = hidden * F.linear(
+                        current, w3[expert_index].to(_compute_dtype)
+                    )
+                    outputs.append(
+                        F.linear(
+                            hidden,
+                            w2[expert_index].to(_compute_dtype),
+                        )
+                    )
+                start = end
+
+            if not outputs:
+                return x_RD.new_empty((0, x_RD.shape[-1]))
+            return torch.cat(outputs, dim=0).to(x_RD.dtype)
+
+        experts.forward = MethodType(forward_with_fp32, experts)
+        experts._parity_compute_dtype = compute_dtype
+        experts._parity_uses_grouped_mm = False
+        num_wrapped += 1
+
+    if num_wrapped == 0:
+        raise ValueError("TorchTitan model has no routed-expert modules to wrap")
+
+
 def _build_models(
     device: torch.device, *, seed: int = 41
 ) -> tuple[torch.nn.Module, torch.nn.Module]:
@@ -2313,6 +2384,7 @@ class TestGlm5Parity(
     ``GLM5_PARITY_DATA_CASE=random|zeros|ones|extreme|alternating``
     ``GLM5_PARITY_COMPONENT_EXECUTION=independent|sequential``
     ``GLM5_PARITY_HF_ROUTED_EXPERT_COMPUTE=model|bf16|grouped_mm``
+    ``GLM5_PARITY_TITAN_ROUTED_EXPERT_COMPUTE=model|fp32``
 
     The test methods do not construct a precision-specific class.  They use
     the models and batches prepared here.  Fixed runners preserve the original
@@ -2337,6 +2409,9 @@ class TestGlm5Parity(
     )
     HF_ROUTED_EXPERT_COMPUTE = os.environ.get(
         "GLM5_PARITY_HF_ROUTED_EXPERT_COMPUTE", "model"
+    ).lower()
+    TITAN_ROUTED_EXPERT_COMPUTE = os.environ.get(
+        "GLM5_PARITY_TITAN_ROUTED_EXPERT_COMPUTE", "model"
     ).lower()
 
     @staticmethod
@@ -2387,6 +2462,21 @@ class TestGlm5Parity(
                 "GLM5_PARITY_HF_ROUTED_EXPERT_COMPUTE must be "
                 "model, bf16, or grouped_mm"
             )
+        if cls.TITAN_ROUTED_EXPERT_COMPUTE not in {"model", "fp32"}:
+            raise ValueError(
+                "GLM5_PARITY_TITAN_ROUTED_EXPERT_COMPUTE must be model or fp32"
+            )
+        if cls.TITAN_ROUTED_EXPERT_COMPUTE == "fp32":
+            titan_endpoints = (
+                endpoint
+                for endpoint in (cls.actual_endpoint, cls.expected_endpoint)
+                if endpoint.implementation == "titan"
+            )
+            if any(endpoint.precision is not FP32 for endpoint in titan_endpoints):
+                raise ValueError(
+                    "the TorchTitan FP32 routed-expert experiment requires "
+                    "every configured Titan endpoint to use fp32"
+                )
 
         # Build the endpoint table once.  Test methods only select from this
         # table and never perform ad hoc dtype conversion.
@@ -2408,6 +2498,13 @@ class TestGlm5Parity(
                     use_grouped_mm=(
                         cls.HF_ROUTED_EXPERT_COMPUTE == "grouped_mm"
                     ),
+                )
+            if (
+                cls.TITAN_ROUTED_EXPERT_COMPUTE == "fp32"
+                and precision is FP32
+            ):
+                _set_titan_routed_expert_compute_dtype(
+                    pair.titan, torch.float32
                 )
             cls.pairs[precision.name] = pair
             cls.models[("hf", precision.name)] = pair.hf
@@ -2475,11 +2572,14 @@ class TestGlm5Parity(
 
     def _configured_report_label(self) -> str:
         def endpoint_label(endpoint: ModelEndpoint) -> str:
-            expert_compute = (
-                "bf16_grouped_mm"
-                if endpoint.implementation == "titan"
-                else self.HF_ROUTED_EXPERT_COMPUTE
-            )
+            if endpoint.implementation == "titan":
+                expert_compute = (
+                    "fp32_eager"
+                    if self.TITAN_ROUTED_EXPERT_COMPUTE == "fp32"
+                    else "bf16_grouped_mm"
+                )
+            else:
+                expert_compute = self.HF_ROUTED_EXPERT_COMPUTE
             if expert_compute == "model":
                 expert_compute = endpoint.precision.name
             elif expert_compute == "grouped_mm":
