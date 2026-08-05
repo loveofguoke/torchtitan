@@ -141,8 +141,224 @@ def _causal_mask(positions_BL: torch.Tensor, dtype: torch.dtype) -> torch.Tensor
     )
 
 
-# 检测torchtitan glm moe Router的精度是否符合数学定义, 并且在BF16下不会降低离散选择的精度
-# 测试自我规范和数学定义
+def _selection_mismatch_positions(
+    actual_BLK: torch.Tensor,
+    expected_BLK: torch.Tensor,
+    positions_BL: torch.Tensor | None = None,
+) -> list[int]:
+    """Return query positions whose selected sets differ."""
+    if actual_BLK.shape != expected_BLK.shape:
+        raise ValueError(
+            "selection shapes differ: "
+            f"actual={tuple(actual_BLK.shape)}, expected={tuple(expected_BLK.shape)}"
+        )
+    if actual_BLK.ndim != 3:
+        raise ValueError(
+            f"selections must have shape [B, L, K], got {actual_BLK.shape}"
+        )
+    if positions_BL is not None and positions_BL.shape != actual_BLK.shape[:2]:
+        raise ValueError(
+            "positions must match the selection batch and sequence dimensions: "
+            f"positions={tuple(positions_BL.shape)}, "
+            f"selections={tuple(actual_BLK.shape)}"
+        )
+
+    actual_cpu = actual_BLK.detach().cpu()
+    expected_cpu = expected_BLK.detach().cpu()
+    positions_cpu = None if positions_BL is None else positions_BL.detach().cpu()
+    mismatched_positions: list[int] = []
+    for batch_index in range(actual_cpu.shape[0]):
+        for sequence_index in range(actual_cpu.shape[1]):
+            causal_position = (
+                None
+                if positions_cpu is None
+                else int(positions_cpu[batch_index, sequence_index])
+            )
+            actual = {
+                int(index)
+                for index in actual_cpu[batch_index, sequence_index]
+                if causal_position is None or int(index) <= causal_position
+            }
+            expected = {
+                int(index)
+                for index in expected_cpu[batch_index, sequence_index]
+                if causal_position is None or int(index) <= causal_position
+            }
+            if actual != expected:
+                mismatched_positions.append(sequence_index)
+    return mismatched_positions
+
+
+def _format_parity_diagnostics(
+    records: dict[str, dict[int, torch.Tensor | None]],
+    positions_BL: torch.Tensor,
+) -> str:
+    """Format layer-local block, Indexer, and router parity evidence."""
+    expected_record_names = (
+        "hf_blocks",
+        "titan_blocks",
+        "hf_indexer",
+        "titan_indexer",
+        "hf_router",
+        "titan_router",
+    )
+    missing_record_names = [
+        name for name in expected_record_names if name not in records
+    ]
+    if missing_record_names:
+        return f"missing record groups: {missing_record_names}"
+
+    layer_indices = sorted(
+        {
+            layer_index
+            for record_name in expected_record_names
+            for layer_index in records[record_name]
+        }
+    )
+    lines: list[str] = []
+    discrete_mismatches: list[tuple[int, int, str]] = []
+    for layer_index in layer_indices:
+        layer_parts = [f"layer {layer_index}:"]
+        hf_block = records["hf_blocks"].get(layer_index)
+        titan_block = records["titan_blocks"].get(layer_index)
+        if hf_block is None or titan_block is None:
+            layer_parts.append(
+                "block_records=missing"
+                f"(hf={hf_block is not None}, titan={titan_block is not None})"
+            )
+        elif (
+            hf_block.ndim != 3
+            or titan_block.ndim != 3
+            or hf_block.shape[:2] != positions_BL.shape
+            or titan_block.shape[:2] != positions_BL.shape
+        ):
+            layer_parts.append(
+                "block_shape_error=expected [B, L, D] compatible with positions"
+            )
+        elif hf_block.shape != titan_block.shape:
+            layer_parts.append(
+                "block_shape_mismatch="
+                f"hf{tuple(hf_block.shape)}!=titan{tuple(titan_block.shape)}"
+            )
+        else:
+            block_difference = (hf_block.float() - titan_block.float()).abs()
+            position_max_L = block_difference.amax(dim=(0, 2)).detach().cpu()
+            layer_parts.append(f"block_max_abs={float(position_max_L.max()):.6g}")
+            position_values = ", ".join(
+                f"{position}:{float(value):.6g}"
+                for position, value in enumerate(position_max_L)
+            )
+            layer_parts.append(f"block_position_max_abs=[{position_values}]")
+
+        for source in ("indexer", "router"):
+            hf_records = records[f"hf_{source}"]
+            titan_records = records[f"titan_{source}"]
+            if layer_index not in hf_records and layer_index not in titan_records:
+                continue
+            hf_selection = hf_records.get(layer_index)
+            titan_selection = titan_records.get(layer_index)
+            if hf_selection is None or titan_selection is None:
+                layer_parts.append(
+                    f"{source}_records=missing"
+                    f"(hf={hf_selection is not None}, "
+                    f"titan={titan_selection is not None})"
+                )
+                continue
+            try:
+                mismatch_positions = _selection_mismatch_positions(
+                    titan_selection,
+                    hf_selection,
+                    positions_BL if source == "indexer" else None,
+                )
+            except ValueError as error:
+                layer_parts.append(f"{source}_comparison_error={error}")
+                continue
+            layer_parts.append(
+                f"{source}_mismatched_queries={len(mismatch_positions)} "
+                f"positions={sorted(set(mismatch_positions))}"
+            )
+            discrete_mismatches.extend(
+                (layer_index, position, source) for position in mismatch_positions
+            )
+        lines.append(" ".join(layer_parts))
+
+    if discrete_mismatches:
+        layer_index, position, source = min(discrete_mismatches)
+        lines.append(
+            "first_discrete_mismatch="
+            f"layer {layer_index} position {position} source={source}"
+        )
+    else:
+        lines.append("first_discrete_mismatch=none")
+    return "\n".join(lines)
+
+
+class TestGlm5ParityDiagnostics(unittest.TestCase):
+    def test_format_reports_layer_position_and_discrete_mismatches(self) -> None:
+        zero_blocks = torch.zeros(1, 3, 2)
+        divergent_blocks = zero_blocks.clone()
+        divergent_blocks[0, 1, 0] = 0.5
+        matching_indices = torch.tensor([[[0, 1], [0, 1], [0, 1]]])
+        future_only_indices = torch.tensor([[[0, 2], [0, 1], [0, 1]]])
+        indexer_indices = torch.tensor([[[0, 2], [0, 1], [0, 2]]])
+        router_indices = torch.tensor([[[1, 0], [0, 2], [1, 0]]])
+        records = {
+            "hf_blocks": {0: zero_blocks, 1: zero_blocks},
+            "titan_blocks": {0: zero_blocks, 1: divergent_blocks},
+            "hf_indexer": {0: matching_indices, 1: matching_indices},
+            "titan_indexer": {0: future_only_indices, 1: indexer_indices},
+            "hf_router": {1: matching_indices},
+            "titan_router": {1: router_indices},
+        }
+
+        diagnostics = _format_parity_diagnostics(records, torch.tensor([[0, 1, 2]]))
+
+        self.assertIn("layer 0: block_max_abs=0", diagnostics)
+        self.assertIn("layer 1: block_max_abs=0.5", diagnostics)
+        self.assertIn("block_position_max_abs=[0:0, 1:0.5, 2:0]", diagnostics)
+        self.assertIn("indexer_mismatched_queries=1 positions=[2]", diagnostics)
+        self.assertIn("router_mismatched_queries=1 positions=[1]", diagnostics)
+        self.assertIn(
+            "first_discrete_mismatch=layer 1 position 1 source=router",
+            diagnostics,
+        )
+
+    def test_format_reports_missing_expected_records(self) -> None:
+        matching_indices = torch.tensor([[[0], [0]]])
+        zero_blocks = torch.zeros(1, 2, 2)
+        records = {
+            "hf_blocks": {0: zero_blocks, 1: zero_blocks},
+            "titan_blocks": {0: zero_blocks, 1: zero_blocks},
+            "hf_indexer": {0: None, 1: matching_indices},
+            "titan_indexer": {0: None, 1: matching_indices},
+            "hf_router": {1: matching_indices},
+            "titan_router": {1: None},
+        }
+
+        diagnostics = _format_parity_diagnostics(records, torch.tensor([[0, 1]]))
+
+        self.assertIn("indexer_records=missing(hf=False, titan=False)", diagnostics)
+        self.assertIn("router_records=missing(hf=True, titan=False)", diagnostics)
+
+    def test_format_reports_incompatible_block_shape(self) -> None:
+        malformed_blocks = torch.zeros(2, 2)
+        records = {
+            "hf_blocks": {0: malformed_blocks},
+            "titan_blocks": {0: malformed_blocks},
+            "hf_indexer": {},
+            "titan_indexer": {},
+            "hf_router": {},
+            "titan_router": {},
+        }
+
+        diagnostics = _format_parity_diagnostics(records, torch.tensor([[0, 1]]))
+
+        self.assertIn(
+            "block_shape_error=expected [B, L, D] compatible with positions",
+            diagnostics,
+        )
+
+
 class TestGlm5Bfloat16RouterPrecision(unittest.TestCase):
     # 测试Router的gate在BF16下仍然保持FP32精度, 并且路由结果与FP32计算一致
     def test_router_gate_is_evaluated_in_float32(self) -> None:
@@ -277,20 +493,51 @@ class TestGlm5TransformersComponentParity(unittest.TestCase):
         # TODO: 这里220 / 4096 元素不相等, 最大绝对差 2.3841858e-7
         # TODO: 如果误差很小，可以放宽
         torch.testing.assert_close(titan_q_resid, hf_q_resid, rtol=0, atol=0)
+        torch.testing.assert_close(
+            titan_q_resid,
+            hf_q_resid,
+            rtol=1e-6,
+            atol=1e-7,
+        )
+        common_q_resid = hf_q_resid
 
         # TODO: 没有比较indexer的topk scores, 只比较了topk索引
 
         # 调用indexer，得到top-k的token索引
         hf_topk = hf_attention.indexer(
             hidden_states,
-            hf_q_resid,
+            common_q_resid,
             self.hf_position_embeddings,
             self.causal_mask[:, 0],
             self.positions,
         )
         titan_topk = titan_attention.indexer(
             hidden_states,
+            common_q_resid,
+            self.positions,
+            self.causal_mask[:, 0],
+        )
+        torch.testing.assert_close(
             titan_q_resid,
+            hf_q_resid,
+            rtol=1e-6,
+            atol=1e-7,
+        )
+        common_q_resid = hf_q_resid
+
+        # TODO: 没有比较indexer的topk scores, 只比较了topk索引
+
+        # 调用indexer，得到top-k的token索引
+        hf_topk = hf_attention.indexer(
+            hidden_states,
+            common_q_resid,
+            self.hf_position_embeddings,
+            self.causal_mask[:, 0],
+            self.positions,
+        )
+        titan_topk = titan_attention.indexer(
+            hidden_states,
+            common_q_resid,
             self.positions,
             self.causal_mask[:, 0],
         )
@@ -298,6 +545,8 @@ class TestGlm5TransformersComponentParity(unittest.TestCase):
         # 要求shape、元素位置（顺序）、元素值完全一致
         # 因为 topk() 默认返回按 score 排序后的索引
         self.assertTrue(torch.equal(titan_topk, hf_topk))
+        torch.testing.assert_close(titan_topk, hf_topk, rtol=0, atol=0)
+        torch.testing.assert_close(titan_topk, hf_topk, rtol=0, atol=0)
 
     # 验证两种实现在moe router上的行为
     def test_router_selection_and_weights_match_transformers_exactly(self) -> None:
@@ -436,21 +685,109 @@ class TestGlm5TransformersBfloat16Parity(unittest.TestCase):
 
         # 验证模型端到端完整logits和loss
         labels = self.tokens.clone()
-        hf_outputs = self.hf_model(
-            input_ids=self.tokens,
-            position_ids=self.positions,
-            labels=labels,
-            use_cache=False,
-        )
+        layer_indices = range(len(self.hf_model.model.layers))
+        records: dict[str, dict[int, torch.Tensor | None]] = {
+            "hf_blocks": {layer_index: None for layer_index in layer_indices},
+            "titan_blocks": {layer_index: None for layer_index in layer_indices},
+            "hf_indexer": {layer_index: None for layer_index in layer_indices},
+            "titan_indexer": {layer_index: None for layer_index in layer_indices},
+            "hf_router": {},
+            "titan_router": {},
+        }
+        hook_handles = []
+        try:
+            for layer_index in layer_indices:
+                hf_layer = self.hf_model.model.layers[layer_index]
+                titan_layer = self.titan_model.layers[str(layer_index)]
+
+                def capture_hf_block(
+                    _module, _inputs, output, *, layer_index=layer_index
+                ) -> None:
+                    records["hf_blocks"][layer_index] = output[0].detach()
+
+                def capture_titan_block(
+                    _module, _inputs, output, *, layer_index=layer_index
+                ) -> None:
+                    records["titan_blocks"][layer_index] = output.detach()
+
+                def capture_hf_indexer(
+                    _module, _inputs, output, *, layer_index=layer_index
+                ) -> None:
+                    records["hf_indexer"][layer_index] = output.detach()
+
+                def capture_titan_indexer(
+                    _module, _inputs, output, *, layer_index=layer_index
+                ) -> None:
+                    records["titan_indexer"][layer_index] = output.detach()
+
+                hook_handles.append(hf_layer.register_forward_hook(capture_hf_block))
+                hook_handles.append(
+                    titan_layer.register_forward_hook(capture_titan_block)
+                )
+                hook_handles.append(
+                    hf_layer.self_attn.indexer.register_forward_hook(capture_hf_indexer)
+                )
+                hook_handles.append(
+                    titan_layer.attention.indexer.register_forward_hook(
+                        capture_titan_indexer
+                    )
+                )
+                if getattr(titan_layer, "moe_enabled", False):
+                    records["hf_router"][layer_index] = None
+                    records["titan_router"][layer_index] = None
+
+                    def capture_hf_router(
+                        _module, inputs, output, *, layer_index=layer_index
+                    ) -> None:
+                        batch_size, sequence_length = inputs[0].shape[:2]
+                        records["hf_router"][layer_index] = (
+                            output[2].view(batch_size, sequence_length, -1).detach()
+                        )
+
+                    def capture_titan_router(
+                        _module, _inputs, output, *, layer_index=layer_index
+                    ) -> None:
+                        records["titan_router"][layer_index] = output[1].detach()
+
+                    hook_handles.append(
+                        hf_layer.mlp.gate.register_forward_hook(capture_hf_router)
+                    )
+                    hook_handles.append(
+                        titan_layer.moe.router.register_forward_hook(
+                            capture_titan_router
+                        )
+                    )
+
+            hf_outputs = self.hf_model(
+                input_ids=self.tokens,
+                position_ids=self.positions,
+                labels=labels,
+                use_cache=False,
+            )
+            titan_logits = self.titan_model(self.tokens, positions=self.positions)
+        finally:
+            for handle in hook_handles:
+                handle.remove()
+
         hf_logits = hf_outputs.logits
         hf_loss = hf_outputs.loss
-        titan_logits = self.titan_model(self.tokens, positions=self.positions)
         titan_loss = F.cross_entropy(
             titan_logits[:, :-1].float().reshape(-1, 2048),
             labels[:, 1:].reshape(-1),
         )
 
-        torch.testing.assert_close(titan_logits, hf_logits, rtol=5e-2, atol=5e-2)
+        try:
+            torch.testing.assert_close(
+                titan_logits,
+                hf_logits,
+                rtol=5e-2,
+                atol=5e-2,
+            )
+        except AssertionError as error:
+            diagnostics = _format_parity_diagnostics(records, self.positions)
+            raise AssertionError(
+                f"{error}\n\nGLM-5 parity diagnostics:\n{diagnostics}"
+            ) from error
         torch.testing.assert_close(titan_loss, hf_loss, rtol=5e-2, atol=5e-2)
 
         hf_loss.backward()
