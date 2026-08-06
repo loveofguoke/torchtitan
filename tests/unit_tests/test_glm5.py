@@ -388,6 +388,20 @@ class TestGlm5DsaIndexer(unittest.TestCase):
 
 # glm5 MLA+DSA Attention模块测试
 class TestGlm5Attention(unittest.TestCase):
+    def test_attention_accepts_independent_indexer_head_dimension(self):
+        config = _attention_config()
+        indexer = dataclasses.replace(
+            config.indexer,
+            head_dim=6,
+            wq_b=Linear.Config(in_features=8, out_features=12),
+            wk=Linear.Config(in_features=16, out_features=6),
+            k_norm=LayerNorm.Config(normalized_shape=6),
+        )
+        updated = dataclasses.replace(config, indexer=indexer)
+
+        self.assertEqual(updated.qk_head_dim, 8)
+        self.assertEqual(updated.indexer.head_dim, 6)
+
     def test_attention_topk_cannot_reopen_causal_mask(self):
         attention = _attention_config().build()
         attention.init_states()

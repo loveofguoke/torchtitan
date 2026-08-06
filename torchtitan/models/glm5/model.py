@@ -199,10 +199,11 @@ class Glm5Attention(BaseAttention):
             if (
                 self.indexer.dim != self.dim
                 or self.indexer.q_lora_rank != self.q_lora_rank
-                or self.indexer.head_dim != self.qk_head_dim
                 or self.indexer.qk_rope_head_dim != self.qk_rope_head_dim
             ):
-                raise ValueError("indexer dimensions must match GLM-5 MLA dimensions.")
+                raise ValueError(
+                    "indexer shared dimensions must match GLM-5 MLA dimensions."
+                )
 
     def __init__(self, config: Config):
         super().__init__()
