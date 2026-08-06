@@ -280,28 +280,62 @@ class ParityModelPair:
 class ParityModelSize:
     """One size definition shared by HF and TorchTitan parity models."""
 
-    vocab_size: int = 2048
-    dim: int = 256
-    num_layers: int = 4
-    num_dense_layers: int = 1
-    num_attention_heads: int = 8
-    q_lora_rank: int = 128
-    kv_lora_rank: int = 64
-    qk_nope_head_dim: int = 32
-    qk_rope_head_dim: int = 32
-    v_head_dim: int = 64
-    dense_hidden_dim: int = 1024
-    moe_hidden_dim: int = 256
-    num_experts: int = 8
+    # Balanced single-A100 profile. Core head/indexer geometry follows the
+    # published GLM-5.2 config, while width and expert count are reduced.
+    vocab_size: int = 154880
+    dim: int = 2048 # 6144
+    num_layers: int = 12 # 78
+    num_dense_layers: int = 1 # 3
+    num_attention_heads: int = 32 # 64
+    q_lora_rank: int = 768 # 2044
+    kv_lora_rank: int = 192 # 512
+    qk_nope_head_dim: int = 192
+    qk_rope_head_dim: int = 64
+    v_head_dim: int = 256
+    dense_hidden_dim: int = 4096 # 12288
+    moe_hidden_dim: int = 768 # 2048
+    num_experts: int = 32 # 256
     num_shared_experts: int = 1
-    router_top_k: int = 2
+    router_top_k: int = 8
     router_num_expert_groups: int = 1
     router_num_limited_groups: int = 1
     router_route_scale: float = 2.5
-    index_num_heads: int = 4
-    index_head_dim: int = 64
-    index_top_k: int = 8
-    max_position_embeddings: int = 128
+    index_num_heads: int = 32
+    index_head_dim: int = 128
+    index_top_k: int = 2048
+    max_position_embeddings: int = 1048576
+    rope_theta: float = 8_000_000.0
+    rope_cache_max_seq_len: int = 128
+
+    @classmethod
+    def router_unit_profile(cls) -> "ParityModelSize":
+        """Return a tiny profile for CPU-only router implementation tests."""
+        return cls(
+            vocab_size=2048,
+            dim=256,
+            num_layers=2,
+            num_dense_layers=1,
+            num_attention_heads=8,
+            q_lora_rank=128,
+            kv_lora_rank=64,
+            qk_nope_head_dim=32,
+            qk_rope_head_dim=32,
+            v_head_dim=64,
+            dense_hidden_dim=1024,
+            moe_hidden_dim=256,
+            num_experts=8,
+            num_shared_experts=1,
+            router_top_k=2,
+            router_num_expert_groups=1,
+            router_num_limited_groups=1,
+            router_route_scale=2.5,
+            index_num_heads=4,
+            index_head_dim=64,
+            index_top_k=8,
+            max_position_embeddings=128,
+            rope_theta=1_000_000.0,
+            rope_cache_max_seq_len=128,
+        )
 
     @classmethod
     def from_env(cls) -> "ParityModelSize":
@@ -363,6 +397,16 @@ class ParityModelSize:
                 "MAX_POSITION_EMBEDDINGS",
                 defaults.max_position_embeddings,
             ),
+            rope_theta=float(
+                os.environ.get(
+                    "GLM5_PARITY_MODEL_ROPE_THETA",
+                    str(defaults.rope_theta),
+                )
+            ),
+            rope_cache_max_seq_len=integer(
+                "ROPE_CACHE_MAX_SEQ_LEN",
+                defaults.rope_cache_max_seq_len,
+            ),
         )
 
     def validate(self, *, sequence_length: int) -> None:
@@ -375,6 +419,10 @@ class ParityModelSize:
         if self.max_position_embeddings < sequence_length:
             raise ValueError(
                 "max position embeddings must cover the parity sequence length"
+            )
+        if self.rope_cache_max_seq_len < sequence_length:
+            raise ValueError(
+                "RoPE cache length must cover the parity sequence length"
             )
 
     @property
@@ -415,7 +463,10 @@ def _hf_config(model_size: ParityModelSize) -> Any:
         index_n_heads=model_size.index_num_heads,
         first_k_dense_replace=model_size.num_dense_layers,
         indexer_types=["full"] * model_size.num_layers,
-        rope_parameters={"rope_type": "default", "rope_theta": 1_000_000.0},
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": model_size.rope_theta,
+        },
         use_cache=False,
         _attn_implementation="eager",
     )
@@ -426,7 +477,8 @@ def _titan_config(model_size: ParityModelSize) -> Any:
     rope = replace(
         base.layers[0].attention.rope,
         dim=model_size.qk_rope_head_dim,
-        max_seq_len=model_size.max_position_embeddings,
+        max_seq_len=model_size.rope_cache_max_seq_len,
+        theta=model_size.rope_theta,
     )
     return replace(
         base,
@@ -2888,7 +2940,7 @@ class _ParityDiagnostics:
 
 class _ParityRouterPrecision:
     def _check_router_gate_is_evaluated_in_float32(self) -> None:
-        model_size = ParityModelSize()
+        model_size = ParityModelSize.router_unit_profile()
         titan_model = _titan_config(model_size).build()
         titan_model.init_states()
         titan_model.bfloat16()
@@ -3024,8 +3076,8 @@ class TestGlm5Parity(
     ``GLM5_PARITY_HF_ROUTED_EXPERT_COMPUTE=model|bf16|grouped_mm``
     ``GLM5_PARITY_TITAN_ROUTED_EXPERT_COMPUTE=model|fp32``
     ``GLM5_PARITY_REPORT_DIR=.``
-    ``GLM5_PARITY_MODEL_DIM=256``
-    ``GLM5_PARITY_MODEL_LAYERS=4``
+    ``GLM5_PARITY_MODEL_DIM=2048``
+    ``GLM5_PARITY_MODEL_LAYERS=12``
 
     The test methods do not construct a precision-specific class.  They use
     the models and batches prepared here.  Fixed runners preserve the original
