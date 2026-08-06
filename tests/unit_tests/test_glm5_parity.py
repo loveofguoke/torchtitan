@@ -23,12 +23,15 @@ compact numeric summaries, and explicit discrete selections.
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import unittest
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime
 from html import escape
+from pathlib import Path
 from types import MethodType
 from typing import Any, Callable, Iterator
 
@@ -37,7 +40,11 @@ import torch.nn.functional as F
 
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import TokenChoiceTopKRouter
-from torchtitan.models.glm5 import Glm5StateDictAdapter, glm5_configs
+from torchtitan.models.glm5 import (
+    build_glm5_layers,
+    Glm5StateDictAdapter,
+    glm5_configs,
+)
 from torchtitan.ops.scatter_add import deterministic_scatter_add
 
 _TRANSFORMERS_IMPORT_ERROR: Exception | None = None
@@ -104,6 +111,7 @@ class ComparisonSpec:
         return f"{self.actual.label} vs {self.expected.label}"
 
 
+# 测试数据构造类
 class ParityDataFactory:
     """Build repeatable batches without embedding data assumptions in tests."""
 
@@ -267,54 +275,215 @@ class ParityModelPair:
         self.precision = precision
 
 
-def _hf_config() -> Any:
+# 统一模型配置入口
+@dataclass(frozen=True)
+class ParityModelSize:
+    """One size definition shared by HF and TorchTitan parity models."""
+
+    vocab_size: int = 2048
+    dim: int = 256
+    num_layers: int = 4
+    num_dense_layers: int = 1
+    num_attention_heads: int = 8
+    q_lora_rank: int = 128
+    kv_lora_rank: int = 64
+    qk_nope_head_dim: int = 32
+    qk_rope_head_dim: int = 32
+    v_head_dim: int = 64
+    dense_hidden_dim: int = 1024
+    moe_hidden_dim: int = 256
+    num_experts: int = 8
+    num_shared_experts: int = 1
+    router_top_k: int = 2
+    router_num_expert_groups: int = 1
+    router_num_limited_groups: int = 1
+    router_route_scale: float = 2.5
+    index_num_heads: int = 4
+    index_head_dim: int = 64
+    index_top_k: int = 8
+    max_position_embeddings: int = 128
+
+    @classmethod
+    def from_env(cls) -> "ParityModelSize":
+        defaults = cls()
+
+        def integer(name: str, value: int) -> int:
+            return int(os.environ.get(f"GLM5_PARITY_MODEL_{name}", str(value)))
+
+        return cls(
+            vocab_size=integer("VOCAB_SIZE", defaults.vocab_size),
+            dim=integer("DIM", defaults.dim),
+            num_layers=integer("LAYERS", defaults.num_layers),
+            num_dense_layers=integer(
+                "DENSE_LAYERS", defaults.num_dense_layers
+            ),
+            num_attention_heads=integer(
+                "ATTENTION_HEADS", defaults.num_attention_heads
+            ),
+            q_lora_rank=integer("Q_LORA_RANK", defaults.q_lora_rank),
+            kv_lora_rank=integer("KV_LORA_RANK", defaults.kv_lora_rank),
+            qk_nope_head_dim=integer(
+                "QK_NOPE_HEAD_DIM", defaults.qk_nope_head_dim
+            ),
+            qk_rope_head_dim=integer(
+                "QK_ROPE_HEAD_DIM", defaults.qk_rope_head_dim
+            ),
+            v_head_dim=integer("V_HEAD_DIM", defaults.v_head_dim),
+            dense_hidden_dim=integer(
+                "DENSE_HIDDEN_DIM", defaults.dense_hidden_dim
+            ),
+            moe_hidden_dim=integer(
+                "MOE_HIDDEN_DIM", defaults.moe_hidden_dim
+            ),
+            num_experts=integer("EXPERTS", defaults.num_experts),
+            num_shared_experts=integer(
+                "SHARED_EXPERTS", defaults.num_shared_experts
+            ),
+            router_top_k=integer("ROUTER_TOP_K", defaults.router_top_k),
+            router_num_expert_groups=integer(
+                "EXPERT_GROUPS", defaults.router_num_expert_groups
+            ),
+            router_num_limited_groups=integer(
+                "LIMITED_GROUPS", defaults.router_num_limited_groups
+            ),
+            router_route_scale=float(
+                os.environ.get(
+                    "GLM5_PARITY_MODEL_ROUTE_SCALE",
+                    str(defaults.router_route_scale),
+                )
+            ),
+            index_num_heads=integer(
+                "INDEX_HEADS", defaults.index_num_heads
+            ),
+            index_head_dim=integer(
+                "INDEX_HEAD_DIM", defaults.index_head_dim
+            ),
+            index_top_k=integer("INDEX_TOP_K", defaults.index_top_k),
+            max_position_embeddings=integer(
+                "MAX_POSITION_EMBEDDINGS",
+                defaults.max_position_embeddings,
+            ),
+        )
+
+    def validate(self, *, sequence_length: int) -> None:
+        if self.num_layers <= 0:
+            raise ValueError("GLM5 parity model must have at least one layer")
+        if not 0 <= self.num_dense_layers <= self.num_layers:
+            raise ValueError("dense layers must be in [0, num_layers]")
+        if self.dim <= 0 or self.vocab_size <= 0:
+            raise ValueError("model dim and vocabulary size must be positive")
+        if self.max_position_embeddings < sequence_length:
+            raise ValueError(
+                "max position embeddings must cover the parity sequence length"
+            )
+
+    @property
+    def label(self) -> str:
+        return (
+            f"l{self.num_layers}-d{self.dim}-e{self.num_experts}"
+            f"-f{self.moe_hidden_dim}"
+        )
+
+
+def _hf_config(model_size: ParityModelSize) -> Any:
     assert GlmMoeDsaConfig is not None
     return GlmMoeDsaConfig(
-        vocab_size=2048,
-        hidden_size=256,
-        intermediate_size=1024,
-        moe_intermediate_size=256,
-        num_hidden_layers=4,
-        num_attention_heads=8,
-        num_key_value_heads=8,
-        n_shared_experts=1,
-        n_routed_experts=8,
-        routed_scaling_factor=2.5,
-        kv_lora_rank=64,
-        q_lora_rank=128,
-        qk_rope_head_dim=32,
-        qk_nope_head_dim=32,
-        v_head_dim=64,
-        n_group=1,
-        topk_group=1,
-        num_experts_per_tok=2,
+        vocab_size=model_size.vocab_size,
+        hidden_size=model_size.dim,
+        intermediate_size=model_size.dense_hidden_dim,
+        moe_intermediate_size=model_size.moe_hidden_dim,
+        num_hidden_layers=model_size.num_layers,
+        num_attention_heads=model_size.num_attention_heads,
+        num_key_value_heads=model_size.num_attention_heads,
+        n_shared_experts=model_size.num_shared_experts,
+        n_routed_experts=model_size.num_experts,
+        routed_scaling_factor=model_size.router_route_scale,
+        kv_lora_rank=model_size.kv_lora_rank,
+        q_lora_rank=model_size.q_lora_rank,
+        qk_rope_head_dim=model_size.qk_rope_head_dim,
+        qk_nope_head_dim=model_size.qk_nope_head_dim,
+        v_head_dim=model_size.v_head_dim,
+        n_group=model_size.router_num_expert_groups,
+        topk_group=model_size.router_num_limited_groups,
+        num_experts_per_tok=model_size.router_top_k,
         norm_topk_prob=True,
-        max_position_embeddings=128,
+        max_position_embeddings=model_size.max_position_embeddings,
         rms_norm_eps=1e-5,
         attention_dropout=0.0,
-        index_topk=8,
-        index_head_dim=64,
-        index_n_heads=4,
-        first_k_dense_replace=1,
-        indexer_types=["full", "full", "full", "full"],
+        index_topk=model_size.index_top_k,
+        index_head_dim=model_size.index_head_dim,
+        index_n_heads=model_size.index_num_heads,
+        first_k_dense_replace=model_size.num_dense_layers,
+        indexer_types=["full"] * model_size.num_layers,
         rope_parameters={"rope_type": "default", "rope_theta": 1_000_000.0},
         use_cache=False,
         _attn_implementation="eager",
     )
 
 
+def _titan_config(model_size: ParityModelSize) -> Any:
+    base = glm5_configs["debugmodel"]()
+    rope = replace(
+        base.layers[0].attention.rope,
+        dim=model_size.qk_rope_head_dim,
+        max_seq_len=model_size.max_position_embeddings,
+    )
+    return replace(
+        base,
+        vocab_size=model_size.vocab_size,
+        dim=model_size.dim,
+        tok_embeddings=replace(
+            base.tok_embeddings,
+            num_embeddings=model_size.vocab_size,
+            embedding_dim=model_size.dim,
+        ),
+        norm=replace(base.norm, normalized_shape=model_size.dim),
+        lm_head=replace(
+            base.lm_head,
+            in_features=model_size.dim,
+            out_features=model_size.vocab_size,
+        ),
+        layers=build_glm5_layers(
+            n_layers=model_size.num_layers,
+            n_dense_layers=model_size.num_dense_layers,
+            dim=model_size.dim,
+            n_heads=model_size.num_attention_heads,
+            q_lora_rank=model_size.q_lora_rank,
+            kv_lora_rank=model_size.kv_lora_rank,
+            qk_nope_head_dim=model_size.qk_nope_head_dim,
+            qk_rope_head_dim=model_size.qk_rope_head_dim,
+            v_head_dim=model_size.v_head_dim,
+            dense_hidden_dim=model_size.dense_hidden_dim,
+            moe_hidden_dim=model_size.moe_hidden_dim,
+            num_experts=model_size.num_experts,
+            num_shared_experts=model_size.num_shared_experts,
+            router_top_k=model_size.router_top_k,
+            router_num_expert_groups=model_size.router_num_expert_groups,
+            router_num_limited_groups=model_size.router_num_limited_groups,
+            router_route_scale=model_size.router_route_scale,
+            index_n_heads=model_size.index_num_heads,
+            index_head_dim=model_size.index_head_dim,
+            index_topk=model_size.index_top_k,
+            attention_dropout=0.0,
+            rope=rope,
+        ),
+    )
+
+
 def _build_pair(
     device: torch.device,
     *,
+    model_size: ParityModelSize | None = None,
     precision: PrecisionPolicy = FP32,
     seed: int = 41,
 ) -> ParityModelPair:
     assert GlmMoeDsaForCausalLM is not None
+    model_size = model_size or ParityModelSize.from_env()
     torch.manual_seed(seed)
     # Build both implementations from one HF state dict so every comparison
     # tests execution differences rather than unrelated random weights.
-    hf_model = GlmMoeDsaForCausalLM(_hf_config()).float()
-    titan_config = glm5_configs["debugmodel"]()
+    hf_model = GlmMoeDsaForCausalLM(_hf_config(model_size)).float()
+    titan_config = _titan_config(model_size)
     titan_model = titan_config.build()
     titan_model.init_states()  # Initialize decoder runtime state.
     adapter = Glm5StateDictAdapter(titan_config, hf_assets_path=None)
@@ -522,6 +691,26 @@ def _set_titan_routed_expert_compute_dtype(
         raise ValueError("TorchTitan model has no routed-expert modules to wrap")
 
 
+def _annotate_known_compute_dtypes(pair: ParityModelPair) -> None:
+    """Expose explicit mixed-precision contracts to module trace hooks."""
+    for module in pair.hf.modules():
+        if module.__class__.__name__ == "GlmMoeDsaRMSNorm":
+            module._parity_compute_dtype = torch.float32
+    for layer_index in range(len(pair.hf.model.layers)):
+        hf_attention = pair.hf_layer(layer_index).self_attn
+        titan_attention = pair.titan_layer(layer_index).attention
+        hf_attention._parity_compute_dtype = "mixed(fp32_softmax)"
+        titan_attention._parity_compute_dtype = "mixed(fp32_softmax)"
+        hf_attention.indexer._parity_compute_dtype = "mixed(fp32_scores)"
+        titan_attention.indexer._parity_compute_dtype = "mixed(fp32_scores)"
+        titan_layer = pair.titan_layer(layer_index)
+        if getattr(titan_layer, "moe_enabled", False):
+            titan_layer.moe.router.gate._parity_compute_dtype = torch.float32
+            experts = titan_layer.moe.routed_experts.inner_experts
+            if not hasattr(experts, "_parity_compute_dtype"):
+                experts._parity_compute_dtype = torch.bfloat16
+
+
 def _build_models(
     device: torch.device, *, seed: int = 41
 ) -> tuple[torch.nn.Module, torch.nn.Module]:
@@ -610,6 +799,11 @@ class ComparisonResult:
     passed: bool
     max_abs: float | None = None
     max_rel: float | None = None
+    mean_abs: float | None = None
+    mean_rel: float | None = None
+    relative_l2: float | None = None
+    cosine_similarity: float | None = None
+    rmse: float | None = None
     mismatch_count: int = 0
     mismatch_positions: list[int] = field(default_factory=list)
     peak_position: int | None = None
@@ -621,6 +815,10 @@ class ComparisonResult:
     checkpoint: bool = True
     actual_summary: str = ""
     expected_summary: str = ""
+    actual_dtype: str = ""
+    expected_dtype: str = ""
+    explosion: bool = False
+    growth_ratio: float | None = None
 
 
 class ParityRecorder:
@@ -781,7 +979,92 @@ class ParityRecorder:
         return cls._phase(result), 1, 0, 0, cls._path_key(result)
 
     def ordered_results(self) -> list[ComparisonResult]:
+        self._annotate_explosions()
         return sorted(self.results, key=self._result_key)
+
+    def _annotate_explosions(self) -> None:
+        for result in self.results:
+            result.explosion = False
+            result.growth_ratio = None
+        threshold = float(
+            os.environ.get("GLM5_PARITY_EXPLOSION_RATIO", "8.0")
+        )
+        numerical_floor = torch.finfo(self.precision.dtype).eps * 0.1
+        rows: dict[str, ComparisonResult] = {}
+        for result in self.results:
+            if result.max_abs is None or not isinstance(result.layer, int):
+                continue
+            if self._phase(result) != 0:
+                continue
+            path = self._display_path(result)
+            previous = rows.get(path)
+            if previous is None or result.checkpoint:
+                rows[path] = result
+
+        previous_layer_error = numerical_floor
+        layers = sorted(
+            {
+                result.layer
+                for result in rows.values()
+                if isinstance(result.layer, int)
+            }
+        )
+        for layer in layers:
+            prefix = f"layers.{layer}"
+            sequence = (
+                f"{prefix}.attention_norm",
+                f"{prefix}.attention",
+                f"{prefix}.ffn_norm",
+                f"{prefix}.feed_forward",
+                f"{prefix}.moe",
+                prefix,
+            )
+            baseline = previous_layer_error
+            for path in sequence:
+                result = rows.get(path)
+                if result is None or result.max_abs is None:
+                    continue
+                ratio = result.max_abs / max(baseline, numerical_floor)
+                result.growth_ratio = ratio
+                if ratio >= threshold and result.max_abs >= numerical_floor:
+                    result.explosion = True
+                baseline = max(result.max_abs, numerical_floor)
+            layer_result = rows.get(prefix)
+            if layer_result is not None and layer_result.max_abs is not None:
+                previous_layer_error = max(
+                    layer_result.max_abs, numerical_floor
+                )
+
+        # Component reports often have no decoder-level checkpoints.  In that
+        # case, compare the same logical component across adjacent layers so a
+        # sudden cross-layer increase is still highlighted.
+        component_series: dict[str, dict[int, ComparisonResult]] = {}
+        for result in self.results:
+            if result.max_abs is None or not isinstance(result.layer, int):
+                continue
+            if self._phase(result) != 0:
+                continue
+            path = self._display_path(result)
+            if not path.startswith(f"layers.{result.layer}."):
+                continue
+            series_name = re.sub(r"^layers\.\d+\.", "", path)
+            by_layer = component_series.setdefault(series_name, {})
+            existing = by_layer.get(result.layer)
+            if existing is None or result.checkpoint:
+                by_layer[result.layer] = result
+        for by_layer in component_series.values():
+            previous_error: float | None = None
+            for layer in sorted(by_layer):
+                result = by_layer[layer]
+                if previous_error is not None and result.max_abs is not None:
+                    ratio = result.max_abs / max(
+                        previous_error, numerical_floor
+                    )
+                    if result.growth_ratio is None or ratio > result.growth_ratio:
+                        result.growth_ratio = ratio
+                    if ratio >= threshold and result.max_abs >= numerical_floor:
+                        result.explosion = True
+                previous_error = max(result.max_abs or 0.0, numerical_floor)
 
     def summary(self) -> str:
         checkpoint_total = sum(result.checkpoint for result in self.results)
@@ -815,7 +1098,11 @@ class ParityRecorder:
         level: int = 0,
         node_kind: str = "checkpoint",
         checkpoint: bool = True,
+        actual_dtype: str | None = None,
+        expected_dtype: str | None = None,
     ) -> ComparisonResult:
+        actual_dtype = actual_dtype or f"out={str(actual.dtype).removeprefix('torch.')}"
+        expected_dtype = expected_dtype or f"out={str(expected.dtype).removeprefix('torch.')}"
         actual_cpu = self._cpu(actual)
         expected_cpu = self._cpu(expected)
         rtol = self.precision.rtol if rtol is None else rtol
@@ -831,10 +1118,27 @@ class ParityRecorder:
                 checkpoint=checkpoint,
                 actual_summary=f"shape={tuple(actual_cpu.shape)}",
                 expected_summary=f"shape={tuple(expected_cpu.shape)}",
+                actual_dtype=actual_dtype,
+                expected_dtype=expected_dtype,
             )
         else:
             diff = (actual_cpu - expected_cpu).abs()
             scale = expected_cpu.abs().clamp_min(torch.finfo(torch.float32).tiny)
+            symmetric_scale = (actual_cpu.abs() + expected_cpu.abs()).clamp_min(
+                torch.finfo(torch.float32).eps
+            )
+            diff_l2 = torch.linalg.vector_norm(diff.reshape(-1))
+            expected_l2 = torch.linalg.vector_norm(expected_cpu.reshape(-1))
+            cosine_denominator = (
+                torch.linalg.vector_norm(actual_cpu.reshape(-1)) * expected_l2
+            )
+            if cosine_denominator == 0:
+                cosine_similarity = 1.0 if torch.equal(actual_cpu, expected_cpu) else 0.0
+            else:
+                cosine_similarity = float(
+                    torch.dot(actual_cpu.reshape(-1), expected_cpu.reshape(-1))
+                    / cosine_denominator
+                )
             peak_position = None
             mismatch_positions: list[int] = []
             detail = ""
@@ -859,6 +1163,21 @@ class ParityRecorder:
                 bool(torch.all(diff <= atol + rtol * expected_cpu.abs())),
                 float(diff.max()) if diff.numel() else 0.0,
                 float((diff / scale).max()) if diff.numel() else 0.0,
+                mean_abs=float(diff.mean()) if diff.numel() else 0.0,
+                mean_rel=(
+                    float((2.0 * diff / symmetric_scale).mean())
+                    if diff.numel()
+                    else 0.0
+                ),
+                relative_l2=float(
+                    diff_l2 / expected_l2.clamp_min(torch.finfo(torch.float32).eps)
+                ),
+                cosine_similarity=cosine_similarity,
+                rmse=(
+                    float(torch.sqrt(torch.mean(diff.square())))
+                    if diff.numel()
+                    else 0.0
+                ),
                 mismatch_count=mismatch_count,
                 mismatch_positions=mismatch_positions,
                 peak_position=peak_position,
@@ -870,6 +1189,8 @@ class ParityRecorder:
                 checkpoint=checkpoint,
                 actual_summary=self._numeric_summary(actual_cpu),
                 expected_summary=self._numeric_summary(expected_cpu),
+                actual_dtype=actual_dtype,
+                expected_dtype=expected_dtype,
             )
         self.results.append(result)
         return result
@@ -888,6 +1209,8 @@ class ParityRecorder:
         level: int = 0,
         node_kind: str = "checkpoint",
         checkpoint: bool = True,
+        actual_dtype: str | None = None,
+        expected_dtype: str | None = None,
     ) -> ComparisonResult:
         actual_cpu = actual.detach().cpu()
         expected_cpu = expected.detach().cpu()
@@ -949,6 +1272,14 @@ class ParityRecorder:
                 sorted(mismatch_positions),
                 "topk" if component == "indexer" else "indices",
             ),
+            actual_dtype=(
+                actual_dtype
+                or f"out={str(actual.dtype).removeprefix('torch.')}"
+            ),
+            expected_dtype=(
+                expected_dtype
+                or f"out={str(expected.dtype).removeprefix('torch.')}"
+            ),
         )
         self.results.append(result)
         return result
@@ -1003,18 +1334,25 @@ class ParityRecorder:
         headers = (
             "component",
             "hf_path",
+            "actual_dtype",
+            "expected_dtype",
             "actual",
             "expected",
             "max_abs",
-            "max_rel",
+            "mean_abs",
+            "rmse",
+            "mean_rel",
+            "rel_l2",
+            "cosine",
             "mismatches",
+            "trend",
             "status",
         )
         lines = [
             f"GLM-5 parity report: {self.title}",
             "",
             " | ".join(headers),
-            "-|-|-|-|-|-|-|-| ",
+            "-|-|-|-|-|-|-|-|-|-|-|-|-|-|-| ",
         ]
         for result in self.ordered_results():
             status = self._status(result)
@@ -1026,16 +1364,32 @@ class ParityRecorder:
                     if status == "FAIL"
                     else f"\033[36m{status}\033[0m"
                 )
+            trend = (
+                f"EXPLODE x{result.growth_ratio:.3g}"
+                if result.explosion and result.growth_ratio is not None
+                else "-"
+            )
             lines.append(
                 " | ".join(
                     (
                         self._display_path(result),
                         self._hf_module_path(result),
+                        result.actual_dtype or "-",
+                        result.expected_dtype or "-",
                         result.actual_summary or "-",
                         result.expected_summary or "-",
                         "-" if result.max_abs is None else f"{result.max_abs:.6g}",
-                        "-" if result.max_rel is None else f"{result.max_rel:.6g}",
+                        "-" if result.mean_abs is None else f"{result.mean_abs:.6g}",
+                        "-" if result.rmse is None else f"{result.rmse:.6g}",
+                        "-" if result.mean_rel is None else f"{result.mean_rel:.6g}",
+                        "-" if result.relative_l2 is None else f"{result.relative_l2:.6g}",
+                        (
+                            "-"
+                            if result.cosine_similarity is None
+                            else f"{result.cosine_similarity:.8g}"
+                        ),
                         str(result.mismatch_count),
+                        trend,
                         status,
                     )
                 )
@@ -1052,25 +1406,203 @@ class ParityRecorder:
                 "pass" if status == "PASS"
                 else "fail" if status == "FAIL" else "trace"
             )
+            row_class = " class='explosion-row'" if result.explosion else ""
+            trend = (
+                f"EXPLODE x{result.growth_ratio:.3g}"
+                if result.explosion and result.growth_ratio is not None
+                else "-"
+            )
             rows.append(
-                "<tr>"
+                f"<tr{row_class}>"
                 f"<td>{escape(self._display_path(result))}</td>"
                 f"<td>{escape(self._hf_module_path(result))}</td>"
+                f"<td>{escape(result.actual_dtype or '-')}</td>"
+                f"<td>{escape(result.expected_dtype or '-')}</td>"
                 f"<td>{escape(result.actual_summary or '-')}</td>"
                 f"<td>{escape(result.expected_summary or '-')}</td>"
                 f"<td>{'-' if result.max_abs is None else f'{result.max_abs:.6g}'}</td>"
-                f"<td>{'-' if result.max_rel is None else f'{result.max_rel:.6g}'}</td>"
+                f"<td>{'-' if result.mean_abs is None else f'{result.mean_abs:.6g}'}</td>"
+                f"<td>{'-' if result.rmse is None else f'{result.rmse:.6g}'}</td>"
+                f"<td>{'-' if result.mean_rel is None else f'{result.mean_rel:.6g}'}</td>"
+                f"<td>{'-' if result.relative_l2 is None else f'{result.relative_l2:.6g}'}</td>"
+                f"<td>{'-' if result.cosine_similarity is None else f'{result.cosine_similarity:.8g}'}</td>"
                 f"<td>{result.mismatch_count}</td>"
+                f"<td>{escape(trend)}</td>"
                 f"<td class='{status_class}'>{status}</td>"
                 "</tr>"
             )
         return (
             "<table><thead><tr><th>component</th><th>hf_path</th>"
+            "<th>actual_dtype</th><th>expected_dtype</th>"
             "<th>actual</th>"
-            "<th>expected</th><th>max_abs</th><th>max_rel</th>"
-            "<th>mismatches</th><th>status</th></tr></thead><tbody>"
+            "<th>expected</th><th>max_abs</th><th>mean_abs</th><th>rmse</th>"
+            "<th>mean_rel</th><th>rel_l2</th><th>cosine</th>"
+            "<th>mismatches</th><th>trend</th><th>status</th>"
+            "</tr></thead><tbody>"
             + "".join(rows)
             + "</tbody></table>"
+        )
+
+    def html_error_curve(self) -> str:
+        """Render main forward errors by layer on a logarithmic SVG axis."""
+        patterns = {
+            "layer": re.compile(r"^layers\.(\d+)$"),
+            "attention": re.compile(r"^layers\.(\d+)\.attention$"),
+            "ffn_norm": re.compile(r"^layers\.(\d+)\.ffn_norm$"),
+            "ffn_or_moe": re.compile(
+                r"^layers\.(\d+)\.(?:feed_forward|moe)$"
+            ),
+        }
+        series: dict[str, dict[int, ComparisonResult]] = {
+            name: {} for name in patterns
+        }
+        for result in self.ordered_results():
+            if result.max_abs is None or not isinstance(result.layer, int):
+                continue
+            path = self._display_path(result)
+            for name, pattern in patterns.items():
+                match = pattern.fullmatch(path)
+                if match:
+                    existing = series[name].get(result.layer)
+                    if existing is None or result.checkpoint:
+                        series[name][result.layer] = result
+                    break
+        populated = {name: values for name, values in series.items() if values}
+        if not populated:
+            # Generic component tests do not necessarily expose decoder-level
+            # boundaries.  Group repeated logical paths across layers instead.
+            generic: dict[str, dict[int, ComparisonResult]] = {}
+            for result in self.ordered_results():
+                if result.max_abs is None or not isinstance(result.layer, int):
+                    continue
+                path = self._display_path(result)
+                if not path.startswith(f"layers.{result.layer}."):
+                    continue
+                name = re.sub(r"^layers\.\d+\.", "", path)
+                values = generic.setdefault(name, {})
+                existing = values.get(result.layer)
+                if existing is None or result.checkpoint:
+                    values[result.layer] = result
+            # Keep the chart readable while the table retains every row.
+            populated = dict(
+                sorted(generic.items(), key=lambda item: item[0])[:12]
+            )
+        if not populated:
+            return ""
+
+        all_layers = sorted(
+            {layer for values in populated.values() for layer in values}
+        )
+        floor = max(torch.finfo(self.precision.dtype).eps * 0.01, 1e-12)
+        all_values = [
+            max(result.max_abs or 0.0, floor)
+            for values in populated.values()
+            for result in values.values()
+        ]
+        log_min = math.floor(math.log10(min(all_values)))
+        log_max = math.ceil(math.log10(max(all_values)))
+        if log_min == log_max:
+            log_max += 1
+
+        width, height = 920, 300
+        left, right, top, bottom = 72, 24, 24, 54
+        plot_width = width - left - right
+        plot_height = height - top - bottom
+
+        def x_position(layer: int) -> float:
+            if len(all_layers) == 1:
+                return left + plot_width / 2
+            return left + plot_width * (
+                (layer - all_layers[0]) / (all_layers[-1] - all_layers[0])
+            )
+
+        def y_position(value: float) -> float:
+            normalized = (math.log10(max(value, floor)) - log_min) / (
+                log_max - log_min
+            )
+            return top + plot_height * (1.0 - normalized)
+
+        palette = (
+            "#1f77b4",
+            "#9467bd",
+            "#ff7f0e",
+            "#2ca02c",
+            "#17becf",
+            "#8c564b",
+            "#e377c2",
+            "#7f7f7f",
+            "#bcbd22",
+            "#d62728",
+            "#393b79",
+            "#637939",
+        )
+        colors = {
+            "layer": "#1f77b4",
+            "attention": "#9467bd",
+            "ffn_norm": "#ff7f0e",
+            "ffn_or_moe": "#2ca02c",
+        }
+        for index, name in enumerate(populated):
+            colors.setdefault(name, palette[index % len(palette)])
+        svg = [
+            f"<svg viewBox='0 0 {width} {height}' role='img' "
+            "aria-label='Layer error curves'>",
+            f"<line x1='{left}' y1='{top}' x2='{left}' y2='{top + plot_height}' class='axis'/>",
+            f"<line x1='{left}' y1='{top + plot_height}' x2='{left + plot_width}' y2='{top + plot_height}' class='axis'/>",
+        ]
+        for exponent in range(log_min, log_max + 1):
+            y_value = y_position(10.0**exponent)
+            svg.append(
+                f"<line x1='{left}' y1='{y_value:.2f}' "
+                f"x2='{left + plot_width}' y2='{y_value:.2f}' class='grid'/>"
+                f"<text x='{left - 8}' y='{y_value + 4:.2f}' "
+                f"text-anchor='end'>1e{exponent}</text>"
+            )
+        for layer in all_layers:
+            x_value = x_position(layer)
+            svg.append(
+                f"<text x='{x_value:.2f}' y='{top + plot_height + 22}' "
+                f"text-anchor='middle'>{layer}</text>"
+            )
+        for name, values in populated.items():
+            points = [
+                (
+                    layer,
+                    x_position(layer),
+                    y_position(values[layer].max_abs or 0.0),
+                    values[layer],
+                )
+                for layer in sorted(values)
+            ]
+            polyline = " ".join(
+                f"{x_value:.2f},{y_value:.2f}"
+                for _, x_value, y_value, _ in points
+            )
+            svg.append(
+                f"<polyline points='{polyline}' fill='none' "
+                f"stroke='{colors[name]}' stroke-width='2'/>"
+            )
+            for layer, x_value, y_value, result in points:
+                marker = "#d62728" if result.explosion else colors[name]
+                svg.append(
+                    f"<circle cx='{x_value:.2f}' cy='{y_value:.2f}' r='4' "
+                    f"fill='{marker}'><title>{escape(name)} layer {layer}: "
+                    f"max_abs={result.max_abs:.6g}</title></circle>"
+                )
+        legend_x = left
+        for index, name in enumerate(populated):
+            x_value = legend_x + index * 180
+            svg.append(
+                f"<line x1='{x_value}' y1='{height - 12}' x2='{x_value + 22}' "
+                f"y2='{height - 12}' stroke='{colors[name]}' stroke-width='3'/>"
+                f"<text x='{x_value + 28}' y='{height - 8}'>{escape(name)}</text>"
+            )
+        svg.append("</svg>")
+        return (
+            "<div class='error-chart'><h3>Max-abs error by layer</h3>"
+            "<p>Log scale. Red markers identify configured explosion points.</p>"
+            + "".join(svg)
+            + "</div>"
         )
 
     def html_section(self, section_id: str) -> str:
@@ -1079,7 +1611,12 @@ class ParityRecorder:
             f"<section id='{escape(section_id)}'>"
             f"<h2>{escape(self.title)}</h2>"
             f"<p class='{failed_class}'>{escape(self.summary())}</p>"
-            f"{self.html_table()}</section>"
+            "<p class='metric-note'>mean_rel is symmetric: "
+            "2*|actual-expected|/(|actual|+|expected|). "
+            "rel_l2 is ||actual-expected||2/||expected||2. "
+            "Dtype flow reports observed input/parameter/output dtypes and "
+            "explicit compute dtypes where the implementation declares one.</p>"
+            f"{self.html_error_curve()}{self.html_table()}</section>"
         )
 
     def write(self, path: str | None = None) -> str:
@@ -1094,6 +1631,8 @@ class ParityRecorder:
                     "td:first-child{white-space:nowrap}"
                     ".pass{color:#087f23;font-weight:bold}.fail{color:#b00020;font-weight:bold}"
                     ".trace{color:#007c91;font-weight:bold}"
+                    ".explosion-row{background:#fff1d6}.axis{stroke:#333}.grid{stroke:#ddd}"
+                    ".error-chart svg{width:100%;max-width:920px}"
                     "</style></head><body>"
                     f"<h1>GLM-5 parity report</h1>{self.html_section('result')}"
                     "</body></html>\n"
@@ -1119,9 +1658,14 @@ class ParityReportSection:
 class ParitySuiteReport:
     """Render independently executed parity tests into one HTML document."""
 
-    def __init__(self, title: str):
+    def __init__(
+        self,
+        title: str,
+        configuration: list[tuple[str, str, str]] | None = None,
+    ):
         self.title = title
         self.sections: list[ParityReportSection] = []
+        self.configuration = configuration or []
 
     def add(self, section_id: str, recorder: ParityRecorder) -> None:
         self.sections.append(ParityReportSection(section_id, recorder))
@@ -1142,6 +1686,21 @@ class ParitySuiteReport:
             section.recorder.html_section(section.section_id)
             for section in self.sections
         )
+        configuration_rows = "".join(
+            "<tr>"
+            f"<td>{escape(category)}</td>"
+            f"<td>{escape(name)}</td>"
+            f"<td>{escape(value)}</td>"
+            "</tr>"
+            for category, name, value in self.configuration
+        )
+        configuration = (
+            "<details open><summary>Effective test configuration</summary>"
+            "<table class='configuration'><thead><tr>"
+            "<th>category</th><th>parameter</th><th>effective value</th>"
+            "</tr></thead><tbody>"
+            f"{configuration_rows}</tbody></table></details>"
+        )
         document = (
             "<!doctype html><html><head><meta charset='utf-8'>"
             "<style>"
@@ -1151,13 +1710,20 @@ class ParitySuiteReport:
             "section{margin:36px 0}table{border-collapse:collapse;width:100%}"
             "th,td{border:1px solid #bbb;padding:4px 8px;text-align:left}"
             "th{position:sticky;top:72px;background:#f5f5f5}"
+            "details{margin:20px 0}summary{font-weight:bold;cursor:pointer}"
+            ".configuration{width:auto;min-width:720px;margin-top:10px}"
+            ".configuration th{position:static}"
             "td:first-child{white-space:nowrap}"
             ".pass{color:#087f23;font-weight:bold}"
             ".fail{color:#b00020;font-weight:bold}"
             ".trace{color:#007c91;font-weight:bold}"
+            ".explosion-row{background:#fff1d6}"
+            ".axis{stroke:#333}.grid{stroke:#ddd}"
+            ".error-chart{overflow-x:auto}.error-chart svg{width:100%;min-width:700px;max-width:920px}"
             "</style></head><body>"
             f"<h1>{escape(self.title)}</h1>"
-            f"<nav><ul>{links}</ul></nav>{sections}</body></html>\n"
+            f"{configuration}<nav><ul>{links}</ul></nav>"
+            f"{sections}</body></html>\n"
         )
         with open(path, "w", encoding="utf-8") as file:
             file.write(document)
@@ -1306,6 +1872,36 @@ def _tensor_leaves(output: Any, prefix: str = "") -> list[tuple[str, torch.Tenso
             leaves.extend(_tensor_leaves(value, f"{prefix}.{key}"))
         return leaves
     return []
+
+
+def _dtype_name(dtype: torch.dtype) -> str:
+    return str(dtype).removeprefix("torch.")
+
+
+def _dtype_flow(
+    module: torch.nn.Module,
+    inputs: Any,
+    output: torch.Tensor,
+) -> str:
+    input_dtypes = sorted(
+        {_dtype_name(value.dtype) for _, value in _tensor_leaves(inputs)}
+    )
+    parameter_dtypes = sorted(
+        {_dtype_name(value.dtype) for value in module.parameters(recurse=False)}
+    )
+    compute_dtype = getattr(module, "_parity_compute_dtype", None)
+    parts = [f"in={','.join(input_dtypes) or '-'}"]
+    if parameter_dtypes:
+        parts.append(f"param={','.join(parameter_dtypes)}")
+    if compute_dtype is not None:
+        compute_name = (
+            _dtype_name(compute_dtype)
+            if isinstance(compute_dtype, torch.dtype)
+            else str(compute_dtype)
+        )
+        parts.append(f"compute={compute_name}")
+    parts.append(f"out={_dtype_name(output.dtype)}")
+    return ";".join(parts)
 
 
 @dataclass
@@ -1489,6 +2085,7 @@ class RecursiveModuleTrace:
 
     activations: dict[str, dict[str, torch.Tensor]] = field(default_factory=dict)
     gradients: dict[str, dict[str, torch.Tensor]] = field(default_factory=dict)
+    dtype_flows: dict[str, dict[str, str]] = field(default_factory=dict)
 
     @staticmethod
     @contextmanager
@@ -1504,6 +2101,7 @@ class RecursiveModuleTrace:
             label = endpoint.label
             trace.activations[label] = {}
             trace.gradients[label] = {}
+            trace.dtype_flows[label] = {}
             layers = model.model.layers if endpoint.implementation == "hf" else model.layers
             for layer_index in layer_indices:
                 layer = (
@@ -1528,12 +2126,16 @@ class RecursiveModuleTrace:
                         path=path,
                     ) -> None:
                         for suffix, value in _tensor_leaves(output):
-                            trace.activations[label][path + suffix] = value.detach().cpu()
+                            output_path = path + suffix
+                            trace.activations[label][output_path] = value.detach().cpu()
+                            trace.dtype_flows[label][output_path] = _dtype_flow(
+                                _module, _inputs, value
+                            )
                             if value.requires_grad:
                                 value.register_hook(
                                     lambda gradient,
                                     label=label,
-                                    path=path + suffix: trace.gradients[label].__setitem__(
+                                    path=output_path: trace.gradients[label].__setitem__(
                                         path, gradient.detach().cpu()
                                     )
                                 )
@@ -1563,12 +2165,16 @@ class RecursiveModuleTrace:
                         path=path,
                     ) -> None:
                         for branch, value in _tensor_leaves(output):
-                            trace.activations[label][path + branch] = value.detach().cpu()
+                            output_path = path + branch
+                            trace.activations[label][output_path] = value.detach().cpu()
+                            trace.dtype_flows[label][output_path] = _dtype_flow(
+                                _module, _inputs, value
+                            )
                             if value.requires_grad:
                                 value.register_hook(
                                     lambda gradient,
                                     label=label,
-                                    path=path + branch: trace.gradients[label].__setitem__(
+                                    path=output_path: trace.gradients[label].__setitem__(
                                         path, gradient.detach().cpu()
                                     )
                                 )
@@ -2251,14 +2857,45 @@ class _ParityDiagnostics:
         )
         self.assertIn("pass_rate=100.0%", recorder.write())
 
+    def _check_recorder_reports_extended_metrics_and_explosions(self) -> None:
+        recorder = ParityRecorder(FP32)
+        first = recorder.tensor(
+            scope="trace",
+            component="attention_norm",
+            layer=0,
+            actual=torch.tensor([1.0, 1.000001]),
+            expected=torch.ones(2),
+            module_path="layers.0.attention_norm",
+            checkpoint=False,
+        )
+        second = recorder.tensor(
+            scope="trace",
+            component="attention",
+            layer=0,
+            actual=torch.tensor([1.0, 1.001]),
+            expected=torch.ones(2),
+            module_path="layers.0.attention",
+        )
+        recorder.ordered_results()
+        self.assertIsNotNone(first.mean_abs)
+        self.assertIsNotNone(second.mean_rel)
+        self.assertIsNotNone(second.relative_l2)
+        self.assertIsNotNone(second.cosine_similarity)
+        self.assertTrue(second.explosion)
+        self.assertIn("mean_abs", recorder.table())
+        self.assertIn("explosion-row", recorder.html_table())
+
 
 class _ParityRouterPrecision:
     def _check_router_gate_is_evaluated_in_float32(self) -> None:
-        titan_model = glm5_configs["debugmodel"]().build()
+        model_size = ParityModelSize()
+        titan_model = _titan_config(model_size).build()
         titan_model.init_states()
         titan_model.bfloat16()
         router = titan_model.layers["1"].moe.router
-        hidden_states = torch.randn(1, 16, 256, dtype=torch.bfloat16)
+        hidden_states = torch.randn(
+            1, 16, model_size.dim, dtype=torch.bfloat16
+        )
         _, _, scores = router(hidden_states, titan_model.layers["1"].moe.expert_bias_E)
         expected_scores = torch.sigmoid(
             F.linear(hidden_states.float(), router.gate.weight.float())
@@ -2309,12 +2946,12 @@ class _ParityComponentTests(ComponentParityMixin):
         recorder.precision_label = self._configured_report_label()
         recorder.title = (
             f"{title} [{recorder.precision_label}] "
-            f"(layers={self.LAYER_INDICES})"
+            f"(layers={self.LAYER_INDICES}, seed={self._active_data_seed})"
         )
         if self._active_suite_report is not None:
             self._active_suite_report.add(section_id, recorder)
             return recorder.table(color=False)
-        report = recorder.write(os.environ.get("GLM5_PARITY_REPORT"))
+        report = recorder.write(self._report_path(section_id))
         if recorder.failed:
             recorder.assert_all_passed()
         return report
@@ -2364,6 +3001,7 @@ class _ParityComponentTests(ComponentParityMixin):
 
 
 
+# 主测试类
 class TestGlm5Parity(
     unittest.TestCase,
     _ParityDiagnostics,
@@ -2385,13 +3023,17 @@ class TestGlm5Parity(
     ``GLM5_PARITY_COMPONENT_EXECUTION=independent|sequential``
     ``GLM5_PARITY_HF_ROUTED_EXPERT_COMPUTE=model|bf16|grouped_mm``
     ``GLM5_PARITY_TITAN_ROUTED_EXPERT_COMPUTE=model|fp32``
+    ``GLM5_PARITY_REPORT_DIR=.``
+    ``GLM5_PARITY_MODEL_DIM=256``
+    ``GLM5_PARITY_MODEL_LAYERS=4``
 
     The test methods do not construct a precision-specific class.  They use
     the models and batches prepared here.  Fixed runners preserve the original
     checks, while ``compare_component`` can trace any named module path.
     ``test_configured_precision_suite`` is the complete entry point.  It calls
     the independent component and end-to-end tests, then combines their tables
-    into the single HTML file selected by ``GLM5_PARITY_REPORT``.
+    into one automatically named HTML file.  ``GLM5_PARITY_REPORT`` remains an
+    optional explicit path override.
     """
 
     # Runtime test configuration.
@@ -2402,6 +3044,7 @@ class TestGlm5Parity(
     LAYER_INDICES = os.environ.get("GLM5_PARITY_LAYERS", "all")
     DATA_CASE = os.environ.get("GLM5_PARITY_DATA_CASE", "random")
     DATA_SEED = int(os.environ.get("GLM5_PARITY_DATA_SEED", "61"))
+    MODEL_SEED = 61
     BATCH_SIZE = int(os.environ.get("GLM5_PARITY_BATCH_SIZE", "2"))
     SEQUENCE_LENGTH = int(os.environ.get("GLM5_PARITY_SEQUENCE_LENGTH", "16"))
     COMPONENT_EXECUTION = os.environ.get(
@@ -2453,6 +3096,8 @@ class TestGlm5Parity(
         cls.device = torch.device("cuda")
         cls.actual_endpoint, cls.expected_endpoint = cls._configured_endpoints()
         cls.precision = cls.actual_endpoint.precision
+        cls.model_size = ParityModelSize.from_env()
+        cls.model_size.validate(sequence_length=cls.SEQUENCE_LENGTH)
         if cls.HF_ROUTED_EXPERT_COMPUTE not in {
             "model",
             "bf16",
@@ -2481,8 +3126,6 @@ class TestGlm5Parity(
         # Build the endpoint table once.  Test methods only select from this
         # table and never perform ad hoc dtype conversion.
         precisions = {
-            FP32.name,
-            BF16.name,
             cls.actual_endpoint.precision.name,
             cls.expected_endpoint.precision.name,
         }
@@ -2490,7 +3133,12 @@ class TestGlm5Parity(
         cls.pairs: dict[str, ParityModelPair] = {}
         for precision_name in sorted(precisions):
             precision = BF16 if precision_name == BF16.name else FP32
-            pair = _build_pair(cls.device, precision=precision, seed=61)
+            pair = _build_pair(
+                cls.device,
+                model_size=cls.model_size,
+                precision=precision,
+                seed=cls.MODEL_SEED,
+            )
             if cls.HF_ROUTED_EXPERT_COMPUTE != "model":
                 _set_hf_routed_expert_compute_dtype(
                     pair.hf,
@@ -2506,6 +3154,7 @@ class TestGlm5Parity(
                 _set_titan_routed_expert_compute_dtype(
                     pair.titan, torch.float32
                 )
+            _annotate_known_compute_dtypes(pair)
             cls.pairs[precision.name] = pair
             cls.models[("hf", precision.name)] = pair.hf
             cls.models[("titan", precision.name)] = pair.titan
@@ -2514,6 +3163,9 @@ class TestGlm5Parity(
         cls.pair = cls.pairs[cls.actual_endpoint.precision.name]
         cls.hf_model = cls.pair.hf
         cls.titan_model = cls.pair.titan
+        cls.num_model_parameters = sum(
+            parameter.numel() for parameter in cls.hf_model.parameters()
+        )
         cls.batch = ParityDataFactory.make(
             device=cls.device,
             dtype=cls.actual_endpoint.precision.dtype,
@@ -2544,8 +3196,42 @@ class TestGlm5Parity(
             make_tokens=True,
         )
         cls.adapter = Glm5StateDictAdapter(
-            glm5_configs["debugmodel"](), hf_assets_path=None
+            _titan_config(cls.model_size), hf_assets_path=None
         )
+        cls._active_data_seed = cls.DATA_SEED
+
+    @staticmethod
+    def _test_seed(base_seed: int, test_name: str) -> int:
+        offset = sum(
+            (index + 1) * ord(character)
+            for index, character in enumerate(test_name)
+        )
+        return base_seed + offset
+
+    def _activate_test_data(self, test_name: str) -> None:
+        """Create one deterministic batch owned by a single test method."""
+        seed = self._test_seed(self.DATA_SEED, test_name)
+        self._active_data_seed = seed
+        self.base_batch = ParityDataFactory.make(
+            device=self.device,
+            dtype=torch.float32,
+            batch_size=self.BATCH_SIZE,
+            sequence_length=self.SEQUENCE_LENGTH,
+            hidden_size=self.model_size.dim,
+            vocab_size=self.model_size.vocab_size,
+            seed=seed,
+            data_case=self.DATA_CASE,
+            make_tokens=True,
+        )
+        self.batch = ParityDataFactory.cast(
+            self.base_batch,
+            model=self.hf_model,
+            dtype=self.actual_endpoint.precision.dtype,
+        )
+        self.hidden_states = self.batch.hidden_states
+        self.positions = self.batch.positions
+        self.causal_mask = self.batch.causal_mask
+        self.hf_position_embeddings = self.batch.hf_position_embeddings
 
     def _model(self, endpoint: ModelEndpoint) -> torch.nn.Module:
         return self.models[(endpoint.implementation, endpoint.precision.name)]
@@ -2556,6 +3242,107 @@ class TestGlm5Parity(
             model=self._model(endpoint),
             dtype=endpoint.precision.dtype,
         )
+
+    def _report_path(self, _section_id: str = "suite") -> str:
+        explicit = os.environ.get("GLM5_PARITY_REPORT")
+        if explicit:
+            return explicit
+        timestamp = getattr(self, "_report_timestamp", None)
+        if timestamp is None:
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            self._report_timestamp = timestamp
+        raw_name = (
+            f"glm5_{self.actual_endpoint.label}_vs_"
+            f"{self.expected_endpoint.label}_{timestamp}.html"
+        )
+        filename = re.sub(r"[^A-Za-z0-9_.-]+", "-", raw_name)
+        report_directory = Path(
+            os.environ.get("GLM5_PARITY_REPORT_DIR", ".")
+        )
+        report_directory.mkdir(parents=True, exist_ok=True)
+        return str(report_directory / filename)
+
+    def _effective_routed_expert_compute(
+        self, endpoint: ModelEndpoint
+    ) -> str:
+        if endpoint.implementation == "titan":
+            return (
+                "fp32_eager"
+                if self.TITAN_ROUTED_EXPERT_COMPUTE == "fp32"
+                else "bf16_grouped_mm"
+            )
+        if self.HF_ROUTED_EXPERT_COMPUTE == "grouped_mm":
+            return "bf16_grouped_mm"
+        if self.HF_ROUTED_EXPERT_COMPUTE == "bf16":
+            return "bf16_eager"
+        return endpoint.precision.name
+
+    def _report_configuration(
+        self,
+        spec: ComparisonSpec,
+        *,
+        report_path: str,
+        peak_bytes: int,
+        total_bytes: int,
+    ) -> list[tuple[str, str, str]]:
+        """Return every effective suite setting for the HTML report."""
+        values: list[tuple[str, str, str]] = [
+            ("comparison", "model", "glm5"),
+            ("comparison", "actual_endpoint", spec.actual.label),
+            ("comparison", "expected_endpoint", spec.expected.label),
+            ("comparison", "rtol", f"{spec.rtol:.8g}"),
+            ("comparison", "atol", f"{spec.atol:.8g}"),
+            ("selection", "layers", self.LAYER_INDICES),
+            ("selection", "components", self.RUN_COMPONENTS),
+            ("data", "case", self.DATA_CASE),
+            ("data", "base_seed", str(self.DATA_SEED)),
+            ("data", "per_test_batches", "independent_deterministic"),
+            ("data", "batch_size", str(self.BATCH_SIZE)),
+            ("data", "sequence_length", str(self.SEQUENCE_LENGTH)),
+            ("execution", "component_execution", self.COMPONENT_EXECUTION),
+            ("execution", "model_seed", str(self.MODEL_SEED)),
+            (
+                "execution",
+                "actual_routed_expert_compute",
+                self._effective_routed_expert_compute(spec.actual),
+            ),
+            (
+                "execution",
+                "expected_routed_expert_compute",
+                self._effective_routed_expert_compute(spec.expected),
+            ),
+            (
+                "execution",
+                "hf_routed_expert_override",
+                self.HF_ROUTED_EXPERT_COMPUTE,
+            ),
+            (
+                "execution",
+                "titan_routed_expert_override",
+                self.TITAN_ROUTED_EXPERT_COMPUTE,
+            ),
+            (
+                "report",
+                "explosion_ratio",
+                os.environ.get("GLM5_PARITY_EXPLOSION_RATIO", "8.0"),
+            ),
+            ("report", "path", report_path),
+            ("hardware", "device", str(self.device)),
+            ("hardware", "cuda_device", torch.cuda.get_device_name(self.device)),
+            ("hardware", "model_parameters", f"{self.num_model_parameters:,}"),
+            ("hardware", "peak_cuda_gib", f"{peak_bytes / 2**30:.4f}"),
+            ("hardware", "total_cuda_gib", f"{total_bytes / 2**30:.4f}"),
+            (
+                "hardware",
+                "peak_cuda_percent",
+                f"{100.0 * peak_bytes / total_bytes:.2f}",
+            ),
+        ]
+        values.extend(
+            ("model_size", name, str(value))
+            for name, value in asdict(self.model_size).items()
+        )
+        return values
 
     def _configured_spec(self) -> ComparisonSpec:
         actual, expected = self.actual_endpoint, self.expected_endpoint
@@ -2572,18 +3359,7 @@ class TestGlm5Parity(
 
     def _configured_report_label(self) -> str:
         def endpoint_label(endpoint: ModelEndpoint) -> str:
-            if endpoint.implementation == "titan":
-                expert_compute = (
-                    "fp32_eager"
-                    if self.TITAN_ROUTED_EXPERT_COMPUTE == "fp32"
-                    else "bf16_grouped_mm"
-                )
-            else:
-                expert_compute = self.HF_ROUTED_EXPERT_COMPUTE
-            if expert_compute == "model":
-                expert_compute = endpoint.precision.name
-            elif expert_compute == "grouped_mm":
-                expert_compute = "bf16_grouped_mm"
+            expert_compute = self._effective_routed_expert_compute(endpoint)
             label = endpoint.label
             if expert_compute != endpoint.precision.name:
                 label += f"(routed_experts={expert_compute})"
@@ -2709,16 +3485,22 @@ class TestGlm5Parity(
             and normalized_filter not in TOP_LEVEL_COMPONENTS
             and "." not in normalized_filter
         )
-        logical: dict[str, dict[str, tuple[str, torch.Tensor]]] = {}
+        logical: dict[str, dict[str, tuple[str, torch.Tensor, str]]] = {}
         for endpoint in (spec.actual, spec.expected):
             label = endpoint.label
             for endpoint_path, value in trace.activations[label].items():
                 logical_path = self._logical_activation_path(endpoint, endpoint_path)
-                logical.setdefault(logical_path, {})[label] = (endpoint_path, value)
+                logical.setdefault(logical_path, {})[label] = (
+                    endpoint_path,
+                    value,
+                    trace.dtype_flows[label].get(endpoint_path, ""),
+                )
 
         # HF composition modules may return tuples while TorchTitan returns a
         # tensor.  Compare the first tensor leaf under the common module path.
-        normalized_logical: dict[str, dict[str, tuple[str, torch.Tensor]]] = {}
+        normalized_logical: dict[
+            str, dict[str, tuple[str, torch.Tensor, str]]
+        ] = {}
         for logical_path, values in logical.items():
             base_path = logical_path.split("[", 1)[0]
             target_path = (
@@ -2834,6 +3616,8 @@ class TestGlm5Parity(
                     level=level,
                     node_kind="discrete_checkpoint",
                     checkpoint=checkpoint,
+                    actual_dtype=actual_value[2],
+                    expected_dtype=expected_value[2],
                 )
                 continue
             if actual_tensor.dtype in {
@@ -2859,6 +3643,8 @@ class TestGlm5Parity(
                     level=level,
                     node_kind="discrete_checkpoint",
                     checkpoint=checkpoint,
+                    actual_dtype=actual_value[2],
+                    expected_dtype=expected_value[2],
                 )
                 continue
             recorder.tensor(
@@ -2874,6 +3660,8 @@ class TestGlm5Parity(
                 level=level,
                 node_kind=node_kind,
                 checkpoint=checkpoint,
+                actual_dtype=actual_value[2],
+                expected_dtype=expected_value[2],
             )
 
     def _record_recursive_gradient_trace(
@@ -3654,6 +4442,9 @@ class TestGlm5Parity(
     def test_recorder_writes_plain_text_report(self) -> None:
         self._check_recorder_writes_plain_text_report()
 
+    def test_recorder_reports_extended_metrics_and_explosions(self) -> None:
+        self._check_recorder_reports_extended_metrics_and_explosions()
+
     def test_router_gate_is_evaluated_in_float32(self) -> None:
         self._check_router_gate_is_evaluated_in_float32()
 
@@ -3663,6 +4454,7 @@ class TestGlm5Parity(
     def test_indexer_topk_matches_transformers_exactly(self) -> None:
         if not self.gpu_ready:
             self.skipTest(self.gpu_skip_reason)
+        self._activate_test_data("indexer")
         self._publish_recorder(
             self._check_indexer_topk_matches_transformers(),
             "component-indexer",
@@ -3672,6 +4464,7 @@ class TestGlm5Parity(
     def test_router_selection_and_weights_match_transformers_exactly(self) -> None:
         if not self.gpu_ready:
             self.skipTest(self.gpu_skip_reason)
+        self._activate_test_data("router")
         self._publish_recorder(
             self._check_router_selection_and_weights(),
             "component-router",
@@ -3681,6 +4474,7 @@ class TestGlm5Parity(
     def test_attention_output_matches_transformers(self) -> None:
         if not self.gpu_ready:
             self.skipTest(self.gpu_skip_reason)
+        self._activate_test_data("attention")
         self._publish_recorder(
             self._check_attention_output(),
             "component-attention",
@@ -3690,6 +4484,7 @@ class TestGlm5Parity(
     def test_dense_block_output_matches_transformers(self) -> None:
         if not self.gpu_ready:
             self.skipTest(self.gpu_skip_reason)
+        self._activate_test_data("block")
         self._publish_recorder(
             self._check_dense_block_output(),
             "component-block",
@@ -3719,6 +4514,7 @@ class TestGlm5Parity(
             if item.strip()
         }
         for component in sorted(selected - fixed_components):
+            self._activate_test_data(f"component:{component}")
             safe_component = re.sub(r"[^A-Za-z0-9_.-]+", "-", component)
             self._publish_recorder(
                 self._configured_component_recorder(component),
@@ -3729,6 +4525,7 @@ class TestGlm5Parity(
     def test_end_to_end_output_loss_and_gradients(self) -> None:
         if not self.gpu_ready:
             self.skipTest(self.gpu_skip_reason)
+        self._activate_test_data("end-to-end")
         self._publish_recorder(
             self.compare_end_to_end(self._configured_spec()),
             "end-to-end",
@@ -3744,7 +4541,9 @@ class TestGlm5Parity(
         suite_report = ParitySuiteReport(
             f"GLM-5 parity: {self._configured_report_label()}; "
             f"data={self.DATA_CASE}; "
-            f"layers={self.LAYER_INDICES}"
+            f"layers={self.LAYER_INDICES}; "
+            f"model={self.model_size.label}; "
+            f"params={self.num_model_parameters:,}"
         )
         self._active_suite_report = suite_report
         try:
@@ -3761,8 +4560,21 @@ class TestGlm5Parity(
         finally:
             self._active_suite_report = None
 
-        report_path = os.environ.get("GLM5_PARITY_REPORT")
-        if report_path:
-            suite_report.write(report_path)
+        peak_bytes = torch.cuda.max_memory_allocated(self.device)
+        total_bytes = torch.cuda.get_device_properties(self.device).total_memory
+        suite_report.title += (
+            f"; peak_cuda={peak_bytes / 2**30:.2f}GiB"
+            f"/{total_bytes / 2**30:.2f}GiB"
+            f" ({100.0 * peak_bytes / total_bytes:.1f}%)"
+        )
+        report_path = self._report_path("suite")
+        suite_report.configuration = self._report_configuration(
+            spec,
+            report_path=report_path,
+            peak_bytes=peak_bytes,
+            total_bytes=total_bytes,
+        )
+        suite_report.write(report_path)
+        print(f"GLM-5 parity report: {report_path}")
         if suite_report.failed:
             raise AssertionError(suite_report.failure_message())
