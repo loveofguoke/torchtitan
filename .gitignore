@@ -54,6 +54,6 @@ CLAUDE_CONTEXT/
 .lycheecache
 
 # html result
-.html
+*.html
 /parity_artifacts/
 /parity_reports/*.html
