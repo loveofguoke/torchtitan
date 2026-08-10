@@ -554,7 +554,13 @@ def set_pg_timeouts(
         for mesh in parallel_dims.get_all_one_dimensional_meshes().values()
     ] + [None]
     for group in groups:
-        torch.distributed.set_timeout(timeout, group)
+        if group is None:
+            # Default PG: torch.distributed.set_timeout was removed in torch 2.12.
+            from torch.distributed.distributed_c10d import _set_pg_timeout
+
+            _set_pg_timeout(timeout)
+        else:
+            group.set_timeout(timeout)
 
 
 @torch.no_grad()
