@@ -17,7 +17,7 @@ from . import model_registry
 
 
 def glm5_debugmodel() -> Trainer.Config:
-    """Short, local-assets configuration for the single-device GLM-5 model."""
+    """Short, local-assets configuration for the GLM-5 model."""
     model_spec = model_registry("debugmodel")
     return Trainer.Config(
         loss=ChunkedLossWrapper.Config(
@@ -34,6 +34,10 @@ def glm5_debugmodel() -> Trainer.Config:
             local_batch_size=2,
             seq_len=128,
             steps=10,
+            # Data parallel (DDP/FSDP) wraps the model via apply_fsdp_to_decoder;
+            # fp32 preserves the DSA indexer's pinned fp32 semantics. A user can
+            # opt into bf16 explicitly as a documented precision change.
+            mixed_precision_param="float32",
         ),
         parallelism=ParallelismConfig(),
         checkpoint=CheckpointManager.Config(interval=10),

@@ -12,12 +12,16 @@ def validate_glm5_parallelism(
     parallelism: ParallelismConfig,
     parallel_dims: ParallelDims | None = None,
 ) -> None:
-    """Reject every runtime layout that needs more than one rank.
+    """Reject every runtime layout that is not pure data parallelism.
 
-    GLM-5's debug eager DSA path is intentionally single-device only.  A
-    ``data_parallel_shard_degree`` of ``-1`` is unresolved until the trainer
-    constructs ``ParallelDims``; it is therefore accepted only while
-    ``parallel_dims`` is absent.
+    GLM-5's debug eager DSA path supports data parallelism (DDP/HSDP via
+    ``data_parallel_replicate_degree``, and FSDP via
+    ``data_parallel_shard_degree``) but rejects tensor/context/pipeline/expert
+    parallelism and any non-default SPMD backend.  ``parallel_dims`` is kept
+    for signature parity with the runtime call site: once resolved,
+    ``ParallelDims._validate`` has already enforced
+    ``dp_replicate * dp_shard * cp * tp * pp == world_size``, so a resolved
+    multi-rank world is by construction a legal data-parallel layout.
     """
     unsupported: list[str] = []
     degree_names = (
@@ -25,23 +29,15 @@ def validate_glm5_parallelism(
         ("CP", parallelism.context_parallel_degree),
         ("PP", parallelism.pipeline_parallel_degree),
         ("EP", parallelism.expert_parallel_degree),
-        ("DP replicate", parallelism.data_parallel_replicate_degree),
-        ("DP shard", parallelism.data_parallel_shard_degree),
     )
     unsupported.extend(name for name, degree in degree_names if degree > 1)
 
     if parallelism.spmd_backend != "default":
         unsupported.append(f"SPMD backend ({parallelism.spmd_backend})")
 
-    if parallel_dims is not None:
-        if parallel_dims.dp_shard > 1 and "DP shard" not in unsupported:
-            unsupported.append("DP shard")
-        if parallel_dims.world_size != 1:
-            unsupported.append(f"world_size ({parallel_dims.world_size})")
-
     if unsupported:
         modes = ", ".join(unsupported)
         raise NotImplementedError(
-            "GLM-5 debugmodel supports only a single-device runtime; "
+            "GLM-5 debugmodel supports only data-parallel layouts; "
             f"unsupported parallelism: {modes}."
         )
