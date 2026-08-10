@@ -9,6 +9,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from tests.glm5_2_parity.workflow import (  # noqa: E402
+    OfflineEndpointConfig,
     OfflineParityConfig,
     ParityModelConfig,
     run_offline_cli,
@@ -16,10 +17,22 @@ from tests.glm5_2_parity.workflow import (  # noqa: E402
 
 
 CONFIG = OfflineParityConfig(
-    gpu_endpoint="titan:fp32",
-    npu_endpoint="titan:fp32",
-    gpu_device="7",
-    npu_device="4",
+    actual=OfflineEndpointConfig(
+        name="npu",
+        endpoint="titan:fp32",
+        device_type="npu",
+        visible_device="4",
+        visible_devices_env="ASCEND_RT_VISIBLE_DEVICES",
+        artifact_name="npu_capture",
+    ),
+    expected=OfflineEndpointConfig(
+        name="gpu",
+        endpoint="titan:fp32",
+        device_type="cuda",
+        visible_device="7",
+        visible_devices_env="CUDA_VISIBLE_DEVICES",
+        artifact_name="gpu_capture",
+    ),
     data_case="random",
     data_seed=61,
     model_seed=61,
@@ -45,8 +58,6 @@ CONFIG = OfflineParityConfig(
     report_root="parity_reports",
     log_root="parity_reports/logs",
     fixture_name="fixture",
-    gpu_artifact_name="gpu_capture",
-    npu_artifact_name="npu_capture",
     report_name="gpu_vs_npu.html",
 )
 

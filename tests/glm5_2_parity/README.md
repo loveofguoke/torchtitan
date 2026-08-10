@@ -47,6 +47,14 @@ and resolved paths without executing a test:
 python tests/glm5_2_parity/titan_gpu_npu_fp32_random.py --print-config
 ```
 
+The offline engine calls the two sides `actual` and `expected`; it does not
+assume a GPU/NPU pair. Each `OfflineEndpointConfig` independently specifies the
+model endpoint, device type, visibility environment variable, device index, and
+artifact name. The portable stage names are `--actual-capture` and
+`--expected-capture`. Scenario-specific aliases are generated from endpoint
+names, such as `--npu-capture`, `--gpu-capture`, `--titan-gpu-capture`, or
+`--hf-gpu-capture`.
+
 Generate the fixture once on CPU. This stores the exact FP32 TorchTitan state,
 every case tensor, test ordinal, seed, test plan, and effective configuration:
 
@@ -72,6 +80,21 @@ python tests/glm5_2_parity/titan_gpu_npu_fp32_random.py --compare
 Copy and rename the scenario file for BF16 or another data case, then edit only
 its `CONFIG` block. BF16 uses the same exact FP32 fixture state and performs the
 BF16 cast on CPU before moving tensors to GPU or NPU.
+
+## Offline Titan/HF validation on GPU
+
+Use the supplied dual-GPU-endpoint scenario to validate that offline capture
+reproduces the existing paired Titan/HF comparison. The two captures are
+sequential and may use the same physical GPU:
+
+```bash
+python tests/glm5_2_parity/titan_hf_gpu_fp32_random.py --data
+python tests/glm5_2_parity/titan_hf_gpu_fp32_random.py --actual-capture
+python tests/glm5_2_parity/titan_hf_gpu_fp32_random.py --expected-capture
+python tests/glm5_2_parity/titan_hf_gpu_fp32_random.py --compare
+```
+
+The named aliases `--titan-gpu-capture` and `--hf-gpu-capture` are equivalent.
 
 Comparison rejects different test plans, fixture tensors, effective
 configuration, Git commits, incomplete artifacts, and corrupt shards. Dirty

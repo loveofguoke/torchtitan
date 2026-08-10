@@ -75,17 +75,23 @@ class CommonParityConfig:
 
 
 @dataclass(frozen=True)
+class OfflineEndpointConfig:
+    name: str
+    endpoint: str
+    device_type: str
+    visible_device: str
+    visible_devices_env: str
+    artifact_name: str
+
+
+@dataclass(frozen=True, kw_only=True)
 class OfflineParityConfig(CommonParityConfig):
-    gpu_endpoint: str = "titan:fp32"
-    npu_endpoint: str = "titan:fp32"
-    gpu_device: str = "7"
-    npu_device: str = "4"
+    actual: OfflineEndpointConfig
+    expected: OfflineEndpointConfig
     fixture_root: str = "parity_fixtures"
     artifact_root: str = "parity_artifacts"
     fixture_name: str = "fixture"
-    gpu_artifact_name: str = "gpu_capture"
-    npu_artifact_name: str = "npu_capture"
-    report_name: str = "gpu_vs_npu.html"
+    report_name: str = "actual_vs_expected.html"
 
 
 @dataclass(frozen=True)
@@ -216,6 +222,43 @@ def _print_configuration(
     print(json.dumps(payload, indent=2, sort_keys=True))
 
 
+def _capture_options(
+    role: str,
+    endpoint: OfflineEndpointConfig,
+) -> list[str]:
+    name = endpoint.name.replace("_", "-").lower()
+    invalid = any(
+        not (character.isalnum() or character == "-")
+        for character in name
+    )
+    if not name or invalid:
+        raise ValueError(f"invalid offline endpoint name: {endpoint.name!r}")
+    options = [f"--{role}-capture"]
+    named_option = f"--{name}-capture"
+    if named_option not in options:
+        options.append(named_option)
+    return options
+
+
+def _configure_capture_environment(
+    environment: dict[str, str],
+    endpoint: OfflineEndpointConfig,
+    artifact: Path,
+) -> None:
+    environment["CUDA_VISIBLE_DEVICES"] = ""
+    environment["ASCEND_RT_VISIBLE_DEVICES"] = ""
+    if endpoint.visible_devices_env:
+        environment[endpoint.visible_devices_env] = endpoint.visible_device
+    environment.update(
+        {
+            "GLM5_PARITY_DEVICE": endpoint.device_type,
+            "GLM5_PARITY_MODE": "capture",
+            "GLM5_PARITY_ENDPOINT": endpoint.endpoint,
+            "GLM5_PARITY_ARTIFACT": str(artifact),
+        }
+    )
+
+
 def run_offline_cli(
     config: OfflineParityConfig,
     script_path: str | os.PathLike[str],
@@ -223,19 +266,29 @@ def run_offline_cli(
     parser = argparse.ArgumentParser(
         description="Run one configured GLM-5.2 offline parity stage."
     )
+    actual_options = _capture_options("actual", config.actual)
+    expected_options = _capture_options("expected", config.expected)
+    duplicate_options = set(actual_options).intersection(expected_options)
+    if duplicate_options:
+        raise ValueError(
+            "offline endpoint names must produce distinct capture flags: "
+            + ", ".join(sorted(duplicate_options))
+        )
     stages = parser.add_mutually_exclusive_group(required=True)
     stages.add_argument("--data", action="store_const", dest="stage", const="data")
     stages.add_argument(
-        "--gpu-capture",
+        *actual_options,
         action="store_const",
         dest="stage",
-        const="gpu_capture",
+        const="actual_capture",
+        help=f"capture actual endpoint {config.actual.endpoint}",
     )
     stages.add_argument(
-        "--npu-capture",
+        *expected_options,
         action="store_const",
         dest="stage",
-        const="npu_capture",
+        const="expected_capture",
+        help=f"capture expected endpoint {config.expected.endpoint}",
     )
     stages.add_argument(
         "--compare", action="store_const", dest="stage", const="compare"
@@ -256,17 +309,17 @@ def run_offline_cli(
         scenario_id,
         config.fixture_name,
     )
-    gpu_artifact = _path(
+    actual_artifact = _path(
         root,
         config.artifact_root,
         scenario_id,
-        config.gpu_artifact_name,
+        config.actual.artifact_name,
     )
-    npu_artifact = _path(
+    expected_artifact = _path(
         root,
         config.artifact_root,
         scenario_id,
-        config.npu_artifact_name,
+        config.expected.artifact_name,
     )
     report = _path(
         root,
@@ -282,8 +335,8 @@ def run_offline_cli(
     )
     paths = {
         "fixture": fixture,
-        "gpu_artifact": gpu_artifact,
-        "npu_artifact": npu_artifact,
+        "actual_artifact": actual_artifact,
+        "expected_artifact": expected_artifact,
         "report": report,
         "log": log,
     }
@@ -296,36 +349,26 @@ def run_offline_cli(
     environment["GLM5_PARITY_RUN_ID"] = f"{scenario_id}-{arguments.stage}"
     if arguments.stage == "data":
         environment["GLM5_PARITY_MODE"] = "prepare"
-    elif arguments.stage == "gpu_capture":
+    elif arguments.stage == "actual_capture":
         if not fixture.is_dir():
             raise FileNotFoundError(f"fixture not found: {fixture}")
-        environment.update(
-            {
-                "CUDA_VISIBLE_DEVICES": config.gpu_device,
-                "ASCEND_RT_VISIBLE_DEVICES": "",
-                "GLM5_PARITY_DEVICE": "cuda",
-                "GLM5_PARITY_MODE": "capture",
-                "GLM5_PARITY_ENDPOINT": config.gpu_endpoint,
-                "GLM5_PARITY_ARTIFACT": str(gpu_artifact),
-            }
+        _configure_capture_environment(
+            environment,
+            config.actual,
+            actual_artifact,
         )
-    elif arguments.stage == "npu_capture":
+    elif arguments.stage == "expected_capture":
         if not fixture.is_dir():
             raise FileNotFoundError(f"fixture not found: {fixture}")
-        environment.update(
-            {
-                "ASCEND_RT_VISIBLE_DEVICES": config.npu_device,
-                "CUDA_VISIBLE_DEVICES": "",
-                "GLM5_PARITY_DEVICE": "npu",
-                "GLM5_PARITY_MODE": "capture",
-                "GLM5_PARITY_ENDPOINT": config.npu_endpoint,
-                "GLM5_PARITY_ARTIFACT": str(npu_artifact),
-            }
+        _configure_capture_environment(
+            environment,
+            config.expected,
+            expected_artifact,
         )
     else:
         missing = [
             str(path)
-            for path in (gpu_artifact, npu_artifact)
+            for path in (actual_artifact, expected_artifact)
             if not path.is_dir()
         ]
         if missing:
@@ -336,8 +379,8 @@ def run_offline_cli(
         environment.update(
             {
                 "GLM5_PARITY_MODE": "compare",
-                "GLM5_PARITY_ACTUAL_ARTIFACT": str(npu_artifact),
-                "GLM5_PARITY_EXPECTED_ARTIFACT": str(gpu_artifact),
+                "GLM5_PARITY_ACTUAL_ARTIFACT": str(actual_artifact),
+                "GLM5_PARITY_EXPECTED_ARTIFACT": str(expected_artifact),
                 "GLM5_PARITY_REPORT": str(report),
             }
         )

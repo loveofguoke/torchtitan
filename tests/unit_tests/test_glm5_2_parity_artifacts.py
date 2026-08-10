@@ -16,7 +16,12 @@ from tests.glm5_2_parity.artifacts import (
     ParityArtifactReader,
     ParityArtifactWriter,
 )
-from tests.glm5_2_parity.workflow import ParityModelConfig
+from tests.glm5_2_parity.workflow import (
+    _capture_options,
+    _configure_capture_environment,
+    OfflineEndpointConfig,
+    ParityModelConfig,
+)
 
 
 def _writer(
@@ -240,3 +245,31 @@ def test_glm5_2_workflow_model_configuration_maps_to_environment() -> None:
     environment = ParityModelConfig(layers=7, dim=1024).environment()
     assert environment["GLM5_PARITY_MODEL_LAYERS"] == "7"
     assert environment["GLM5_PARITY_MODEL_DIM"] == "1024"
+
+
+def test_glm5_2_offline_endpoint_configuration_is_device_independent(
+    tmp_path: Path,
+) -> None:
+    endpoint = OfflineEndpointConfig(
+        name="hf-gpu",
+        endpoint="hf:fp32",
+        device_type="cuda",
+        visible_device="3",
+        visible_devices_env="CUDA_VISIBLE_DEVICES",
+        artifact_name="hf_capture",
+    )
+    assert _capture_options("expected", endpoint) == [
+        "--expected-capture",
+        "--hf-gpu-capture",
+    ]
+    environment = {
+        "CUDA_VISIBLE_DEVICES": "old",
+        "ASCEND_RT_VISIBLE_DEVICES": "old",
+    }
+    artifact = tmp_path / "hf_capture"
+    _configure_capture_environment(environment, endpoint, artifact)
+    assert environment["CUDA_VISIBLE_DEVICES"] == "3"
+    assert environment["ASCEND_RT_VISIBLE_DEVICES"] == ""
+    assert environment["GLM5_PARITY_DEVICE"] == "cuda"
+    assert environment["GLM5_PARITY_ENDPOINT"] == "hf:fp32"
+    assert environment["GLM5_PARITY_ARTIFACT"] == str(artifact)
