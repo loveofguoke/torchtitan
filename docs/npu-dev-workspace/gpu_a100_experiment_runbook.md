@@ -42,7 +42,7 @@ A100 中单卡完成模型精度和训练验收；8 卡完成 DDP 与 FSDP 训�
 
 - `nvidia-smi` 不可用、GPU 数量不是 8，或者型号不是 A100；
 - 驱动主版本低于 580；
-- 团队远程仓库没有 `feat/glm5-model`；
+- 团队远程仓库没有 `feat/glm5-model-distributed`；
 - 当前提交不包含上表所列最低模型提交；
 - `pip check` 失败；
 - PyTorch 看不到 8 张 GPU，或者 A100 BF16 不可用；
@@ -62,7 +62,7 @@ CUDA 库，本手册的测试不要求额外安装完整 CUDA Toolkit 或 `nvcc`
 ```bash
 git -C /path/to/pytorch-torchtitan-glm5 status --short --branch
 git -C /path/to/pytorch-torchtitan-glm5 log --oneline origin/main..HEAD
-git -C /path/to/pytorch-torchtitan-glm5 push -u team feat/glm5-model
+git -C /path/to/pytorch-torchtitan-glm5 push -u team feat/glm5-model-distributed
 ```
 
 如果团队分支没有推送，GPU 机器执行者应停止并联系维护者，不要从聊天附件复制零散
@@ -111,9 +111,9 @@ nvidia-smi topo -m
 git clone https://github.com/loveofguoke/torchtitan.git torchtitan-glm5
 cd torchtitan-glm5
 git remote add upstream https://github.com/pytorch/torchtitan.git
-git ls-remote --exit-code --heads origin feat/glm5-model
-git fetch origin feat/glm5-model
-git switch --track -c feat/glm5-model origin/feat/glm5-model
+git ls-remote --exit-code --heads origin feat/glm5-model-distributed
+git fetch origin feat/glm5-model-distributed
+git switch --track -c feat/glm5-model-distributed origin/feat/glm5-model-distributed
 git merge-base --is-ancestor \
   4bc6832c1f01761811e6e5695a24297f992953b4 HEAD
 git status --short --branch
@@ -123,7 +123,7 @@ git rev-parse HEAD
 验收要求：
 
 - `git ls-remote` 和 `git merge-base --is-ancestor` 返回 0；
-- 当前分支是 `feat/glm5-model`；
+- 当前分支是 `feat/glm5-model-distributed`；
 - `git status --short` 没有源码改动；
 - 记录完整 HEAD。实验期间不得切换分支或拉取新提交。
 
@@ -176,7 +176,7 @@ python -m pip check
 ```
 
 不要直接 `pip install torchtitan` 替代 editable source install，否则运行的可能是 PyPI
-版本而不是 `feat/glm5-model` 源码。
+版本而不是 `feat/glm5-model-distributed` 源码。
 
 Nightly 会随时间变化。首次 GPU 验收通过后，应把 `torch.__version__`、wheel CUDA
 版本和 `pip freeze` 归档；后续复现实验优先使用该已验证版本组合。
@@ -406,7 +406,7 @@ profile 和 checkpoint 不应直接提交到 Git。
 
 ### 14.1 团队远程没有开发分支
 
-现象：`git ls-remote --exit-code --heads origin feat/glm5-model` 非零退出。
+现象：`git ls-remote --exit-code --heads origin feat/glm5-model-distributed` 非零退出。
 
 处理：停止，联系维护者推送分支。不要改用 upstream main。
 
