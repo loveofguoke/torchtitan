@@ -51,7 +51,7 @@ from torchtitan.models.glm5 import (
     glm5_configs,
 )
 from torchtitan.ops.scatter_add import deterministic_scatter_add
-from tests.parity.artifacts import (
+from tests.glm5_2_parity.artifacts import (
     EndpointIdentity,
     json_digest,
     ObservationMetadata,
@@ -85,7 +85,7 @@ class PrecisionPolicy:
 FP32 = PrecisionPolicy("fp32", torch.float32, 1e-4, 1e-5)
 BF16 = PrecisionPolicy("bf16", torch.bfloat16, 5e-2, 5e-2)
 TOP_LEVEL_COMPONENTS = {"tok_embeddings", "norm", "lm_head"}
-GLM5_PARITY_SUITE_VERSION = 1
+GLM5_PARITY_SUITE_VERSION = 2
 
 
 @dataclass
@@ -409,7 +409,7 @@ class ParityModelSize:
     # published GLM-5.2 config, while width and expert count are reduced.
     vocab_size: int = 154880
     dim: int = 2048 # 6144
-    num_layers: int = 12 # 78
+    num_layers: int = 11 # 78
     num_dense_layers: int = 1 # 3
     num_attention_heads: int = 32 # 64
     q_lora_rank: int = 768 # 2044
@@ -556,6 +556,47 @@ class ParityModelSize:
             f"l{self.num_layers}-d{self.dim}-e{self.num_experts}"
             f"-f{self.moe_hidden_dim}"
         )
+
+    @property
+    def estimated_num_parameters(self) -> int:
+        attention = (
+            self.dim * self.q_lora_rank
+            + self.q_lora_rank
+            + self.q_lora_rank
+            * self.num_attention_heads
+            * (self.qk_nope_head_dim + self.qk_rope_head_dim)
+            + self.dim * (self.kv_lora_rank + self.qk_rope_head_dim)
+            + self.kv_lora_rank
+            + self.kv_lora_rank
+            * self.num_attention_heads
+            * (self.qk_nope_head_dim + self.v_head_dim)
+            + self.num_attention_heads * self.v_head_dim * self.dim
+            + self.q_lora_rank * self.index_num_heads * self.index_head_dim
+            + self.dim * self.index_head_dim
+            + 2 * self.index_head_dim
+            + self.dim * self.index_num_heads
+            + 2 * self.dim
+        )
+        dense_ffn = 3 * self.dim * self.dense_hidden_dim
+        moe_ffn = (
+            self.dim * self.num_experts
+            + 3 * self.num_experts * self.dim * self.moe_hidden_dim
+            + 3
+            * self.dim
+            * self.moe_hidden_dim
+            * self.num_shared_experts
+        )
+        model_io = 2 * self.vocab_size * self.dim + self.dim
+        return (
+            model_io
+            + self.num_layers * attention
+            + self.num_dense_layers * dense_ffn
+            + (self.num_layers - self.num_dense_layers) * moe_ffn
+        )
+
+    @property
+    def estimated_fp32_size_gb(self) -> float:
+        return self.estimated_num_parameters * 4 / 1_000_000_000
 
 
 def _hf_config(model_size: ParityModelSize) -> Any:
@@ -1882,14 +1923,22 @@ class ParitySuiteReport:
     def write(self, path: str) -> None:
         if not path.lower().endswith(".html"):
             raise ValueError("GLM5_PARITY_REPORT must end with .html")
+        anchored_sections = []
+        for index, section in enumerate(self.sections):
+            safe_id = re.sub(
+                r"[^A-Za-z0-9_.-]+", "-", section.section_id
+            ).strip("-")
+            anchored_sections.append(
+                (f"section-{index}-{safe_id or 'result'}", section)
+            )
         links = "".join(
-            f"<li><a href='#{escape(section.section_id)}'>"
+            f"<li><a href='#{escape(anchor)}'>"
             f"{escape(section.recorder.title)}</a></li>"
-            for section in self.sections
+            for anchor, section in anchored_sections
         )
         sections = "".join(
-            section.recorder.html_section(section.section_id)
-            for section in self.sections
+            section.recorder.html_section(anchor)
+            for anchor, section in anchored_sections
         )
         configuration_rows = "".join(
             "<tr>"
@@ -1910,11 +1959,11 @@ class ParitySuiteReport:
             "<!doctype html><html><head><meta charset='utf-8'>"
             "<style>"
             "body{font-family:ui-monospace,Consolas,monospace;margin:24px}"
-            "nav{position:sticky;top:0;background:#fff;padding:8px 0;border-bottom:1px solid #bbb}"
-            "nav ul{display:flex;gap:18px;flex-wrap:wrap;list-style:none;padding:0}"
-            "section{margin:36px 0}table{border-collapse:collapse;width:100%}"
+            ".report-toc{padding:8px 16px;border:1px solid #bbb;background:#f8f8f8}"
+            ".report-toc h2{margin:4px 0 8px}.report-toc ul{display:flex;gap:18px;flex-wrap:wrap;list-style:none;padding:0}"
+            "section{margin:36px 0;scroll-margin-top:16px}table{border-collapse:collapse;width:100%}"
             "th,td{border:1px solid #bbb;padding:4px 8px;text-align:left}"
-            "th{position:sticky;top:72px;background:#f5f5f5}"
+            "th{background:#f5f5f5}"
             "details{margin:20px 0}summary{font-weight:bold;cursor:pointer}"
             ".configuration{width:auto;min-width:720px;margin-top:10px}"
             ".configuration th{position:static}"
@@ -1927,7 +1976,8 @@ class ParitySuiteReport:
             ".error-chart{overflow-x:auto}.error-chart svg{width:100%;min-width:700px;max-width:920px}"
             "</style></head><body>"
             f"<h1>{escape(self.title)}</h1>"
-            f"{configuration}<nav><ul>{links}</ul></nav>"
+            "<nav id='report-contents' class='report-toc' aria-label='Report contents'>"
+            f"<h2>Contents</h2><ul>{links}</ul></nav>{configuration}"
             f"{sections}</body></html>\n"
         )
         with open(path, "w", encoding="utf-8") as file:
@@ -3230,14 +3280,13 @@ class TestGlm5Parity(
     ``GLM5_PARITY_TITAN_ROUTED_EXPERT_COMPUTE=model|fp32``
     ``GLM5_PARITY_REPORT_DIR=.``
     ``GLM5_PARITY_MODEL_DIM=2048``
-    ``GLM5_PARITY_MODEL_LAYERS=12``
+    ``GLM5_PARITY_MODEL_LAYERS=11``
 
     Decoupled execution additionally supports:
 
     ``GLM5_PARITY_MODE=capture|compare|paired``
     ``GLM5_PARITY_ENDPOINT=titan:fp32``
     ``GLM5_PARITY_ARTIFACT=parity_artifacts/titan-gpu-fp32``
-    ``GLM5_PARITY_REFERENCE_ARTIFACT=parity_artifacts/hf-gpu-fp32``
     ``GLM5_PARITY_ACTUAL_ARTIFACT=parity_artifacts/titan-npu-fp32``
     ``GLM5_PARITY_EXPECTED_ARTIFACT=parity_artifacts/titan-gpu-fp32``
 
@@ -3258,9 +3307,6 @@ class TestGlm5Parity(
         "GLM5_PARITY_ENDPOINT", ACTUAL_ENDPOINT
     )
     ARTIFACT_PATH = os.environ.get("GLM5_PARITY_ARTIFACT")
-    REFERENCE_ARTIFACT_PATH = os.environ.get(
-        "GLM5_PARITY_REFERENCE_ARTIFACT"
-    )
     COMPARE_ACTUAL_ARTIFACT = os.environ.get(
         "GLM5_PARITY_ACTUAL_ARTIFACT"
     )
@@ -3360,7 +3406,7 @@ class TestGlm5Parity(
     @classmethod
     def _capture_test_plan(cls) -> dict[str, Any]:
         return {
-            "suite": "glm5",
+            "suite": "glm5.2",
             "suite_version": GLM5_PARITY_SUITE_VERSION,
             "cases": [asdict(case) for case in cls.capture_cases],
             "layers": cls.LAYER_INDICES,
@@ -3376,6 +3422,11 @@ class TestGlm5Parity(
 
     @classmethod
     def _capture_configuration(cls) -> dict[str, Any]:
+        routed_expert_compute = (
+            cls.HF_ROUTED_EXPERT_COMPUTE
+            if cls.capture_endpoint.implementation == "hf"
+            else cls.TITAN_ROUTED_EXPERT_COMPUTE
+        )
         return {
             "layers": cls.LAYER_INDICES,
             "components": cls.RUN_COMPONENTS,
@@ -3385,88 +3436,43 @@ class TestGlm5Parity(
             "batch_size": cls.BATCH_SIZE,
             "sequence_length": cls.SEQUENCE_LENGTH,
             "component_execution": cls.COMPONENT_EXECUTION,
-            "hf_routed_expert_compute": cls.HF_ROUTED_EXPERT_COMPUTE,
-            "titan_routed_expert_compute": cls.TITAN_ROUTED_EXPERT_COMPUTE,
+            "routed_expert_compute": routed_expert_compute,
             "model_size": asdict(cls.model_size),
+            "estimated_fp32_model_gb": cls.model_size.estimated_fp32_size_gb,
         }
-
-    @classmethod
-    def _state_from_reference(
-        cls, reader: ParityArtifactReader
-    ) -> dict[str, torch.Tensor]:
-        state: dict[str, torch.Tensor] = {}
-        for key in sorted(reader.observation_keys):
-            metadata = reader.metadata(key)
-            state_key = metadata.tags.get("state_key")
-            if metadata.scope == "parameters" and state_key:
-                state[state_key] = reader.tensor(key)
-        if not state:
-            raise ParityArtifactError(
-                "reference artifact does not contain canonical model parameters"
-            )
-        return state
 
     @classmethod
     def _build_capture_model(
         cls,
         endpoint: ModelEndpoint,
-        canonical_state: dict[str, torch.Tensor] | None,
     ) -> tuple[torch.nn.Module, dict[str, torch.Tensor]]:
         titan_config = _titan_config(cls.model_size)
         cls.adapter = Glm5StateDictAdapter(titan_config, hf_assets_path=None)
-        if canonical_state is None:
-            if _TRANSFORMERS_IMPORT_ERROR is not None:
-                raise RuntimeError(
-                    "creating a standalone parity fixture requires Transformers: "
-                    f"{_TRANSFORMERS_IMPORT_ERROR!r}"
-                )
-            torch.manual_seed(cls.MODEL_SEED)
-            source_model = GlmMoeDsaForCausalLM(
-                _hf_config(cls.model_size)
-            ).float()
-            canonical_state = cls.adapter.from_hf(source_model.state_dict())
-            if endpoint.implementation == "hf":
-                model = source_model
-            else:
-                model = titan_config.build()
-                model.init_states()
-                model.load_state_dict(canonical_state, strict=True)
-                del source_model
-        elif endpoint.implementation == "hf":
+        torch.manual_seed(cls.MODEL_SEED)
+        if endpoint.implementation == "hf":
             if _TRANSFORMERS_IMPORT_ERROR is not None:
                 raise RuntimeError(
                     "capturing an HF endpoint requires Transformers: "
                     f"{_TRANSFORMERS_IMPORT_ERROR!r}"
                 )
             model = GlmMoeDsaForCausalLM(_hf_config(cls.model_size)).float()
-            incompatible = model.load_state_dict(
-                cls.adapter.to_hf(canonical_state), strict=False
-            )
-            unsupported_missing = set(incompatible.missing_keys).difference(
-                cls.adapter._IGNORED_HF_KEYS
-            )
-            if unsupported_missing or incompatible.unexpected_keys:
-                raise RuntimeError(
-                    "reference state is incompatible with the HF endpoint: "
-                    f"missing={sorted(unsupported_missing)}, "
-                    f"unexpected={sorted(incompatible.unexpected_keys)}"
-                )
         else:
             model = titan_config.build()
             model.init_states()
-            model.load_state_dict(canonical_state, strict=True)
 
-        model.to(device=cls.device, dtype=endpoint.precision.dtype).eval()
+        model.to(dtype=endpoint.precision.dtype)
         for name, parameter in model.named_parameters():
             if name.endswith("indexer.weights_proj.weight"):
                 parameter.data = parameter.data.float()
         effective_state = dict(model.named_parameters())
         if endpoint.implementation == "hf":
             effective_state = cls.adapter.from_hf(effective_state)
-        return model, {
+        source_state = {
             name: value.detach().cpu()
             for name, value in effective_state.items()
         }
+        model.to(device=cls.device).eval()
+        return model, source_state
 
     @classmethod
     def _set_up_capture_class(cls) -> None:
@@ -3494,25 +3500,8 @@ class TestGlm5Parity(
         cls.model_size.validate(sequence_length=cls.SEQUENCE_LENGTH)
         cls.capture_cases = cls._configured_cases()
         cls.capture_plan = cls._capture_test_plan()
-        cls.reference_reader = (
-            ParityArtifactReader(cls.REFERENCE_ARTIFACT_PATH)
-            if cls.REFERENCE_ARTIFACT_PATH
-            else None
-        )
-        if (
-            cls.reference_reader is not None
-            and cls.reference_reader.manifest.get("status") != "success"
-        ):
-            raise ParityArtifactError(
-                "GLM5_PARITY_REFERENCE_ARTIFACT must be a successful run"
-            )
-        canonical_state = (
-            cls._state_from_reference(cls.reference_reader)
-            if cls.reference_reader is not None
-            else None
-        )
         cls.capture_model, source_state = cls._build_capture_model(
-            cls.capture_endpoint, canonical_state
+            cls.capture_endpoint
         )
         if (
             cls.capture_endpoint.implementation == "hf"
@@ -3545,45 +3534,18 @@ class TestGlm5Parity(
             f"model/{name}": tensor_digest(value)
             for name, value in sorted(source_state.items())
         }
-        if cls.reference_reader is not None:
-            reference_plan = cls.reference_reader.manifest["test_plan"]
-            if json_digest(reference_plan) != json_digest(cls.capture_plan):
-                raise ParityArtifactError(
-                    "reference artifact test plan does not match this capture"
-                )
-            reference_configuration = cls.reference_reader.manifest[
-                "configuration_digest"
-            ]
-            if reference_configuration != json_digest(
-                cls._capture_configuration()
-            ):
-                raise ParityArtifactError(
-                    "reference artifact configuration does not match this capture"
-                )
         for case in cls.capture_cases:
-            if cls.reference_reader is None:
-                batch = ParityDataFactory.make(
-                    device=torch.device("cpu"),
-                    dtype=torch.float32,
-                    batch_size=cls.BATCH_SIZE,
-                    sequence_length=cls.SEQUENCE_LENGTH,
-                    hidden_size=cls.model_size.dim,
-                    vocab_size=cls.model_size.vocab_size,
-                    seed=case.seed,
-                    data_case=cls.DATA_CASE,
-                    make_tokens=True,
-                )
-            else:
-                prefix = f"fixture/data/{case.case_id}"
-                batch = ParityBatch(
-                    hidden_states=cls.reference_reader.tensor(
-                        f"{prefix}/hidden_states"
-                    ),
-                    positions=cls.reference_reader.tensor(f"{prefix}/positions"),
-                    causal_mask=cls.reference_reader.tensor(f"{prefix}/causal_mask"),
-                    hf_position_embeddings=(torch.empty(0), torch.empty(0)),
-                    tokens=cls.reference_reader.tensor(f"{prefix}/tokens"),
-                )
+            batch = ParityDataFactory.make(
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+                batch_size=cls.BATCH_SIZE,
+                sequence_length=cls.SEQUENCE_LENGTH,
+                hidden_size=cls.model_size.dim,
+                vocab_size=cls.model_size.vocab_size,
+                seed=case.seed,
+                data_case=cls.DATA_CASE,
+                make_tokens=True,
+            )
             cls.capture_batches[case.case_id] = batch
             for field_name in ("hidden_states", "positions", "causal_mask", "tokens"):
                 value = getattr(batch, field_name)
@@ -3592,18 +3554,7 @@ class TestGlm5Parity(
                     tensor_digest(value)
                 )
         computed_fixture_digest = json_digest(fixture_fingerprints)
-        cls.fixture_digest = (
-            cls.reference_reader.manifest["fixture_digest"]
-            if cls.reference_reader is not None
-            else computed_fixture_digest
-        )
-        if (
-            cls.reference_reader is not None
-            and computed_fixture_digest != cls.fixture_digest
-        ):
-            raise ParityArtifactError(
-                "loaded reference tensors do not reproduce its fixture digest"
-            )
+        cls.fixture_digest = computed_fixture_digest
         del source_state
 
     @classmethod
@@ -3799,10 +3750,11 @@ class TestGlm5Parity(
 
     def _capture_batch(self, case: ParityCase) -> ParityBatch:
         source = self.capture_batches[case.case_id]
+        dtype = self.capture_endpoint.precision.dtype
         device_batch = ParityBatch(
-            hidden_states=source.hidden_states.to(self.device),
+            hidden_states=source.hidden_states.to(dtype=dtype).to(self.device),
             positions=source.positions.to(self.device),
-            causal_mask=source.causal_mask.to(self.device),
+            causal_mask=source.causal_mask.to(dtype=dtype).to(self.device),
             hf_position_embeddings=(
                 torch.empty(0, device=self.device),
                 torch.empty(0, device=self.device),
@@ -3813,11 +3765,11 @@ class TestGlm5Parity(
                 else None
             ),
         )
-        return ParityDataFactory.cast(
-            device_batch,
-            model=self.capture_model,
-            dtype=self.capture_endpoint.precision.dtype,
-        )
+        if self.capture_endpoint.implementation == "hf":
+            return ParityDataFactory.attach_hf_position_embeddings(
+                device_batch, self.capture_model
+            )
+        return device_batch
 
     def _new_capture_writer(self) -> ParityArtifactWriter:
         run_id = os.environ.get(
@@ -3866,7 +3818,7 @@ class TestGlm5Parity(
         )
         return ParityArtifactWriter(
             self.ARTIFACT_PATH,
-            suite="glm5",
+            suite="glm5.2",
             suite_version=GLM5_PARITY_SUITE_VERSION,
             endpoint=identity,
             test_plan=self.capture_plan,
@@ -4144,34 +4096,6 @@ class TestGlm5Parity(
             component_filter=component_filter or None,
         )
 
-    def _capture_probe(
-        self,
-        *,
-        case: ParityCase,
-        layer: int,
-        name: str,
-        value: torch.Tensor | None,
-    ) -> torch.Tensor:
-        key = f"fixture/probe/{case.case_id}/layers.{layer}/{name}"
-        if self.reference_reader is not None:
-            probe = self.reference_reader.tensor(key).to(self.device)
-        else:
-            if value is None:
-                raise ValueError(f"probe {key} requires a generated value")
-            probe = value.detach()
-        self._capture_add(
-            key=key,
-            section_id="fixture",
-            tensor=probe,
-            scope="fixture",
-            component=name,
-            layer=layer,
-            value_kind="fixture",
-            compare=False,
-            tags={"case_id": case.case_id, "probe": name},
-        )
-        return probe
-
     def _capture_exact_component_checkpoints(
         self,
         *,
@@ -4188,18 +4112,27 @@ class TestGlm5Parity(
                 else self.capture_model.layers[str(layer_index)]
             )
             with torch.no_grad():
-                generated_normalized = (
+                normalized = (
                     layer.input_layernorm(batch.hidden_states)
                     if endpoint.implementation == "hf"
                     else layer.attention_norm(batch.hidden_states)
                 )
-                normalized = self._capture_probe(
-                    case=case,
-                    layer=layer_index,
-                    name="normalized_input",
-                    value=generated_normalized,
-                )
                 parent_path = f"layers.{layer_index}"
+                self._capture_add(
+                    key=(
+                        f"{case.section_id}/exact/"
+                        f"layers.{layer_index}.attention.normalized_input"
+                    ),
+                    section_id=case.section_id,
+                    tensor=normalized,
+                    scope="component",
+                    component="normalized_input",
+                    layer=layer_index,
+                    module_path=f"{parent_path}.attention.normalized_input",
+                    parent_path=f"{parent_path}.attention",
+                    level=4,
+                    node_kind="activation_checkpoint",
+                )
                 if component == "indexer":
                     attention = (
                         layer.self_attn
@@ -4238,16 +4171,10 @@ class TestGlm5Parity(
                             ),
                         },
                     )
-                    common_q_residual = self._capture_probe(
-                        case=case,
-                        layer=layer_index,
-                        name="common_q_residual",
-                        value=q_residual,
-                    )
                     topk = (
                         attention.indexer(
                             normalized,
-                            common_q_residual,
+                            q_residual,
                             batch.hf_position_embeddings,
                             batch.causal_mask[:, 0],
                             batch.positions,
@@ -4255,7 +4182,7 @@ class TestGlm5Parity(
                         if endpoint.implementation == "hf"
                         else attention.indexer(
                             normalized,
-                            common_q_residual,
+                            q_residual,
                             batch.positions,
                             batch.causal_mask[:, 0],
                         )
@@ -4482,7 +4409,7 @@ class TestGlm5Parity(
             )
         self.capture_missing_gradients = sorted(missing)
 
-    def _capture_common_moe_replay(
+    def _capture_local_moe_replay(
         self,
         case: ParityCase,
         endpoint_trace: EndpointTrace,
@@ -4503,33 +4430,32 @@ class TestGlm5Parity(
             if not is_moe:
                 continue
             generated = endpoint_trace.moe_inputs[label].get(layer_index)
-            common_input = self._capture_probe(
-                case=case,
-                layer=layer_index,
-                name="common_moe_input",
-                value=generated.float() if generated is not None else None,
-            )
+            if generated is None:
+                raise RuntimeError(
+                    f"missing captured MoE input for layer {layer_index}"
+                )
+            local_input = generated.float()
             with torch.no_grad():
                 routed, weights, indices, expert_load = (
                     self._run_routed_experts_on_input(
-                        endpoint, layer_index, common_input
+                        endpoint, layer_index, local_input
                     )
                 )
             parent_path = f"layers.{layer_index}.moe.routed_experts"
             for name, value, value_kind in (
-                ("common_input", routed, "tensor"),
+                ("output", routed, "tensor"),
                 ("weights", weights, "tensor"),
                 ("indices", indices, "discrete"),
                 ("expert_load", expert_load, "discrete"),
             ):
                 self._capture_add(
                     key=(
-                        f"{case.section_id}/causal_replay/"
+                        f"{case.section_id}/local_replay/"
                         f"{parent_path}.{name}"
                     ),
                     section_id=case.section_id,
                     tensor=value,
-                    scope="causal_replay",
+                    scope="local_replay",
                     component=name,
                     layer=layer_index,
                     value_kind=value_kind,
@@ -4563,7 +4489,7 @@ class TestGlm5Parity(
             include_gradients=True,
         )
         self._capture_endpoint_trace(case, endpoint_trace)
-        self._capture_common_moe_replay(case, endpoint_trace)
+        self._capture_local_moe_replay(case, endpoint_trace)
         self._capture_add(
             key=f"{case.section_id}/output/logits",
             section_id=case.section_id,
@@ -4659,8 +4585,6 @@ class TestGlm5Parity(
             f"GLM-5 parity artifact: {output} "
             f"({self.capture_endpoint.label}@{self.device_type})"
         )
-        if self.reference_reader is not None:
-            self.reference_reader.close()
         if failure is not None:
             raise failure
 

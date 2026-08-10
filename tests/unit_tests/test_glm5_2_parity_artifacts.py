@@ -1,7 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 
-"""CPU tests for portable numerical parity artifacts."""
+"""CPU regression tests for portable GLM-5.2 numerical parity artifacts."""
 
 from pathlib import Path
 
@@ -9,7 +9,7 @@ import pytest
 import torch
 
 import tests.unit_tests.test_glm5_parity as glm5_parity
-from tests.parity.artifacts import (
+from tests.glm5_2_parity.artifacts import (
     EndpointIdentity,
     ObservationMetadata,
     ParityArtifactError,
@@ -193,3 +193,29 @@ def test_glm5_offline_comparator_reads_raw_artifact_tensors(
     )
     assert len(recorder.results) == 1
     assert recorder.results[0].passed
+
+
+def test_glm5_2_default_parity_model_is_about_ten_fp32_gb() -> None:
+    model_size = glm5_parity.ParityModelSize()
+    assert model_size.num_layers == 11
+    assert 10.0 <= model_size.estimated_fp32_size_gb <= 10.5
+
+
+def test_glm5_2_html_contents_is_top_only_and_targets_sections(
+    tmp_path: Path,
+) -> None:
+    recorder = glm5_parity.ParityRecorder(
+        glm5_parity.FP32,
+        title="Indexer and router",
+    )
+    report = glm5_parity.ParitySuiteReport("GLM-5.2 offline parity")
+    report.add("component:indexer", recorder)
+    path = tmp_path / "report.html"
+    report.write(str(path))
+
+    html = path.read_text(encoding="utf-8")
+    assert html.count("class='report-toc'") == 1
+    assert "position:sticky" not in html
+    assert "href='#section-0-component-indexer'" in html
+    assert "<section id='section-0-component-indexer'>" in html
+    assert html.index("class='report-toc'") < html.index("<section id=")

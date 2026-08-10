@@ -1,6 +1,6 @@
-# Portable GLM-5 parity workflow
+# Portable GLM-5.2 parity workflow
 
-The GLM-5 parity suite supports three execution modes:
+The GLM-5.2 parity suite supports three execution modes:
 
 - `paired` (default): run two endpoints in one process and immediately report.
 - `capture`: run one endpoint and write a portable, checksummed artifact.
@@ -17,6 +17,10 @@ Because parameters and gradients are retained for offline comparison, budget at
 least two model-state sizes per artifact, plus activation traces and fixtures.
 
 ## Existing paired command
+
+torchtitan glm5.2 vs hf glm5.2
+- gpu
+- fp32
 
 Existing commands remain valid; `GLM5_PARITY_MODE=paired` is implicit:
 
@@ -38,40 +42,25 @@ tests/unit_tests/test_glm5_parity.py::TestGlm5Parity::test_configured_precision_
 
 ## Offline GPU/NPU comparison
 
+torchtitan glm5.2 gpu vs npu
+- fp32&bf16
+
 All capture commands in one comparison must use the same model, data,
 component, layer, and compute-mode settings. Start from a clean, identical Git
 commit on both servers.
 
-First capture the HF reference on GPU. Besides reference outputs, this creates
-the exact weights, CPU-generated test batches, normalized component inputs,
-common Indexer residuals, and common MoE replay inputs used by later runs:
-
-```bash
-CUDA_VISIBLE_DEVICES=7 \
-GLM5_PARITY_MODE=capture \
-GLM5_PARITY_ENDPOINT=hf:fp32 \
-GLM5_PARITY_ARTIFACT=parity_artifacts/hf-gpu-fp32 \
-GLM5_PARITY_HF_ROUTED_EXPERT_COMPUTE=model \
-GLM5_PARITY_TITAN_ROUTED_EXPERT_COMPUTE=fp32 \
-GLM5_PARITY_LAYERS=all \
-GLM5_PARITY_COMPONENTS=all \
-GLM5_PARITY_DATA_CASE=random \
-python -m pytest \
-tests/unit_tests/test_glm5_parity.py::TestGlm5Parity::test_configured_precision_suite \
--s \
-> parity_reports/glm5_parity_test.log 2>&1
-```
-
-Capture the TorchTitan GPU baseline from that reference:
+First capture the TorchTitan GPU baseline. Each capture independently creates
+the model weights and test batches on CPU from the model seed, case seed, test
+ordinal, and effective configuration. The artifact stores their checksums plus
+all local intermediate results. No HF model or reference artifact participates
+in this workflow:
 
 ```bash
 CUDA_VISIBLE_DEVICES=7 \
 GLM5_PARITY_MODE=capture \
 GLM5_PARITY_ENDPOINT=titan:fp32 \
-GLM5_PARITY_REFERENCE_ARTIFACT=parity_artifacts/hf-gpu-fp32 \
 GLM5_PARITY_ARTIFACT=parity_artifacts/titan-gpu-fp32 \
-GLM5_PARITY_HF_ROUTED_EXPERT_COMPUTE=model \
-GLM5_PARITY_TITAN_ROUTED_EXPERT_COMPUTE=fp32 \
+GLM5_PARITY_TITAN_ROUTED_EXPERT_COMPUTE=model \
 GLM5_PARITY_LAYERS=all \
 GLM5_PARITY_COMPONENTS=all \
 GLM5_PARITY_DATA_CASE=random \
@@ -81,17 +70,15 @@ tests/unit_tests/test_glm5_parity.py::TestGlm5Parity::test_configured_precision_
 > parity_reports/glm5_parity_test.log 2>&1
 ```
 
-Copy the HF reference artifact to the Ascend server and capture TorchTitan NPU:
+Capture TorchTitan NPU on Ascend server:
 
 ```bash
 ASCEND_RT_VISIBLE_DEVICES=4 \
 GLM5_PARITY_DEVICE=npu \
 GLM5_PARITY_MODE=capture \
 GLM5_PARITY_ENDPOINT=titan:fp32 \
-GLM5_PARITY_REFERENCE_ARTIFACT=parity_artifacts/hf-gpu-fp32 \
 GLM5_PARITY_ARTIFACT=parity_artifacts/titan-npu-fp32 \
-GLM5_PARITY_HF_ROUTED_EXPERT_COMPUTE=model \
-GLM5_PARITY_TITAN_ROUTED_EXPERT_COMPUTE=fp32 \
+GLM5_PARITY_TITAN_ROUTED_EXPERT_COMPUTE=model \
 GLM5_PARITY_LAYERS=all \
 GLM5_PARITY_COMPONENTS=all \
 GLM5_PARITY_DATA_CASE=random \
@@ -123,3 +110,15 @@ Comparison rejects different test plans, fixture tensors, effective
 configuration, Git commits, incomplete artifacts, and corrupt shards. Dirty
 source trees are rejected by default. `GLM5_PARITY_ALLOW_DIRTY=1` exists only
 for exploratory development and weakens source reproducibility.
+
+## Framework self-check
+
+`tests/unit_tests/test_glm5_2_parity_artifacts.py` is not part of capture or
+compare execution. It is a fast CPU regression suite for the artifact protocol:
+dtype-preserving round trips, checksums, incomplete or failed runs, configuration
+and fixture mismatch rejection, offline tensor comparison, the report contents
+links, and the default model-size budget. Run it after changing the framework:
+
+```bash
+python -m pytest tests/unit_tests/test_glm5_2_parity_artifacts.py -q
+```

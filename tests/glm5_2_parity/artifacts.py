@@ -1,7 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 
-"""Portable, checksummed artifacts for decoupled numerical parity runs.
+"""Portable, checksummed artifacts for decoupled GLM-5.2 parity runs.
 
 The artifact format intentionally stores only JSON metadata and safetensors
 tensor shards.  Comparing artifacts therefore never imports the model that
