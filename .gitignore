@@ -56,4 +56,5 @@ CLAUDE_CONTEXT/
 # html result
 *.html
 /parity_artifacts/
+/parity_fixtures/
 /parity_reports/*.html

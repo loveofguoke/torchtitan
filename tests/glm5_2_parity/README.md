@@ -1,8 +1,9 @@
 # Portable GLM-5.2 parity workflow
 
-The GLM-5.2 parity suite supports three execution modes:
+The GLM-5.2 parity suite supports four execution modes:
 
 - `paired` (default): run two endpoints in one process and immediately report.
+- `prepare`: create one immutable fixture containing exact model state and data.
 - `capture`: run one endpoint and write a portable, checksummed artifact.
 - `compare`: compare two artifacts on CPU and write the same HTML diagnostics.
 
@@ -22,89 +23,55 @@ torchtitan glm5.2 vs hf glm5.2
 - gpu
 - fp32
 
-Existing commands remain valid; `GLM5_PARITY_MODE=paired` is implicit:
+The paired scenario keeps all editable settings in one file:
 
 ```bash
-CUDA_VISIBLE_DEVICES=7 \
-GLM5_PARITY_ACTUAL=titan:fp32 \
-GLM5_PARITY_EXPECTED=hf:fp32 \
-GLM5_PARITY_HF_ROUTED_EXPERT_COMPUTE=model \
-GLM5_PARITY_TITAN_ROUTED_EXPERT_COMPUTE=fp32 \
-GLM5_PARITY_LAYERS=all \
-GLM5_PARITY_COMPONENTS=all \
-GLM5_PARITY_DATA_CASE=random \
-GLM5_PARITY_REPORT_DIR=parity_reports \
-python -m pytest \
-tests/unit_tests/test_glm5_parity.py::TestGlm5Parity::test_configured_precision_suite \
--s \
-> parity_reports/glm5_parity_test.log 2>&1
+python tests/glm5_2_parity/titan_hf_gpu_fp32_random_paired.py --run
 ```
+
+Copy and rename that file to define another paired experiment. The filename is
+the scenario ID and therefore controls the default report and log directory.
+Only edit its `CONFIG` block.
 
 ## Offline GPU/NPU comparison
 
 torchtitan glm5.2 gpu vs npu
 - fp32&bf16
 
-All capture commands in one comparison must use the same model, data,
-component, layer, and compute-mode settings. Start from a clean, identical Git
-commit on both servers.
-
-First capture the TorchTitan GPU baseline. Each capture independently creates
-the model weights and test batches on CPU from the model seed, case seed, test
-ordinal, and effective configuration. The artifact stores their checksums plus
-all local intermediate results. No HF model or reference artifact participates
-in this workflow:
+The offline scenario is also one editable file. Its filename is the scenario
+ID; its `CONFIG` block defines both endpoints, devices, data, model size, cases,
+components, output names, and directories. Inspect the effective configuration
+and resolved paths without executing a test:
 
 ```bash
-CUDA_VISIBLE_DEVICES=7 \
-GLM5_PARITY_MODE=capture \
-GLM5_PARITY_ENDPOINT=titan:fp32 \
-GLM5_PARITY_ARTIFACT=parity_artifacts/titan-gpu-fp32 \
-GLM5_PARITY_TITAN_ROUTED_EXPERT_COMPUTE=model \
-GLM5_PARITY_LAYERS=all \
-GLM5_PARITY_COMPONENTS=all \
-GLM5_PARITY_DATA_CASE=random \
-python -m pytest \
-tests/unit_tests/test_glm5_parity.py::TestGlm5Parity::test_configured_precision_suite \
--s \
-> parity_reports/glm5_parity_test.log 2>&1
+python tests/glm5_2_parity/titan_gpu_npu_fp32_random.py --print-config
 ```
 
-Capture TorchTitan NPU on Ascend server:
+Generate the fixture once on CPU. This stores the exact FP32 TorchTitan state,
+every case tensor, test ordinal, seed, test plan, and effective configuration:
 
 ```bash
-ASCEND_RT_VISIBLE_DEVICES=4 \
-GLM5_PARITY_DEVICE=npu \
-GLM5_PARITY_MODE=capture \
-GLM5_PARITY_ENDPOINT=titan:fp32 \
-GLM5_PARITY_ARTIFACT=parity_artifacts/titan-npu-fp32 \
-GLM5_PARITY_TITAN_ROUTED_EXPERT_COMPUTE=model \
-GLM5_PARITY_LAYERS=all \
-GLM5_PARITY_COMPONENTS=all \
-GLM5_PARITY_DATA_CASE=random \
-python -m pytest \
-tests/unit_tests/test_glm5_parity.py::TestGlm5Parity::test_configured_precision_suite \
--s \
-> parity_reports/glm5_parity_test.log 2>&1
+python tests/glm5_2_parity/titan_gpu_npu_fp32_random.py --data
 ```
 
-After copying the NPU artifact back, compare Titan NPU with Titan GPU. This step
-does not construct a model and does not require an accelerator:
+Copy the unchanged scenario file and its complete fixture directory to both
+servers. Each capture refuses to run without that fixture or when any scenario,
+model, data, case-order, or configuration digest differs:
 
 ```bash
-GLM5_PARITY_MODE=compare \
-GLM5_PARITY_ACTUAL_ARTIFACT=parity_artifacts/titan-npu-fp32 \
-GLM5_PARITY_EXPECTED_ARTIFACT=parity_artifacts/titan-gpu-fp32 \
-GLM5_PARITY_REPORT=parity_reports/titan-npu-vs-gpu-fp32.html \
-python -m pytest \
-tests/unit_tests/test_glm5_parity.py::TestGlm5Parity::test_configured_precision_suite \
--s \
-> parity_reports/glm5_parity_test.log 2>&1
+python tests/glm5_2_parity/titan_gpu_npu_fp32_random.py --gpu-capture
+python tests/glm5_2_parity/titan_gpu_npu_fp32_random.py --npu-capture
 ```
 
-Repeat the workflow with `bf16` endpoints. For BF16, use
-`GLM5_PARITY_TITAN_ROUTED_EXPERT_COMPUTE=model`; the explicit `fp32` routed
-expert experiment is intentionally restricted to an FP32 Titan endpoint.
+Copy the NPU capture beside the GPU capture and generate the report on CPU:
+
+```bash
+python tests/glm5_2_parity/titan_gpu_npu_fp32_random.py --compare
+```
+
+Copy and rename the scenario file for BF16 or another data case, then edit only
+its `CONFIG` block. BF16 uses the same exact FP32 fixture state and performs the
+BF16 cast on CPU before moving tensors to GPU or NPU.
 
 Comparison rejects different test plans, fixture tensors, effective
 configuration, Git commits, incomplete artifacts, and corrupt shards. Dirty

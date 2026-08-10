@@ -16,6 +16,7 @@ from tests.glm5_2_parity.artifacts import (
     ParityArtifactReader,
     ParityArtifactWriter,
 )
+from tests.glm5_2_parity.workflow import ParityModelConfig
 
 
 def _writer(
@@ -219,3 +220,23 @@ def test_glm5_2_html_contents_is_top_only_and_targets_sections(
     assert "href='#section-0-component-indexer'" in html
     assert "<section id='section-0-component-indexer'>" in html
     assert html.index("class='report-toc'") < html.index("<section id=")
+
+
+def test_glm5_2_capture_requires_an_explicit_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(glm5_parity.TestGlm5Parity, "FIXTURE_PATH", None)
+    monkeypatch.setattr(
+        glm5_parity.TestGlm5Parity,
+        "ARTIFACT_PATH",
+        str(tmp_path / "capture"),
+    )
+    with pytest.raises(ValueError, match="GLM5_PARITY_FIXTURE"):
+        glm5_parity.TestGlm5Parity._set_up_capture_class()
+
+
+def test_glm5_2_workflow_model_configuration_maps_to_environment() -> None:
+    environment = ParityModelConfig(layers=7, dim=1024).environment()
+    assert environment["GLM5_PARITY_MODEL_LAYERS"] == "7"
+    assert environment["GLM5_PARITY_MODEL_DIM"] == "1024"

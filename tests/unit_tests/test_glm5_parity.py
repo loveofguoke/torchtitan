@@ -85,7 +85,7 @@ class PrecisionPolicy:
 FP32 = PrecisionPolicy("fp32", torch.float32, 1e-4, 1e-5)
 BF16 = PrecisionPolicy("bf16", torch.bfloat16, 5e-2, 5e-2)
 TOP_LEVEL_COMPONENTS = {"tok_embeddings", "norm", "lm_head"}
-GLM5_PARITY_SUITE_VERSION = 2
+GLM5_PARITY_SUITE_VERSION = 3
 
 
 @dataclass
@@ -3284,7 +3284,8 @@ class TestGlm5Parity(
 
     Decoupled execution additionally supports:
 
-    ``GLM5_PARITY_MODE=capture|compare|paired``
+    ``GLM5_PARITY_MODE=prepare|capture|compare|paired``
+    ``GLM5_PARITY_FIXTURE=parity_fixtures/glm5.2-fp32``
     ``GLM5_PARITY_ENDPOINT=titan:fp32``
     ``GLM5_PARITY_ARTIFACT=parity_artifacts/titan-gpu-fp32``
     ``GLM5_PARITY_ACTUAL_ARTIFACT=parity_artifacts/titan-npu-fp32``
@@ -3307,6 +3308,7 @@ class TestGlm5Parity(
         "GLM5_PARITY_ENDPOINT", ACTUAL_ENDPOINT
     )
     ARTIFACT_PATH = os.environ.get("GLM5_PARITY_ARTIFACT")
+    FIXTURE_PATH = os.environ.get("GLM5_PARITY_FIXTURE")
     COMPARE_ACTUAL_ARTIFACT = os.environ.get(
         "GLM5_PARITY_ACTUAL_ARTIFACT"
     )
@@ -3318,7 +3320,7 @@ class TestGlm5Parity(
     LAYER_INDICES = os.environ.get("GLM5_PARITY_LAYERS", "all")
     DATA_CASE = os.environ.get("GLM5_PARITY_DATA_CASE", "random")
     DATA_SEED = int(os.environ.get("GLM5_PARITY_DATA_SEED", "61"))
-    MODEL_SEED = 61
+    MODEL_SEED = int(os.environ.get("GLM5_PARITY_MODEL_SEED", "61"))
     BATCH_SIZE = int(os.environ.get("GLM5_PARITY_BATCH_SIZE", "2"))
     SEQUENCE_LENGTH = int(os.environ.get("GLM5_PARITY_SEQUENCE_LENGTH", "16"))
     COMPONENT_EXECUTION = os.environ.get(
@@ -3421,12 +3423,7 @@ class TestGlm5Parity(
         }
 
     @classmethod
-    def _capture_configuration(cls) -> dict[str, Any]:
-        routed_expert_compute = (
-            cls.HF_ROUTED_EXPERT_COMPUTE
-            if cls.capture_endpoint.implementation == "hf"
-            else cls.TITAN_ROUTED_EXPERT_COMPUTE
-        )
+    def _fixture_configuration(cls) -> dict[str, Any]:
         return {
             "layers": cls.LAYER_INDICES,
             "components": cls.RUN_COMPONENTS,
@@ -3436,19 +3433,34 @@ class TestGlm5Parity(
             "batch_size": cls.BATCH_SIZE,
             "sequence_length": cls.SEQUENCE_LENGTH,
             "component_execution": cls.COMPONENT_EXECUTION,
-            "routed_expert_compute": routed_expert_compute,
             "model_size": asdict(cls.model_size),
             "estimated_fp32_model_gb": cls.model_size.estimated_fp32_size_gb,
+            "scenario_id": os.environ.get("GLM5_PARITY_SCENARIO_ID", ""),
+            "scenario_config_digest": os.environ.get(
+                "GLM5_PARITY_SCENARIO_CONFIG_DIGEST", ""
+            ),
+            "scenario_configuration": os.environ.get(
+                "GLM5_PARITY_SCENARIO_CONFIG_JSON", ""
+            ),
         }
+
+    @classmethod
+    def _capture_configuration(cls) -> dict[str, Any]:
+        configuration = cls._fixture_configuration()
+        configuration["routed_expert_compute"] = {
+            "hf": cls.HF_ROUTED_EXPERT_COMPUTE,
+            "titan": cls.TITAN_ROUTED_EXPERT_COMPUTE,
+        }
+        return configuration
 
     @classmethod
     def _build_capture_model(
         cls,
         endpoint: ModelEndpoint,
-    ) -> tuple[torch.nn.Module, dict[str, torch.Tensor]]:
+        canonical_state: dict[str, torch.Tensor],
+    ) -> torch.nn.Module:
         titan_config = _titan_config(cls.model_size)
         cls.adapter = Glm5StateDictAdapter(titan_config, hf_assets_path=None)
-        torch.manual_seed(cls.MODEL_SEED)
         if endpoint.implementation == "hf":
             if _TRANSFORMERS_IMPORT_ERROR is not None:
                 raise RuntimeError(
@@ -3456,26 +3468,177 @@ class TestGlm5Parity(
                     f"{_TRANSFORMERS_IMPORT_ERROR!r}"
                 )
             model = GlmMoeDsaForCausalLM(_hf_config(cls.model_size)).float()
+            incompatible = model.load_state_dict(
+                cls.adapter.to_hf(canonical_state), strict=False
+            )
+            unsupported_missing = set(incompatible.missing_keys).difference(
+                cls.adapter._IGNORED_HF_KEYS
+            )
+            if unsupported_missing or incompatible.unexpected_keys:
+                raise RuntimeError(
+                    "fixture state is incompatible with the HF endpoint: "
+                    f"missing={sorted(unsupported_missing)}, "
+                    f"unexpected={sorted(incompatible.unexpected_keys)}"
+                )
         else:
             model = titan_config.build()
             model.init_states()
+            model.load_state_dict(canonical_state, strict=True)
 
         model.to(dtype=endpoint.precision.dtype)
         for name, parameter in model.named_parameters():
             if name.endswith("indexer.weights_proj.weight"):
                 parameter.data = parameter.data.float()
-        effective_state = dict(model.named_parameters())
-        if endpoint.implementation == "hf":
-            effective_state = cls.adapter.from_hf(effective_state)
-        source_state = {
-            name: value.detach().cpu()
-            for name, value in effective_state.items()
-        }
         model.to(device=cls.device).eval()
-        return model, source_state
+        return model
+
+    @classmethod
+    def _make_fixture_batches(cls) -> dict[str, ParityBatch]:
+        return {
+            case.case_id: ParityDataFactory.make(
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+                batch_size=cls.BATCH_SIZE,
+                sequence_length=cls.SEQUENCE_LENGTH,
+                hidden_size=cls.model_size.dim,
+                vocab_size=cls.model_size.vocab_size,
+                seed=case.seed,
+                data_case=cls.DATA_CASE,
+                make_tokens=True,
+            )
+            for case in cls.capture_cases
+        }
+
+    @classmethod
+    def _set_up_prepare_class(cls) -> None:
+        if not cls.FIXTURE_PATH:
+            raise ValueError(
+                "GLM5_PARITY_MODE=prepare requires GLM5_PARITY_FIXTURE"
+            )
+        if Path(cls.FIXTURE_PATH).exists():
+            raise FileExistsError(
+                f"GLM5_PARITY_FIXTURE already exists: {cls.FIXTURE_PATH}"
+            )
+        cls.gpu_ready = True
+        cls.gpu_skip_reason = ""
+        cls.device_type = "cpu"
+        cls.model_size = ParityModelSize.from_env()
+        cls.model_size.validate(sequence_length=cls.SEQUENCE_LENGTH)
+        cls.capture_cases = cls._configured_cases()
+        cls.capture_plan = cls._capture_test_plan()
+
+    @classmethod
+    def _load_fixture(
+        cls,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, ParityBatch], str]:
+        if not cls.FIXTURE_PATH:
+            raise ValueError(
+                "GLM5_PARITY_MODE=capture requires GLM5_PARITY_FIXTURE"
+            )
+        with ParityArtifactReader(cls.FIXTURE_PATH) as reader:
+            if reader.manifest.get("status") != "success":
+                raise ParityArtifactError(
+                    "GLM5_PARITY_FIXTURE must be a successful fixture"
+                )
+            if reader.manifest.get("suite") != "glm5.2-fixture":
+                raise ParityArtifactError(
+                    "GLM5_PARITY_FIXTURE is not a GLM-5.2 fixture"
+                )
+            if reader.manifest.get("suite_version") != GLM5_PARITY_SUITE_VERSION:
+                raise ParityArtifactError(
+                    "GLM5_PARITY_FIXTURE suite version does not match this code"
+                )
+            if reader.manifest.get("test_plan_digest") != json_digest(
+                cls.capture_plan
+            ):
+                raise ParityArtifactError(
+                    "GLM5_PARITY_FIXTURE test plan does not match this capture"
+                )
+            if reader.manifest.get("configuration_digest") != json_digest(
+                cls._fixture_configuration()
+            ):
+                raise ParityArtifactError(
+                    "GLM5_PARITY_FIXTURE configuration does not match this capture"
+                )
+            fixture_source = reader.manifest.get("environment", {})
+            current_source = _git_metadata()
+            if fixture_source.get("git_commit") != current_source.get(
+                "git_commit"
+            ):
+                raise ParityArtifactError(
+                    "GLM5_PARITY_FIXTURE was produced by a different Git commit"
+                )
+            if os.environ.get("GLM5_PARITY_ALLOW_DIRTY", "0") != "1":
+                dirty = {
+                    "fixture": fixture_source.get("git_status", ""),
+                    "fixture_untracked_source": fixture_source.get(
+                        "git_untracked_source", ""
+                    ),
+                    "capture": current_source.get("git_status", ""),
+                    "capture_untracked_source": current_source.get(
+                        "git_untracked_source", ""
+                    ),
+                }
+                if any(dirty.values()):
+                    raise ParityArtifactError(
+                        "fixture and capture require clean source trees; set "
+                        "GLM5_PARITY_ALLOW_DIRTY=1 only for exploratory runs. "
+                        f"dirty status={dirty}"
+                    )
+            canonical_state: dict[str, torch.Tensor] = {}
+            fingerprints: dict[str, str] = {}
+            for key in sorted(reader.observation_keys):
+                metadata = reader.metadata(key)
+                state_key = metadata.tags.get("state_key")
+                if metadata.scope != "fixture_model" or not state_key:
+                    continue
+                value = reader.tensor(key).clone()
+                canonical_state[state_key] = value
+                fingerprints[f"model/{state_key}"] = tensor_digest(value)
+            if not canonical_state:
+                raise ParityArtifactError(
+                    "GLM5_PARITY_FIXTURE contains no model state"
+                )
+            batches: dict[str, ParityBatch] = {}
+            for case in cls.capture_cases:
+                prefix = f"fixture/data/{case.case_id}"
+                values = {
+                    field_name: reader.tensor(f"{prefix}/{field_name}").clone()
+                    for field_name in (
+                        "hidden_states",
+                        "positions",
+                        "causal_mask",
+                        "tokens",
+                    )
+                }
+                batches[case.case_id] = ParityBatch(
+                    hidden_states=values["hidden_states"],
+                    positions=values["positions"],
+                    causal_mask=values["causal_mask"],
+                    hf_position_embeddings=(torch.empty(0), torch.empty(0)),
+                    tokens=values["tokens"],
+                )
+                for field_name, value in values.items():
+                    fingerprints[f"data/{case.case_id}/{field_name}"] = (
+                        tensor_digest(value)
+                    )
+            fixture_digest = json_digest(fingerprints)
+            if fixture_digest != reader.manifest.get("fixture_digest"):
+                raise ParityArtifactError(
+                    "GLM5_PARITY_FIXTURE tensors do not reproduce its digest"
+                )
+            return canonical_state, batches, fixture_digest
 
     @classmethod
     def _set_up_capture_class(cls) -> None:
+        if not cls.FIXTURE_PATH:
+            raise ValueError(
+                "GLM5_PARITY_MODE=capture requires GLM5_PARITY_FIXTURE"
+            )
+        if not Path(cls.FIXTURE_PATH).is_dir():
+            raise FileNotFoundError(
+                f"GLM5_PARITY_FIXTURE does not exist: {cls.FIXTURE_PATH}"
+            )
         if not cls.ARTIFACT_PATH:
             raise ValueError(
                 "GLM5_PARITY_MODE=capture requires GLM5_PARITY_ARTIFACT"
@@ -3484,12 +3647,7 @@ class TestGlm5Parity(
             raise FileExistsError(
                 f"GLM5_PARITY_ARTIFACT already exists: {cls.ARTIFACT_PATH}"
             )
-        try:
-            cls.device, cls.device_module, cls.device_type = _parity_device()
-        except RuntimeError as error:
-            cls.gpu_ready = False
-            cls.gpu_skip_reason = str(error)
-            return
+        cls.device, cls.device_module, cls.device_type = _parity_device()
         cls.gpu_ready = True
         cls.gpu_skip_reason = ""
         cls.capture_endpoint = cls._endpoint(cls.CAPTURE_ENDPOINT)
@@ -3500,9 +3658,13 @@ class TestGlm5Parity(
         cls.model_size.validate(sequence_length=cls.SEQUENCE_LENGTH)
         cls.capture_cases = cls._configured_cases()
         cls.capture_plan = cls._capture_test_plan()
-        cls.capture_model, source_state = cls._build_capture_model(
-            cls.capture_endpoint
+        canonical_state, cls.capture_batches, cls.fixture_digest = (
+            cls._load_fixture()
         )
+        cls.capture_model = cls._build_capture_model(
+            cls.capture_endpoint, canonical_state
+        )
+        del canonical_state
         if (
             cls.capture_endpoint.implementation == "hf"
             and cls.HF_ROUTED_EXPERT_COMPUTE != "model"
@@ -3529,39 +3691,12 @@ class TestGlm5Parity(
         cls.num_model_parameters = sum(
             parameter.numel() for parameter in cls.capture_model.parameters()
         )
-        cls.capture_batches: dict[str, ParityBatch] = {}
-        fixture_fingerprints: dict[str, str] = {
-            f"model/{name}": tensor_digest(value)
-            for name, value in sorted(source_state.items())
-        }
-        for case in cls.capture_cases:
-            batch = ParityDataFactory.make(
-                device=torch.device("cpu"),
-                dtype=torch.float32,
-                batch_size=cls.BATCH_SIZE,
-                sequence_length=cls.SEQUENCE_LENGTH,
-                hidden_size=cls.model_size.dim,
-                vocab_size=cls.model_size.vocab_size,
-                seed=case.seed,
-                data_case=cls.DATA_CASE,
-                make_tokens=True,
-            )
-            cls.capture_batches[case.case_id] = batch
-            for field_name in ("hidden_states", "positions", "causal_mask", "tokens"):
-                value = getattr(batch, field_name)
-                assert value is not None
-                fixture_fingerprints[f"data/{case.case_id}/{field_name}"] = (
-                    tensor_digest(value)
-                )
-        computed_fixture_digest = json_digest(fixture_fingerprints)
-        cls.fixture_digest = computed_fixture_digest
-        del source_state
 
     @classmethod
     def setUpClass(cls) -> None:
-        if cls.RUN_MODE not in {"paired", "capture", "compare"}:
+        if cls.RUN_MODE not in {"paired", "prepare", "capture", "compare"}:
             raise ValueError(
-                "GLM5_PARITY_MODE must be paired, capture, or compare"
+                "GLM5_PARITY_MODE must be paired, prepare, capture, or compare"
             )
         if cls.RUN_MODE == "compare":
             cls.gpu_ready = True
@@ -3569,6 +3704,9 @@ class TestGlm5Parity(
             return
         if cls.RUN_MODE == "capture":
             cls._set_up_capture_class()
+            return
+        if cls.RUN_MODE == "prepare":
+            cls._set_up_prepare_class()
             return
         if _TRANSFORMERS_IMPORT_ERROR is not None:
             cls.gpu_ready = False
@@ -3690,7 +3828,7 @@ class TestGlm5Parity(
 
     def setUp(self) -> None:
         if (
-            self.RUN_MODE in {"capture", "compare"}
+            self.RUN_MODE in {"prepare", "capture", "compare"}
             and self._testMethodName != "test_configured_precision_suite"
         ):
             self.skipTest(
@@ -3785,6 +3923,7 @@ class TestGlm5Parity(
         environment["argv"] = repr(sys.argv)
         environment["device_type"] = self.device_type
         environment["device_name"] = device_name
+        environment["fixture_path"] = str(self.FIXTURE_PATH)
         for name in (
             "CUDA_VISIBLE_DEVICES",
             "ASCEND_RT_VISIBLE_DEVICES",
@@ -4516,6 +4655,114 @@ class TestGlm5Parity(
         )
         self._capture_parameters_and_gradients(case.section_id)
 
+    def _run_prepare_fixture(self) -> None:
+        torch.manual_seed(self.MODEL_SEED)
+        titan_config = _titan_config(self.model_size)
+        model = titan_config.build()
+        model.init_states()
+        model.float().eval()
+        canonical_state = {
+            name: value.detach()
+            for name, value in model.state_dict().items()
+        }
+        batches = self._make_fixture_batches()
+        fingerprints = {
+            f"model/{name}": tensor_digest(value)
+            for name, value in sorted(canonical_state.items())
+        }
+        for case in self.capture_cases:
+            batch = batches[case.case_id]
+            for field_name in (
+                "hidden_states",
+                "positions",
+                "causal_mask",
+                "tokens",
+            ):
+                value = getattr(batch, field_name)
+                assert value is not None
+                fingerprints[f"data/{case.case_id}/{field_name}"] = (
+                    tensor_digest(value)
+                )
+        fixture_digest = json_digest(fingerprints)
+        run_id = os.environ.get(
+            "GLM5_PARITY_RUN_ID", Path(self.FIXTURE_PATH).name
+        )
+        environment: dict[str, Any] = runtime_metadata()
+        environment.update(_git_metadata())
+        environment["argv"] = repr(sys.argv)
+        environment["fixture_role"] = "canonical_model_state_and_test_data"
+        writer = ParityArtifactWriter(
+            self.FIXTURE_PATH,
+            suite="glm5.2-fixture",
+            suite_version=GLM5_PARITY_SUITE_VERSION,
+            endpoint=EndpointIdentity(
+                implementation="titan-fixture",
+                precision="fp32",
+                device_type="cpu",
+                device_name="cpu",
+                run_id=run_id,
+            ),
+            test_plan=self.capture_plan,
+            configuration=self._fixture_configuration(),
+            fixture_digest=fixture_digest,
+            environment=environment,
+        )
+        for state_key, value in sorted(canonical_state.items()):
+            layer_match = re.match(r"layers\.(\d+)", state_key)
+            layer: int | str = (
+                int(layer_match.group(1)) if layer_match else "global"
+            )
+            writer.add(
+                ObservationMetadata(
+                    key=f"fixture/model/{state_key}",
+                    section_id="fixture",
+                    scope="fixture_model",
+                    component="model_state",
+                    layer=layer,
+                    value_kind="fixture",
+                    module_path=state_key,
+                    parent_path=state_key.rpartition(".")[0],
+                    level=len(state_key.split(".")) - 1,
+                    node_kind="fixture_state",
+                    checkpoint=True,
+                    compare=False,
+                    tags={"state_key": state_key},
+                ),
+                value,
+            )
+        for case in self.capture_cases:
+            batch = batches[case.case_id]
+            prefix = f"fixture/data/{case.case_id}"
+            for field_name in (
+                "hidden_states",
+                "positions",
+                "causal_mask",
+                "tokens",
+            ):
+                value = getattr(batch, field_name)
+                assert value is not None
+                writer.add(
+                    ObservationMetadata(
+                        key=f"{prefix}/{field_name}",
+                        section_id="fixture",
+                        scope="fixture_data",
+                        component=field_name,
+                        layer="global",
+                        value_kind="fixture",
+                        compare=False,
+                        tags={
+                            "case_id": case.case_id,
+                            "case_ordinal": str(case.ordinal),
+                            "case_seed": str(case.seed),
+                        },
+                    ),
+                    value,
+                )
+        del canonical_state, batches, model
+        output = writer.write()
+        print(f"GLM-5.2 parity fixture: {output}")
+        print(f"fixture digest: {fixture_digest}")
+
     def _run_capture_suite(self) -> None:
         self.capture_writer = self._new_capture_writer()
         artifact_parent = Path(self.ARTIFACT_PATH).parent
@@ -4985,6 +5232,18 @@ class TestGlm5Parity(
     ) -> list[tuple[str, str, str]]:
         """Return every effective suite setting for the HTML report."""
         values: list[tuple[str, str, str]] = [
+            (
+                "scenario",
+                "id",
+                os.environ.get("GLM5_PARITY_SCENARIO_ID", "direct"),
+            ),
+            (
+                "scenario",
+                "configuration_digest",
+                os.environ.get(
+                    "GLM5_PARITY_SCENARIO_CONFIG_DIGEST", "unavailable"
+                ),
+            ),
             ("comparison", "model", "glm5"),
             ("comparison", "actual_endpoint", spec.actual.label),
             ("comparison", "expected_endpoint", spec.expected.label),
@@ -6244,6 +6503,9 @@ class TestGlm5Parity(
     # Complete entry point for the configured end-to-end and component tests.
     def test_configured_precision_suite(self) -> None:
         """Call independent tests and combine their results into one report."""
+        if self.RUN_MODE == "prepare":
+            self._run_prepare_fixture()
+            return
         if self.RUN_MODE == "compare":
             self._run_offline_compare()
             return
