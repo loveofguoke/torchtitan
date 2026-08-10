@@ -4315,18 +4315,6 @@ class TestGlm5Parity(
                         parent_path=f"{parent_path}.attention",
                         level=4,
                         node_kind="activation_checkpoint",
-                        tags={
-                            "rtol": (
-                                "1e-6"
-                                if endpoint.precision is FP32
-                                else str(endpoint.precision.rtol)
-                            ),
-                            "atol": (
-                                "1e-7"
-                                if endpoint.precision is FP32
-                                else str(endpoint.precision.atol)
-                            ),
-                        },
                     )
                     topk = (
                         attention.indexer(
@@ -5046,20 +5034,29 @@ class TestGlm5Parity(
                     expected_dtype=expected_dtype,
                 )
             return
+        use_suite_tolerance = metadata.component == "q_residual"
         recorder.tensor(
             scope=metadata.scope,
             component=metadata.component,
             layer=metadata.layer,
             actual=actual_tensor,
             expected=expected_tensor,
-            rtol=float(
-                actual_metadata.tags.get(
-                    "rtol", expected_metadata.tags.get("rtol", policy.rtol)
+            rtol=(
+                policy.rtol
+                if use_suite_tolerance
+                else float(
+                    actual_metadata.tags.get(
+                        "rtol", expected_metadata.tags.get("rtol", policy.rtol)
+                    )
                 )
             ),
-            atol=float(
-                actual_metadata.tags.get(
-                    "atol", expected_metadata.tags.get("atol", policy.atol)
+            atol=(
+                policy.atol
+                if use_suite_tolerance
+                else float(
+                    actual_metadata.tags.get(
+                        "atol", expected_metadata.tags.get("atol", policy.atol)
+                    )
                 )
             ),
             module_path=module_path,

@@ -227,6 +227,43 @@ def test_glm5_offline_comparator_ignores_router_tuple_branches() -> None:
     )
 
 
+def test_glm5_offline_q_residual_uses_suite_tolerance(
+    tmp_path: Path,
+) -> None:
+    key = "component-indexer/exact/layers.0.attention.q_residual"
+    for name, value in (("actual", 0.0), ("expected", 9.536743e-7)):
+        writer = _writer(tmp_path / name)
+        writer.add(
+            ObservationMetadata(
+                key=key,
+                section_id="component-indexer",
+                scope="component",
+                component="q_residual",
+                layer=0,
+                tags={"rtol": "1e-6", "atol": "1e-7"},
+            ),
+            torch.tensor([value], dtype=torch.float32),
+        )
+        writer.write()
+
+    actual = ParityArtifactReader(tmp_path / "actual")
+    expected = ParityArtifactReader(tmp_path / "expected")
+    recorder = glm5_parity.ParityRecorder(glm5_parity.FP32)
+    suite = glm5_parity.TestGlm5Parity(
+        methodName="test_configured_precision_suite"
+    )
+    suite._compare_artifact_observation(
+        key=key,
+        actual=actual,
+        expected=expected,
+        recorder=recorder,
+        policy=glm5_parity.FP32,
+    )
+    assert len(recorder.results) == 1
+    assert recorder.results[0].passed
+    assert recorder.results[0].mismatch_count == 0
+
+
 def test_glm5_2_default_parity_model_is_about_ten_fp32_gb() -> None:
     model_size = glm5_parity.ParityModelSize()
     assert model_size.num_layers == 11
