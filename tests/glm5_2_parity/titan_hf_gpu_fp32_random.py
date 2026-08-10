@@ -41,7 +41,7 @@ CONFIG = OfflineParityConfig(
     layers="all",
     components="all",
     component_execution="independent",
-    titan_routed_expert_compute="model",
+    titan_routed_expert_compute="fp32",
     allow_dirty=False,
     model=ParityModelConfig(
         vocab_size=154880,
@@ -58,7 +58,7 @@ CONFIG = OfflineParityConfig(
     report_root="parity_reports",
     log_root="parity_reports/logs",
     fixture_name="fixture",
-    report_name="titan_vs_hf_offline.html",
+    report_name="titan_vs_hf_gpu_fp32_offline.html",
 )
 
 
