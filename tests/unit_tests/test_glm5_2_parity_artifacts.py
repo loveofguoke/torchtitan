@@ -201,6 +201,32 @@ def test_glm5_offline_comparator_reads_raw_artifact_tensors(
     assert recorder.results[0].passed
 
 
+def test_glm5_offline_comparator_ignores_router_tuple_branches() -> None:
+    metadata = ObservationMetadata(
+        key="component-router/activation/layers.1.moe.router[0]",
+        section_id="component-router",
+        scope="trace",
+        component="router[0]",
+        layer=1,
+    )
+    assert not glm5_parity.TestGlm5Parity._artifact_observation_is_comparable(
+        metadata.key,
+        metadata,
+    )
+    exact = ObservationMetadata(
+        key="component-router/exact/layers.1.moe.router.indices",
+        section_id="component-router",
+        scope="component",
+        component="router_indices",
+        layer=1,
+        value_kind="discrete",
+    )
+    assert glm5_parity.TestGlm5Parity._artifact_observation_is_comparable(
+        exact.key,
+        exact,
+    )
+
+
 def test_glm5_2_default_parity_model_is_about_ten_fp32_gb() -> None:
     model_size = glm5_parity.ParityModelSize()
     assert model_size.num_layers == 11

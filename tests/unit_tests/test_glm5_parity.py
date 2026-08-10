@@ -4038,6 +4038,7 @@ class TestGlm5Parity(
         trace: RecursiveModuleTrace,
         include_gradients: bool,
         component_filter: str | None = None,
+        skip_filter_root: bool = False,
     ) -> None:
         endpoint = self.capture_endpoint
         label = endpoint.label
@@ -4068,6 +4069,7 @@ class TestGlm5Parity(
             logical_values.items()
         ):
             base_path = logical_path.split("[", 1)[0]
+            filter_root = False
             if normalized_filter:
                 layer_match = re.match(r"layers\.(\d+)", base_path)
                 targets = (
@@ -4083,6 +4085,9 @@ class TestGlm5Parity(
                     for target in targets
                 ) and not base_path.endswith(f".{normalized_filter}"):
                     continue
+                filter_root = base_path in targets or base_path.endswith(
+                    f".{normalized_filter}"
+                )
             layer_match = re.match(r"layers\.(\d+)", base_path)
             layer: int | str = int(layer_match.group(1)) if layer_match else "global"
             parent_path = base_path.rpartition(".")[0]
@@ -4122,6 +4127,13 @@ class TestGlm5Parity(
                 checkpoint=checkpoint,
                 dtype_flow=dtype_flow,
                 positions_key=positions_key,
+                compare=not (
+                    re.fullmatch(r"layers\.\d+", base_path)
+                    or base_path.endswith(
+                        (".attention.indexer", ".moe.router")
+                    )
+                    or (skip_filter_root and filter_root)
+                ),
             )
         if not include_gradients:
             return
@@ -4160,6 +4172,7 @@ class TestGlm5Parity(
                     "gradient_checkpoint" if checkpoint else "gradient_activation"
                 ),
                 checkpoint=checkpoint,
+                compare=not base_path.endswith(".moe.router"),
             )
 
     def _capture_component_case(self, case: ParityCase) -> None:
@@ -4233,6 +4246,7 @@ class TestGlm5Parity(
             trace=trace,
             include_gradients=False,
             component_filter=component_filter or None,
+            skip_filter_root=True,
         )
 
     def _capture_exact_component_checkpoints(
@@ -4293,7 +4307,11 @@ class TestGlm5Parity(
                         scope="component",
                         component="q_residual",
                         layer=layer_index,
-                        module_path=f"{parent_path}.attention.q_residual",
+                        module_path=(
+                            f"model.layers.{layer_index}.self_attn.q_a_layernorm"
+                            if endpoint.implementation == "hf"
+                            else f"{parent_path}.attention.q_norm"
+                        ),
                         parent_path=f"{parent_path}.attention",
                         level=4,
                         node_kind="activation_checkpoint",
@@ -4337,7 +4355,11 @@ class TestGlm5Parity(
                         component="indexer",
                         layer=layer_index,
                         value_kind="discrete",
-                        module_path=f"{parent_path}.attention.indexer",
+                        module_path=(
+                            f"model.layers.{layer_index}.self_attn.indexer"
+                            if endpoint.implementation == "hf"
+                            else f"{parent_path}.attention.indexer"
+                        ),
                         parent_path=f"{parent_path}.attention",
                         level=4,
                         node_kind="discrete_checkpoint",
@@ -4373,7 +4395,11 @@ class TestGlm5Parity(
                             component=f"router_{name}",
                             layer=layer_index,
                             value_kind=kind,
-                            module_path=f"{parent_path}.moe.router.{name}",
+                            module_path=(
+                                f"model.layers.{layer_index}.mlp.gate"
+                                if endpoint.implementation == "hf"
+                                else f"{parent_path}.moe.router"
+                            ),
                             parent_path=f"{parent_path}.moe",
                             level=4,
                             node_kind=(
@@ -4847,6 +4873,22 @@ class TestGlm5Parity(
             return FP32
         return BF16
 
+    @staticmethod
+    def _artifact_observation_is_comparable(
+        key: str,
+        metadata: ObservationMetadata,
+    ) -> bool:
+        if not metadata.compare:
+            return False
+        if metadata.scope not in {"trace", "activation_gradient"}:
+            return True
+        match = re.search(
+            r"/(?:activation|activation_gradient)/"
+            r"layers\.\d+\.moe\.router(?:\[\d+\])?$",
+            key,
+        )
+        return match is None
+
     def _compare_artifact_observation(
         self,
         *,
@@ -5116,13 +5158,17 @@ class TestGlm5Parity(
             key
             for reader in (actual, expected)
             for key in reader.observation_keys
-            if reader.metadata(key).compare
+            if self._artifact_observation_is_comparable(
+                key, reader.metadata(key)
+            )
         }
         sections = {
             reader.metadata(key).section_id
             for reader in (actual, expected)
             for key in reader.observation_keys
-            if reader.metadata(key).compare
+            if self._artifact_observation_is_comparable(
+                key, reader.metadata(key)
+            )
         }
         planned_sections = [
             case["section_id"] for case in actual.manifest["test_plan"]["cases"]
