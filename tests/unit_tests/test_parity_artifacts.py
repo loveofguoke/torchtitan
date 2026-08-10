@@ -1,0 +1,195 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+
+"""CPU tests for portable numerical parity artifacts."""
+
+from pathlib import Path
+
+import pytest
+import torch
+
+import tests.unit_tests.test_glm5_parity as glm5_parity
+from tests.parity.artifacts import (
+    EndpointIdentity,
+    ObservationMetadata,
+    ParityArtifactError,
+    ParityArtifactReader,
+    ParityArtifactWriter,
+)
+
+
+def _writer(
+    path: Path,
+    *,
+    fixture_digest: str = "fixture",
+    seed: int = 17,
+) -> ParityArtifactWriter:
+    return ParityArtifactWriter(
+        path,
+        suite="unit",
+        suite_version=1,
+        endpoint=EndpointIdentity(
+            implementation="native",
+            precision="bf16",
+            device_type="cpu",
+            device_name="cpu",
+            run_id=path.name,
+        ),
+        test_plan={"cases": [{"id": "forward", "ordinal": 0}]},
+        configuration={"layers": [0], "seed": seed},
+        fixture_digest=fixture_digest,
+        environment={"torch": torch.__version__},
+        shard_size_bytes=8,
+    )
+
+
+def test_parity_artifact_round_trip_preserves_dtype_and_metadata(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "run"
+    writer = _writer(path)
+    writer.add(
+        ObservationMetadata(
+            key="forward/activation/layers.0",
+            section_id="forward",
+            scope="trace",
+            component="block",
+            layer=0,
+            dtype_flow="in=bf16;out=bf16",
+        ),
+        torch.tensor([[1.0, -2.0]], dtype=torch.bfloat16),
+    )
+    writer.add(
+        ObservationMetadata(
+            key="forward/router/indices",
+            section_id="forward",
+            scope="trace",
+            component="router",
+            layer=0,
+            value_kind="discrete",
+        ),
+        torch.tensor([[[1, 3]]], dtype=torch.int64),
+    )
+    log_path = tmp_path / "runtime.log"
+    log_path.write_text("capture complete\n", encoding="utf-8")
+    writer.add_attachment(log_path, name="runtime.log")
+    writer.write()
+
+    reader = ParityArtifactReader(path)
+    assert reader.endpoint.precision == "bf16"
+    assert reader.metadata("forward/activation/layers.0").dtype_flow == (
+        "in=bf16;out=bf16"
+    )
+    activation = reader.tensor("forward/activation/layers.0")
+    indices = reader.tensor("forward/router/indices")
+    assert activation.dtype is torch.bfloat16
+    assert torch.equal(activation, torch.tensor([[1.0, -2.0]], dtype=torch.bfloat16))
+    assert indices.dtype is torch.int64
+    assert torch.equal(indices, torch.tensor([[[1, 3]]]))
+    assert len(reader.manifest["shards"]) == 2
+    assert reader.manifest["attachments"][0]["file"] == "attachments/runtime.log"
+
+
+def test_parity_artifact_rejects_incompatible_fixture(tmp_path: Path) -> None:
+    left_path = tmp_path / "left"
+    right_path = tmp_path / "right"
+    _writer(left_path, fixture_digest="left").write()
+    _writer(right_path, fixture_digest="right").write()
+
+    left = ParityArtifactReader(left_path)
+    right = ParityArtifactReader(right_path)
+    with pytest.raises(ParityArtifactError, match="fixture_digest"):
+        left.validate_compatible(right)
+
+
+def test_parity_artifact_rejects_incompatible_configuration(
+    tmp_path: Path,
+) -> None:
+    left_path = tmp_path / "left"
+    right_path = tmp_path / "right"
+    _writer(left_path, seed=17).write()
+    _writer(right_path, seed=18).write()
+
+    left = ParityArtifactReader(left_path)
+    right = ParityArtifactReader(right_path)
+    with pytest.raises(ParityArtifactError, match="configuration_digest"):
+        left.validate_compatible(right)
+
+
+def test_parity_artifact_rejects_incomplete_directory(tmp_path: Path) -> None:
+    path = tmp_path / "incomplete"
+    path.mkdir()
+    (path / "manifest.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(ParityArtifactError, match="incomplete"):
+        ParityArtifactReader(path)
+
+
+def test_parity_artifact_rejects_corrupt_shard(tmp_path: Path) -> None:
+    path = tmp_path / "run"
+    writer = _writer(path)
+    writer.add(
+        ObservationMetadata(
+            key="forward/output",
+            section_id="forward",
+            scope="output",
+            component="output",
+            layer="all",
+        ),
+        torch.arange(8, dtype=torch.float32),
+    )
+    writer.write()
+    shard = next(path.glob("*.safetensors"))
+    with shard.open("ab") as file:
+        file.write(b"corrupt")
+    with pytest.raises(ParityArtifactError, match="shard size mismatch"):
+        ParityArtifactReader(path)
+
+
+def test_parity_artifact_rejects_failed_run_comparison(tmp_path: Path) -> None:
+    failed_path = tmp_path / "failed"
+    success_path = tmp_path / "success"
+    failed_writer = _writer(failed_path)
+    failed_writer.mark_failed("unsupported operator")
+    failed_writer.write()
+    _writer(success_path).write()
+
+    failed = ParityArtifactReader(failed_path)
+    success = ParityArtifactReader(success_path)
+    with pytest.raises(ParityArtifactError, match="unsuccessful"):
+        failed.validate_compatible(success)
+
+
+def test_glm5_offline_comparator_reads_raw_artifact_tensors(
+    tmp_path: Path,
+) -> None:
+    actual_path = tmp_path / "actual"
+    expected_path = tmp_path / "expected"
+    for path, value in ((actual_path, 1.0), (expected_path, 1.0)):
+        writer = _writer(path)
+        writer.add(
+            ObservationMetadata(
+                key="forward/output/logits",
+                section_id="forward",
+                scope="configured",
+                component="logits",
+                layer="all",
+            ),
+            torch.tensor([value], dtype=torch.float32),
+        )
+        writer.write()
+
+    actual = ParityArtifactReader(actual_path)
+    expected = ParityArtifactReader(expected_path)
+    recorder = glm5_parity.ParityRecorder(glm5_parity.FP32)
+    suite = glm5_parity.TestGlm5Parity(
+        methodName="test_configured_precision_suite"
+    )
+    suite._compare_artifact_observation(
+        key="forward/output/logits",
+        actual=actual,
+        expected=expected,
+        recorder=recorder,
+        policy=glm5_parity.FP32,
+    )
+    assert len(recorder.results) == 1
+    assert recorder.results[0].passed

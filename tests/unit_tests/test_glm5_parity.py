@@ -16,9 +16,10 @@ The module separates five concerns:
 * ``TestGlm5Parity`` selects implementation x precision endpoints at runtime.
 * The single test class declares the component, layers, precision, and data.
 
-The reference model is optional and all HF comparisons are CUDA-gated.  The
-native router precision tests remain CPU-safe.  Reports use canonical paths,
-compact numeric summaries, and explicit discrete selections.
+The reference model is optional. Paired execution uses the accelerator selected
+by PyTorch, while offline artifacts allow endpoints on different backends and
+servers. The native router precision tests remain CPU-safe. Reports use
+canonical paths, compact numeric summaries, and explicit discrete selections.
 """
 
 from __future__ import annotations
@@ -26,8 +27,12 @@ from __future__ import annotations
 import math
 import os
 import re
+import subprocess
+import sys
+import tempfile
+import traceback
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from html import escape
@@ -46,6 +51,16 @@ from torchtitan.models.glm5 import (
     glm5_configs,
 )
 from torchtitan.ops.scatter_add import deterministic_scatter_add
+from tests.parity.artifacts import (
+    EndpointIdentity,
+    json_digest,
+    ObservationMetadata,
+    ParityArtifactError,
+    ParityArtifactReader,
+    ParityArtifactWriter,
+    runtime_metadata,
+    tensor_digest,
+)
 
 _TRANSFORMERS_IMPORT_ERROR: Exception | None = None
 try:
@@ -70,6 +85,7 @@ class PrecisionPolicy:
 FP32 = PrecisionPolicy("fp32", torch.float32, 1e-4, 1e-5)
 BF16 = PrecisionPolicy("bf16", torch.bfloat16, 5e-2, 5e-2)
 TOP_LEVEL_COMPONENTS = {"tok_embeddings", "norm", "lm_head"}
+GLM5_PARITY_SUITE_VERSION = 1
 
 
 @dataclass
@@ -109,6 +125,115 @@ class ComparisonSpec:
     @property
     def label(self) -> str:
         return f"{self.actual.label} vs {self.expected.label}"
+
+
+@dataclass(frozen=True)
+class ParityCase:
+    """One stable, independently seeded case in a parity suite."""
+
+    ordinal: int
+    case_id: str
+    section_id: str
+    component: str
+    seed: int
+
+
+def _load_requested_device_backend() -> None:
+    """Import an explicitly requested out-of-tree device backend."""
+    requested = os.environ.get("GLM5_PARITY_DEVICE", "auto").lower()
+    if requested == "npu":
+        try:
+            __import__("torch_npu")
+        except ImportError as error:
+            raise RuntimeError(
+                "GLM5_PARITY_DEVICE=npu requires torch_npu to be installed"
+            ) from error
+
+
+def _parity_device() -> tuple[torch.device, Any, str]:
+    """Return the available accelerator through PyTorch's device registry."""
+    _load_requested_device_backend()
+    from torch._utils import _get_available_device_type, _get_device_module
+
+    requested = os.environ.get("GLM5_PARITY_DEVICE", "auto").lower()
+    device_type = _get_available_device_type()
+    if requested != "auto":
+        if device_type != requested:
+            raise RuntimeError(
+                f"requested parity device {requested!r}, but PyTorch selected "
+                f"{device_type!r}"
+            )
+    if device_type is None:
+        raise RuntimeError("GLM-5 parity requires an available accelerator")
+    device_module = _get_device_module(device_type)
+    device = torch.device(device_type, 0)
+    device_module.set_device(device)
+    return device, device_module, device_type
+
+
+def _git_metadata() -> dict[str, str]:
+    """Record source identity without making artifact creation depend on Git."""
+    values: dict[str, str] = {}
+    commands = {
+        "git_commit": ["git", "rev-parse", "HEAD"],
+        "git_branch": ["git", "branch", "--show-current"],
+        "git_status": [
+            "git",
+            "status",
+            "--short",
+            "--untracked-files=no",
+        ],
+        "git_untracked": [
+            "git",
+            "status",
+            "--short",
+            "--untracked-files=normal",
+        ],
+        "git_untracked_source": [
+            "git",
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "--",
+            "*.py",
+            "*.toml",
+        ],
+    }
+    for name, command in commands.items():
+        try:
+            values[name] = subprocess.run(
+                command,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        except (OSError, subprocess.CalledProcessError) as error:
+            values[name] = f"unavailable: {error}"
+    return values
+
+
+class _TeeStream:
+    """Mirror Python text output to the console and an artifact log."""
+
+    def __init__(self, primary: Any, log: Any) -> None:
+        self.primary = primary
+        self.log = log
+        self.encoding = getattr(primary, "encoding", "utf-8")
+
+    def write(self, value: str) -> int:
+        self.primary.write(value)
+        self.log.write(value)
+        return len(value)
+
+    def flush(self) -> None:
+        self.primary.flush()
+        self.log.flush()
+
+    def isatty(self) -> bool:
+        return bool(getattr(self.primary, "isatty", lambda: False)())
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.primary, name)
 
 
 # 测试数据构造类
@@ -763,6 +888,29 @@ def _annotate_known_compute_dtypes(pair: ParityModelPair) -> None:
                 experts._parity_compute_dtype = torch.bfloat16
 
 
+def _annotate_endpoint_compute_dtypes(
+    endpoint: ModelEndpoint,
+    model: torch.nn.Module,
+) -> None:
+    """Apply the same dtype trace annotations to one captured endpoint."""
+    if endpoint.implementation == "hf":
+        for module in model.modules():
+            if module.__class__.__name__ == "GlmMoeDsaRMSNorm":
+                module._parity_compute_dtype = torch.float32
+        for layer in model.model.layers:
+            layer.self_attn._parity_compute_dtype = "mixed(fp32_softmax)"
+            layer.self_attn.indexer._parity_compute_dtype = "mixed(fp32_scores)"
+        return
+    for layer in model.layers.values():
+        layer.attention._parity_compute_dtype = "mixed(fp32_softmax)"
+        layer.attention.indexer._parity_compute_dtype = "mixed(fp32_scores)"
+        if getattr(layer, "moe_enabled", False):
+            layer.moe.router.gate._parity_compute_dtype = torch.float32
+            experts = layer.moe.routed_experts.inner_experts
+            if not hasattr(experts, "_parity_compute_dtype"):
+                experts._parity_compute_dtype = torch.bfloat16
+
+
 def _build_models(
     device: torch.device, *, seed: int = 41
 ) -> tuple[torch.nn.Module, torch.nn.Module]:
@@ -984,6 +1132,11 @@ class ParityRecorder:
             if not value.startswith("hf:"):
                 continue
             path = value.removeprefix("hf:")
+            path = re.sub(
+                r"^(?:fp32|bf16|bfloat16)@[^:]+(?:\[[^]]+\])?:",
+                "",
+                path,
+            )
             for precision in ("fp32:", "bf16:", "bfloat16:"):
                 if path.startswith(precision):
                     path = path.removeprefix(precision)
@@ -3079,6 +3232,15 @@ class TestGlm5Parity(
     ``GLM5_PARITY_MODEL_DIM=2048``
     ``GLM5_PARITY_MODEL_LAYERS=12``
 
+    Decoupled execution additionally supports:
+
+    ``GLM5_PARITY_MODE=capture|compare|paired``
+    ``GLM5_PARITY_ENDPOINT=titan:fp32``
+    ``GLM5_PARITY_ARTIFACT=parity_artifacts/titan-gpu-fp32``
+    ``GLM5_PARITY_REFERENCE_ARTIFACT=parity_artifacts/hf-gpu-fp32``
+    ``GLM5_PARITY_ACTUAL_ARTIFACT=parity_artifacts/titan-npu-fp32``
+    ``GLM5_PARITY_EXPECTED_ARTIFACT=parity_artifacts/titan-gpu-fp32``
+
     The test methods do not construct a precision-specific class.  They use
     the models and batches prepared here.  Fixed runners preserve the original
     checks, while ``compare_component`` can trace any named module path.
@@ -3089,8 +3251,22 @@ class TestGlm5Parity(
     """
 
     # Runtime test configuration.
+    RUN_MODE = os.environ.get("GLM5_PARITY_MODE", "paired").lower()
     ACTUAL_ENDPOINT = os.environ.get("GLM5_PARITY_ACTUAL", "titan:fp32")
     EXPECTED_ENDPOINT = os.environ.get("GLM5_PARITY_EXPECTED", "hf:fp32")
+    CAPTURE_ENDPOINT = os.environ.get(
+        "GLM5_PARITY_ENDPOINT", ACTUAL_ENDPOINT
+    )
+    ARTIFACT_PATH = os.environ.get("GLM5_PARITY_ARTIFACT")
+    REFERENCE_ARTIFACT_PATH = os.environ.get(
+        "GLM5_PARITY_REFERENCE_ARTIFACT"
+    )
+    COMPARE_ACTUAL_ARTIFACT = os.environ.get(
+        "GLM5_PARITY_ACTUAL_ARTIFACT"
+    )
+    COMPARE_EXPECTED_ARTIFACT = os.environ.get(
+        "GLM5_PARITY_EXPECTED_ARTIFACT"
+    )
     PRECISION_OVERRIDE = os.environ.get("GLM5_PARITY_PRECISION")
     RUN_COMPONENTS = os.environ.get("GLM5_PARITY_COMPONENTS", "all")
     LAYER_INDICES = os.environ.get("GLM5_PARITY_LAYERS", "all")
@@ -3134,18 +3310,327 @@ class TestGlm5Parity(
         return cls._endpoint(cls.ACTUAL_ENDPOINT), cls._endpoint(cls.EXPECTED_ENDPOINT)
 
     @classmethod
+    def _configured_cases(cls) -> list[ParityCase]:
+        """Materialize suite order so two servers execute the same cases."""
+        selected = {
+            item.strip().lower()
+            for item in cls.RUN_COMPONENTS.split(",")
+            if item.strip()
+        }
+
+        def enabled(name: str) -> bool:
+            return not selected or "all" in selected or name in selected
+
+        definitions: list[tuple[str, str, str]] = []
+        for component in ("indexer", "router", "attention", "block"):
+            if enabled(component):
+                definitions.append(
+                    (component, f"component-{component}", component)
+                )
+        fixed = {
+            "all",
+            "indexer",
+            "router",
+            "attention",
+            "block",
+            "gradient",
+            "parameters",
+            "logits",
+            "loss",
+            "model",
+            "e2e",
+        }
+        for component in sorted(selected - fixed):
+            safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", component)
+            definitions.append(
+                (f"component:{component}", f"component-{safe}", component)
+            )
+        definitions.append(("end-to-end", "end-to-end", "model"))
+        return [
+            ParityCase(
+                ordinal=index,
+                case_id=test_name,
+                section_id=section_id,
+                component=component,
+                seed=cls._test_seed(cls.DATA_SEED, test_name),
+            )
+            for index, (test_name, section_id, component) in enumerate(definitions)
+        ]
+
+    @classmethod
+    def _capture_test_plan(cls) -> dict[str, Any]:
+        return {
+            "suite": "glm5",
+            "suite_version": GLM5_PARITY_SUITE_VERSION,
+            "cases": [asdict(case) for case in cls.capture_cases],
+            "layers": cls.LAYER_INDICES,
+            "components": cls.RUN_COMPONENTS,
+            "data_case": cls.DATA_CASE,
+            "base_seed": cls.DATA_SEED,
+            "model_seed": cls.MODEL_SEED,
+            "batch_size": cls.BATCH_SIZE,
+            "sequence_length": cls.SEQUENCE_LENGTH,
+            "component_execution": cls.COMPONENT_EXECUTION,
+            "model_size": asdict(cls.model_size),
+        }
+
+    @classmethod
+    def _capture_configuration(cls) -> dict[str, Any]:
+        return {
+            "layers": cls.LAYER_INDICES,
+            "components": cls.RUN_COMPONENTS,
+            "data_case": cls.DATA_CASE,
+            "data_seed": cls.DATA_SEED,
+            "model_seed": cls.MODEL_SEED,
+            "batch_size": cls.BATCH_SIZE,
+            "sequence_length": cls.SEQUENCE_LENGTH,
+            "component_execution": cls.COMPONENT_EXECUTION,
+            "hf_routed_expert_compute": cls.HF_ROUTED_EXPERT_COMPUTE,
+            "titan_routed_expert_compute": cls.TITAN_ROUTED_EXPERT_COMPUTE,
+            "model_size": asdict(cls.model_size),
+        }
+
+    @classmethod
+    def _state_from_reference(
+        cls, reader: ParityArtifactReader
+    ) -> dict[str, torch.Tensor]:
+        state: dict[str, torch.Tensor] = {}
+        for key in sorted(reader.observation_keys):
+            metadata = reader.metadata(key)
+            state_key = metadata.tags.get("state_key")
+            if metadata.scope == "parameters" and state_key:
+                state[state_key] = reader.tensor(key)
+        if not state:
+            raise ParityArtifactError(
+                "reference artifact does not contain canonical model parameters"
+            )
+        return state
+
+    @classmethod
+    def _build_capture_model(
+        cls,
+        endpoint: ModelEndpoint,
+        canonical_state: dict[str, torch.Tensor] | None,
+    ) -> tuple[torch.nn.Module, dict[str, torch.Tensor]]:
+        titan_config = _titan_config(cls.model_size)
+        cls.adapter = Glm5StateDictAdapter(titan_config, hf_assets_path=None)
+        if canonical_state is None:
+            if _TRANSFORMERS_IMPORT_ERROR is not None:
+                raise RuntimeError(
+                    "creating a standalone parity fixture requires Transformers: "
+                    f"{_TRANSFORMERS_IMPORT_ERROR!r}"
+                )
+            torch.manual_seed(cls.MODEL_SEED)
+            source_model = GlmMoeDsaForCausalLM(
+                _hf_config(cls.model_size)
+            ).float()
+            canonical_state = cls.adapter.from_hf(source_model.state_dict())
+            if endpoint.implementation == "hf":
+                model = source_model
+            else:
+                model = titan_config.build()
+                model.init_states()
+                model.load_state_dict(canonical_state, strict=True)
+                del source_model
+        elif endpoint.implementation == "hf":
+            if _TRANSFORMERS_IMPORT_ERROR is not None:
+                raise RuntimeError(
+                    "capturing an HF endpoint requires Transformers: "
+                    f"{_TRANSFORMERS_IMPORT_ERROR!r}"
+                )
+            model = GlmMoeDsaForCausalLM(_hf_config(cls.model_size)).float()
+            incompatible = model.load_state_dict(
+                cls.adapter.to_hf(canonical_state), strict=False
+            )
+            unsupported_missing = set(incompatible.missing_keys).difference(
+                cls.adapter._IGNORED_HF_KEYS
+            )
+            if unsupported_missing or incompatible.unexpected_keys:
+                raise RuntimeError(
+                    "reference state is incompatible with the HF endpoint: "
+                    f"missing={sorted(unsupported_missing)}, "
+                    f"unexpected={sorted(incompatible.unexpected_keys)}"
+                )
+        else:
+            model = titan_config.build()
+            model.init_states()
+            model.load_state_dict(canonical_state, strict=True)
+
+        model.to(device=cls.device, dtype=endpoint.precision.dtype).eval()
+        for name, parameter in model.named_parameters():
+            if name.endswith("indexer.weights_proj.weight"):
+                parameter.data = parameter.data.float()
+        effective_state = dict(model.named_parameters())
+        if endpoint.implementation == "hf":
+            effective_state = cls.adapter.from_hf(effective_state)
+        return model, {
+            name: value.detach().cpu()
+            for name, value in effective_state.items()
+        }
+
+    @classmethod
+    def _set_up_capture_class(cls) -> None:
+        if not cls.ARTIFACT_PATH:
+            raise ValueError(
+                "GLM5_PARITY_MODE=capture requires GLM5_PARITY_ARTIFACT"
+            )
+        if Path(cls.ARTIFACT_PATH).exists():
+            raise FileExistsError(
+                f"GLM5_PARITY_ARTIFACT already exists: {cls.ARTIFACT_PATH}"
+            )
+        try:
+            cls.device, cls.device_module, cls.device_type = _parity_device()
+        except RuntimeError as error:
+            cls.gpu_ready = False
+            cls.gpu_skip_reason = str(error)
+            return
+        cls.gpu_ready = True
+        cls.gpu_skip_reason = ""
+        cls.capture_endpoint = cls._endpoint(cls.CAPTURE_ENDPOINT)
+        cls.actual_endpoint = cls.capture_endpoint
+        cls.expected_endpoint = cls.capture_endpoint
+        cls.precision = cls.capture_endpoint.precision
+        cls.model_size = ParityModelSize.from_env()
+        cls.model_size.validate(sequence_length=cls.SEQUENCE_LENGTH)
+        cls.capture_cases = cls._configured_cases()
+        cls.capture_plan = cls._capture_test_plan()
+        cls.reference_reader = (
+            ParityArtifactReader(cls.REFERENCE_ARTIFACT_PATH)
+            if cls.REFERENCE_ARTIFACT_PATH
+            else None
+        )
+        if (
+            cls.reference_reader is not None
+            and cls.reference_reader.manifest.get("status") != "success"
+        ):
+            raise ParityArtifactError(
+                "GLM5_PARITY_REFERENCE_ARTIFACT must be a successful run"
+            )
+        canonical_state = (
+            cls._state_from_reference(cls.reference_reader)
+            if cls.reference_reader is not None
+            else None
+        )
+        cls.capture_model, source_state = cls._build_capture_model(
+            cls.capture_endpoint, canonical_state
+        )
+        if (
+            cls.capture_endpoint.implementation == "hf"
+            and cls.HF_ROUTED_EXPERT_COMPUTE != "model"
+        ):
+            _set_hf_routed_expert_compute_dtype(
+                cls.capture_model,
+                torch.bfloat16,
+                use_grouped_mm=cls.HF_ROUTED_EXPERT_COMPUTE == "grouped_mm",
+            )
+        if (
+            cls.capture_endpoint.implementation == "titan"
+            and cls.TITAN_ROUTED_EXPERT_COMPUTE == "fp32"
+        ):
+            if cls.capture_endpoint.precision is not FP32:
+                raise ValueError(
+                    "the TorchTitan FP32 routed-expert experiment requires fp32"
+                )
+            _set_titan_routed_expert_compute_dtype(
+                cls.capture_model, torch.float32
+            )
+        _annotate_endpoint_compute_dtypes(
+            cls.capture_endpoint, cls.capture_model
+        )
+        cls.num_model_parameters = sum(
+            parameter.numel() for parameter in cls.capture_model.parameters()
+        )
+        cls.capture_batches: dict[str, ParityBatch] = {}
+        fixture_fingerprints: dict[str, str] = {
+            f"model/{name}": tensor_digest(value)
+            for name, value in sorted(source_state.items())
+        }
+        if cls.reference_reader is not None:
+            reference_plan = cls.reference_reader.manifest["test_plan"]
+            if json_digest(reference_plan) != json_digest(cls.capture_plan):
+                raise ParityArtifactError(
+                    "reference artifact test plan does not match this capture"
+                )
+            reference_configuration = cls.reference_reader.manifest[
+                "configuration_digest"
+            ]
+            if reference_configuration != json_digest(
+                cls._capture_configuration()
+            ):
+                raise ParityArtifactError(
+                    "reference artifact configuration does not match this capture"
+                )
+        for case in cls.capture_cases:
+            if cls.reference_reader is None:
+                batch = ParityDataFactory.make(
+                    device=torch.device("cpu"),
+                    dtype=torch.float32,
+                    batch_size=cls.BATCH_SIZE,
+                    sequence_length=cls.SEQUENCE_LENGTH,
+                    hidden_size=cls.model_size.dim,
+                    vocab_size=cls.model_size.vocab_size,
+                    seed=case.seed,
+                    data_case=cls.DATA_CASE,
+                    make_tokens=True,
+                )
+            else:
+                prefix = f"fixture/data/{case.case_id}"
+                batch = ParityBatch(
+                    hidden_states=cls.reference_reader.tensor(
+                        f"{prefix}/hidden_states"
+                    ),
+                    positions=cls.reference_reader.tensor(f"{prefix}/positions"),
+                    causal_mask=cls.reference_reader.tensor(f"{prefix}/causal_mask"),
+                    hf_position_embeddings=(torch.empty(0), torch.empty(0)),
+                    tokens=cls.reference_reader.tensor(f"{prefix}/tokens"),
+                )
+            cls.capture_batches[case.case_id] = batch
+            for field_name in ("hidden_states", "positions", "causal_mask", "tokens"):
+                value = getattr(batch, field_name)
+                assert value is not None
+                fixture_fingerprints[f"data/{case.case_id}/{field_name}"] = (
+                    tensor_digest(value)
+                )
+        computed_fixture_digest = json_digest(fixture_fingerprints)
+        cls.fixture_digest = (
+            cls.reference_reader.manifest["fixture_digest"]
+            if cls.reference_reader is not None
+            else computed_fixture_digest
+        )
+        if (
+            cls.reference_reader is not None
+            and computed_fixture_digest != cls.fixture_digest
+        ):
+            raise ParityArtifactError(
+                "loaded reference tensors do not reproduce its fixture digest"
+            )
+        del source_state
+
+    @classmethod
     def setUpClass(cls) -> None:
+        if cls.RUN_MODE not in {"paired", "capture", "compare"}:
+            raise ValueError(
+                "GLM5_PARITY_MODE must be paired, capture, or compare"
+            )
+        if cls.RUN_MODE == "compare":
+            cls.gpu_ready = True
+            cls.gpu_skip_reason = ""
+            return
+        if cls.RUN_MODE == "capture":
+            cls._set_up_capture_class()
+            return
         if _TRANSFORMERS_IMPORT_ERROR is not None:
             cls.gpu_ready = False
             cls.gpu_skip_reason = f"Transformers unavailable: {_TRANSFORMERS_IMPORT_ERROR!r}"
             return
-        if not torch.cuda.is_available():
+        try:
+            cls.device, cls.device_module, cls.device_type = _parity_device()
+        except RuntimeError as error:
             cls.gpu_ready = False
-            cls.gpu_skip_reason = "GLM-5 parity requires CUDA"
+            cls.gpu_skip_reason = str(error)
             return
 
         cls.gpu_ready = True
-        cls.device = torch.device("cuda")
         cls.actual_endpoint, cls.expected_endpoint = cls._configured_endpoints()
         cls.precision = cls.actual_endpoint.precision
         cls.model_size = ParityModelSize.from_env()
@@ -3252,6 +3737,15 @@ class TestGlm5Parity(
         )
         cls._active_data_seed = cls.DATA_SEED
 
+    def setUp(self) -> None:
+        if (
+            self.RUN_MODE in {"capture", "compare"}
+            and self._testMethodName != "test_configured_precision_suite"
+        ):
+            self.skipTest(
+                f"GLM5_PARITY_MODE={self.RUN_MODE} uses the configured suite entry point"
+            )
+
     @staticmethod
     def _test_seed(base_seed: int, test_name: str) -> int:
         offset = sum(
@@ -3286,14 +3780,1242 @@ class TestGlm5Parity(
         self.hf_position_embeddings = self.batch.hf_position_embeddings
 
     def _model(self, endpoint: ModelEndpoint) -> torch.nn.Module:
+        if self.RUN_MODE == "capture":
+            if endpoint != self.capture_endpoint:
+                raise KeyError(
+                    f"capture run owns only endpoint {self.capture_endpoint.label}"
+                )
+            return self.capture_model
         return self.models[(endpoint.implementation, endpoint.precision.name)]
 
     def _batch_for(self, endpoint: ModelEndpoint) -> ParityBatch:
+        if self.RUN_MODE == "capture":
+            return self._capture_batch(self._active_capture_case)
         return ParityDataFactory.cast(
             self.base_batch,
             model=self._model(endpoint),
             dtype=endpoint.precision.dtype,
         )
+
+    def _capture_batch(self, case: ParityCase) -> ParityBatch:
+        source = self.capture_batches[case.case_id]
+        device_batch = ParityBatch(
+            hidden_states=source.hidden_states.to(self.device),
+            positions=source.positions.to(self.device),
+            causal_mask=source.causal_mask.to(self.device),
+            hf_position_embeddings=(
+                torch.empty(0, device=self.device),
+                torch.empty(0, device=self.device),
+            ),
+            tokens=(
+                source.tokens.to(self.device)
+                if source.tokens is not None
+                else None
+            ),
+        )
+        return ParityDataFactory.cast(
+            device_batch,
+            model=self.capture_model,
+            dtype=self.capture_endpoint.precision.dtype,
+        )
+
+    def _new_capture_writer(self) -> ParityArtifactWriter:
+        run_id = os.environ.get(
+            "GLM5_PARITY_RUN_ID",
+            datetime.now().strftime("%Y%m%d-%H%M%S-%f"),
+        )
+        try:
+            device_name = self.device_module.get_device_name(self.device)
+        except (AttributeError, RuntimeError):
+            device_name = str(self.device)
+        environment: dict[str, Any] = runtime_metadata()
+        environment.update(_git_metadata())
+        environment["argv"] = repr(sys.argv)
+        environment["device_type"] = self.device_type
+        environment["device_name"] = device_name
+        for name in (
+            "CUDA_VISIBLE_DEVICES",
+            "ASCEND_RT_VISIBLE_DEVICES",
+            "ASCEND_HOME_PATH",
+            "ASCEND_OPP_PATH",
+            "PYTORCH_ALLOC_CONF",
+            "PYTORCH_NPU_ALLOC_CONF",
+            "RANK",
+            "LOCAL_RANK",
+            "WORLD_SIZE",
+        ):
+            if name in os.environ:
+                environment[f"env_{name}"] = os.environ[name]
+        if self.device_type == "npu":
+            try:
+                import torch_npu
+
+                environment["torch_npu"] = getattr(
+                    torch_npu, "__version__", "unknown"
+                )
+            except ImportError:
+                environment["torch_npu"] = "unavailable"
+        identity = EndpointIdentity(
+            implementation=self.capture_endpoint.implementation,
+            precision=self.capture_endpoint.precision.name,
+            device_type=self.device_type,
+            device_name=device_name,
+            run_id=run_id,
+            rank=int(os.environ.get("RANK", "0")),
+            world_size=int(os.environ.get("WORLD_SIZE", "1")),
+        )
+        return ParityArtifactWriter(
+            self.ARTIFACT_PATH,
+            suite="glm5",
+            suite_version=GLM5_PARITY_SUITE_VERSION,
+            endpoint=identity,
+            test_plan=self.capture_plan,
+            configuration=self._capture_configuration(),
+            fixture_digest=self.fixture_digest,
+            environment=environment,
+        )
+
+    def _capture_add(
+        self,
+        *,
+        key: str,
+        section_id: str,
+        tensor: torch.Tensor,
+        scope: str,
+        component: str,
+        layer: int | str,
+        value_kind: str = "tensor",
+        module_path: str = "",
+        parent_path: str = "",
+        level: int = 0,
+        node_kind: str = "checkpoint",
+        checkpoint: bool = True,
+        dtype_flow: str = "",
+        positions_key: str = "",
+        compare: bool = True,
+        tags: dict[str, str] | None = None,
+    ) -> None:
+        effective_tags = dict(tags or {})
+        active_case = getattr(self, "_active_capture_case", None)
+        if active_case is not None:
+            effective_tags.setdefault("case_id", active_case.case_id)
+            effective_tags.setdefault("case_ordinal", str(active_case.ordinal))
+            effective_tags.setdefault("case_seed", str(active_case.seed))
+        self.capture_writer.add(
+            ObservationMetadata(
+                key=key,
+                section_id=section_id,
+                scope=scope,
+                component=component,
+                layer=layer,
+                value_kind=value_kind,
+                module_path=module_path,
+                parent_path=parent_path,
+                level=level,
+                node_kind=node_kind,
+                checkpoint=checkpoint,
+                dtype_flow=dtype_flow,
+                positions_key=positions_key,
+                compare=compare,
+                tags=effective_tags,
+            ),
+            tensor,
+        )
+
+    def _capture_fixture_batch(self, case: ParityCase) -> None:
+        batch = self.capture_batches[case.case_id]
+        prefix = f"fixture/data/{case.case_id}"
+        for field_name in ("hidden_states", "positions", "causal_mask", "tokens"):
+            value = getattr(batch, field_name)
+            assert value is not None
+            self._capture_add(
+                key=f"{prefix}/{field_name}",
+                section_id="fixture",
+                tensor=value,
+                scope="fixture",
+                component=field_name,
+                layer="global",
+                value_kind="fixture",
+                compare=False,
+                tags={"case_id": case.case_id},
+            )
+
+    def _capture_recursive_observations(
+        self,
+        *,
+        section_id: str,
+        trace: RecursiveModuleTrace,
+        include_gradients: bool,
+        component_filter: str | None = None,
+    ) -> None:
+        endpoint = self.capture_endpoint
+        label = endpoint.label
+        normalized_filter = (
+            component_filter.strip().strip(".")
+            if component_filter is not None
+            else None
+        )
+        logical_values: dict[str, tuple[str, torch.Tensor, str]] = {}
+        for endpoint_path, value in trace.activations[label].items():
+            logical_path = self._logical_activation_path(endpoint, endpoint_path)
+            base_path = logical_path.split("[", 1)[0]
+            target_path = (
+                base_path
+                if re.fullmatch(r"layers\.\d+", base_path)
+                or base_path.endswith((".attention", ".moe", ".feed_forward"))
+                else logical_path
+            )
+            logical_values.setdefault(
+                target_path,
+                (
+                    endpoint_path,
+                    value,
+                    trace.dtype_flows[label].get(endpoint_path, ""),
+                ),
+            )
+        for logical_path, (endpoint_path, value, dtype_flow) in sorted(
+            logical_values.items()
+        ):
+            base_path = logical_path.split("[", 1)[0]
+            if normalized_filter:
+                layer_match = re.match(r"layers\.(\d+)", base_path)
+                targets = (
+                    {
+                        f"layers.{layer}.{normalized_filter}"
+                        for layer in self._selected_layers()
+                    }
+                    if layer_match
+                    else {normalized_filter}
+                )
+                if not any(
+                    base_path == target or base_path.startswith(f"{target}.")
+                    for target in targets
+                ) and not base_path.endswith(f".{normalized_filter}"):
+                    continue
+            layer_match = re.match(r"layers\.(\d+)", base_path)
+            layer: int | str = int(layer_match.group(1)) if layer_match else "global"
+            parent_path = base_path.rpartition(".")[0]
+            component = logical_path.rsplit(".", 1)[-1]
+            checkpoint = base_path.endswith(
+                (".attention", ".moe", ".feed_forward")
+            ) or bool(normalized_filter and base_path.endswith(f".{normalized_filter}"))
+            is_discrete = base_path.endswith(".attention.indexer") or value.dtype in {
+                torch.int8,
+                torch.int16,
+                torch.int32,
+                torch.int64,
+                torch.uint8,
+                torch.bool,
+            }
+            positions_key = (
+                f"fixture/data/{self._active_capture_case.case_id}/positions"
+                if is_discrete and value.ndim == 3
+                else ""
+            )
+            self._capture_add(
+                key=f"{section_id}/activation/{logical_path}",
+                section_id=section_id,
+                tensor=value,
+                scope="trace",
+                component=component,
+                layer=layer,
+                value_kind="discrete" if is_discrete else "tensor",
+                module_path=endpoint_path,
+                parent_path=parent_path,
+                level=len(logical_path.split(".")) - 1,
+                node_kind=(
+                    "discrete_checkpoint"
+                    if is_discrete
+                    else "composition_checkpoint" if checkpoint else "activation"
+                ),
+                checkpoint=checkpoint,
+                dtype_flow=dtype_flow,
+                positions_key=positions_key,
+            )
+        if not include_gradients:
+            return
+        logical_gradients: dict[str, tuple[str, torch.Tensor]] = {}
+        for endpoint_path, value in trace.gradients[label].items():
+            logical_path = self._logical_activation_path(endpoint, endpoint_path)
+            base_path = logical_path.split("[", 1)[0]
+            target_path = (
+                base_path
+                if base_path.endswith((".attention", ".moe", ".feed_forward"))
+                else logical_path
+            )
+            logical_gradients.setdefault(target_path, (endpoint_path, value))
+        for logical_path, (endpoint_path, value) in sorted(
+            logical_gradients.items()
+        ):
+            base_path = logical_path.split("[", 1)[0]
+            layer_match = re.match(r"layers\.(\d+)", base_path)
+            layer = int(layer_match.group(1)) if layer_match else "global"
+            parent_path = base_path.rpartition(".")[0]
+            component = logical_path.rsplit(".", 1)[-1]
+            checkpoint = base_path.endswith(
+                (".attention", ".moe", ".feed_forward")
+            )
+            self._capture_add(
+                key=f"{section_id}/activation_gradient/{logical_path}",
+                section_id=section_id,
+                tensor=value,
+                scope="activation_gradient",
+                component=component,
+                layer=layer,
+                module_path=f"{endpoint_path}.grad",
+                parent_path=parent_path,
+                level=len(logical_path.split(".")) - 1,
+                node_kind=(
+                    "gradient_checkpoint" if checkpoint else "gradient_activation"
+                ),
+                checkpoint=checkpoint,
+            )
+
+    def _capture_component_case(self, case: ParityCase) -> None:
+        endpoint = self.capture_endpoint
+        model = self.capture_model
+        batch = self._capture_batch(case)
+        layers = model.model.layers if endpoint.implementation == "hf" else model.layers
+        layer_indices = self._selected_layers()
+        component = case.component
+        if component in {"indexer", "router", "attention", "block"}:
+            self._capture_exact_component_checkpoints(
+                case=case,
+                batch=batch,
+                layer_indices=layer_indices,
+            )
+        normalized = self._normalize_model_component(component)
+        if normalized in TOP_LEVEL_COMPONENTS:
+            with RecursiveModuleTrace.install(
+                {endpoint: model}, [], include_model_modules=True
+            ) as trace:
+                with torch.no_grad():
+                    _run_causal_lm_endpoint(model, endpoint, batch)
+            self._capture_recursive_observations(
+                section_id=case.section_id,
+                trace=trace,
+                include_gradients=False,
+                component_filter=normalized,
+            )
+            return
+
+        component_filter = self._normalize_component_name(
+            layer_indices[0], component
+        )
+        with RecursiveModuleTrace.install(
+            {endpoint: model}, layer_indices
+        ) as trace:
+            with torch.no_grad():
+                current = batch.hidden_states
+                for layer_index in layer_indices:
+                    layer = (
+                        layers[layer_index]
+                        if endpoint.implementation == "hf"
+                        else layers[str(layer_index)]
+                    )
+                    if endpoint.implementation == "hf":
+                        output = layer(
+                            current,
+                            attention_mask=batch.causal_mask,
+                            position_ids=batch.positions,
+                            position_embeddings=batch.hf_position_embeddings,
+                            use_cache=False,
+                        )
+                    else:
+                        output = layer(
+                            current,
+                            batch.causal_mask,
+                            batch.positions,
+                        )
+                    if self.COMPONENT_EXECUTION.lower() == "sequential":
+                        value = (
+                            output[0]
+                            if endpoint.implementation == "hf"
+                            and isinstance(output, (tuple, list))
+                            else output
+                        )
+                        current = _first_tensor(value)
+                    else:
+                        current = batch.hidden_states
+        self._capture_recursive_observations(
+            section_id=case.section_id,
+            trace=trace,
+            include_gradients=False,
+            component_filter=component_filter or None,
+        )
+
+    def _capture_probe(
+        self,
+        *,
+        case: ParityCase,
+        layer: int,
+        name: str,
+        value: torch.Tensor | None,
+    ) -> torch.Tensor:
+        key = f"fixture/probe/{case.case_id}/layers.{layer}/{name}"
+        if self.reference_reader is not None:
+            probe = self.reference_reader.tensor(key).to(self.device)
+        else:
+            if value is None:
+                raise ValueError(f"probe {key} requires a generated value")
+            probe = value.detach()
+        self._capture_add(
+            key=key,
+            section_id="fixture",
+            tensor=probe,
+            scope="fixture",
+            component=name,
+            layer=layer,
+            value_kind="fixture",
+            compare=False,
+            tags={"case_id": case.case_id, "probe": name},
+        )
+        return probe
+
+    def _capture_exact_component_checkpoints(
+        self,
+        *,
+        case: ParityCase,
+        batch: ParityBatch,
+        layer_indices: list[int],
+    ) -> None:
+        endpoint = self.capture_endpoint
+        component = case.component
+        for layer_index in layer_indices:
+            layer = (
+                self.capture_model.model.layers[layer_index]
+                if endpoint.implementation == "hf"
+                else self.capture_model.layers[str(layer_index)]
+            )
+            with torch.no_grad():
+                generated_normalized = (
+                    layer.input_layernorm(batch.hidden_states)
+                    if endpoint.implementation == "hf"
+                    else layer.attention_norm(batch.hidden_states)
+                )
+                normalized = self._capture_probe(
+                    case=case,
+                    layer=layer_index,
+                    name="normalized_input",
+                    value=generated_normalized,
+                )
+                parent_path = f"layers.{layer_index}"
+                if component == "indexer":
+                    attention = (
+                        layer.self_attn
+                        if endpoint.implementation == "hf"
+                        else layer.attention
+                    )
+                    q_residual = (
+                        attention.q_a_layernorm(attention.q_a_proj(normalized))
+                        if endpoint.implementation == "hf"
+                        else attention.q_norm(attention.wq_a(normalized))
+                    )
+                    self._capture_add(
+                        key=(
+                            f"{case.section_id}/exact/"
+                            f"layers.{layer_index}.attention.q_residual"
+                        ),
+                        section_id=case.section_id,
+                        tensor=q_residual,
+                        scope="component",
+                        component="q_residual",
+                        layer=layer_index,
+                        module_path=f"{parent_path}.attention.q_residual",
+                        parent_path=f"{parent_path}.attention",
+                        level=4,
+                        node_kind="activation_checkpoint",
+                        tags={
+                            "rtol": (
+                                "1e-6"
+                                if endpoint.precision is FP32
+                                else str(endpoint.precision.rtol)
+                            ),
+                            "atol": (
+                                "1e-7"
+                                if endpoint.precision is FP32
+                                else str(endpoint.precision.atol)
+                            ),
+                        },
+                    )
+                    common_q_residual = self._capture_probe(
+                        case=case,
+                        layer=layer_index,
+                        name="common_q_residual",
+                        value=q_residual,
+                    )
+                    topk = (
+                        attention.indexer(
+                            normalized,
+                            common_q_residual,
+                            batch.hf_position_embeddings,
+                            batch.causal_mask[:, 0],
+                            batch.positions,
+                        )
+                        if endpoint.implementation == "hf"
+                        else attention.indexer(
+                            normalized,
+                            common_q_residual,
+                            batch.positions,
+                            batch.causal_mask[:, 0],
+                        )
+                    )
+                    self._capture_add(
+                        key=(
+                            f"{case.section_id}/exact/"
+                            f"layers.{layer_index}.attention.indexer"
+                        ),
+                        section_id=case.section_id,
+                        tensor=topk,
+                        scope="component",
+                        component="indexer",
+                        layer=layer_index,
+                        value_kind="discrete",
+                        module_path=f"{parent_path}.attention.indexer",
+                        parent_path=f"{parent_path}.attention",
+                        level=4,
+                        node_kind="discrete_checkpoint",
+                        positions_key=f"fixture/data/{case.case_id}/positions",
+                    )
+                elif component == "router":
+                    if endpoint.implementation == "hf":
+                        if not hasattr(layer.mlp, "gate"):
+                            continue
+                        _, weights, indices = layer.mlp.gate(normalized)
+                    else:
+                        if not getattr(layer, "moe_enabled", False):
+                            continue
+                        weights, indices, _ = layer.moe.router(
+                            normalized, layer.moe.expert_bias_E
+                        )
+                    indices = indices.view(
+                        normalized.shape[0], normalized.shape[1], -1
+                    )
+                    weights = weights.view_as(indices)
+                    for name, value, kind in (
+                        ("indices", indices, "discrete"),
+                        ("weights", weights, "tensor"),
+                    ):
+                        self._capture_add(
+                            key=(
+                                f"{case.section_id}/exact/"
+                                f"layers.{layer_index}.moe.router.{name}"
+                            ),
+                            section_id=case.section_id,
+                            tensor=value,
+                            scope="component",
+                            component=f"router_{name}",
+                            layer=layer_index,
+                            value_kind=kind,
+                            module_path=f"{parent_path}.moe.router.{name}",
+                            parent_path=f"{parent_path}.moe",
+                            level=4,
+                            node_kind=(
+                                "discrete_checkpoint"
+                                if kind == "discrete"
+                                else "activation_checkpoint"
+                            ),
+                            tags=(
+                                {"rtol": "1e-6", "atol": "1e-7"}
+                                if name == "weights"
+                                else None
+                            ),
+                        )
+                elif component == "attention":
+                    output = (
+                        layer.self_attn(
+                            hidden_states=normalized,
+                            position_embeddings=batch.hf_position_embeddings,
+                            attention_mask=batch.causal_mask,
+                            position_ids=batch.positions,
+                        )[0]
+                        if endpoint.implementation == "hf"
+                        else layer.attention(
+                            normalized, batch.causal_mask, batch.positions
+                        )
+                    )
+                    self._capture_add(
+                        key=f"{case.section_id}/exact/{parent_path}.attention",
+                        section_id=case.section_id,
+                        tensor=output,
+                        scope="component",
+                        component="attention",
+                        layer=layer_index,
+                        module_path=f"{parent_path}.attention",
+                        parent_path=parent_path,
+                        level=3,
+                        node_kind="attention_checkpoint",
+                    )
+                else:
+                    output = (
+                        layer(
+                            batch.hidden_states,
+                            attention_mask=batch.causal_mask,
+                            position_ids=batch.positions,
+                            position_embeddings=batch.hf_position_embeddings,
+                            use_cache=False,
+                        )[0]
+                        if endpoint.implementation == "hf"
+                        else layer(
+                            batch.hidden_states,
+                            batch.causal_mask,
+                            batch.positions,
+                        )
+                    )
+                    self._capture_add(
+                        key=f"{case.section_id}/exact/{parent_path}",
+                        section_id=case.section_id,
+                        tensor=output,
+                        scope="composition",
+                        component="decoder_block",
+                        layer=layer_index,
+                        module_path=parent_path,
+                        parent_path="layers",
+                        level=2,
+                        node_kind="layer_checkpoint",
+                    )
+
+    def _capture_endpoint_trace(
+        self,
+        case: ParityCase,
+        trace: EndpointTrace,
+    ) -> None:
+        endpoint = self.capture_endpoint
+        label = endpoint.label
+        positions_key = f"fixture/data/{case.case_id}/positions"
+        groups: tuple[tuple[str, dict[int, torch.Tensor], str], ...] = (
+            ("decoder_block", trace.blocks[label], "tensor"),
+            ("indexer", trace.indexer[label], "discrete"),
+            ("router", trace.router[label], "discrete"),
+            ("router_weights", trace.router_weights[label], "tensor"),
+            ("expert_load", trace.expert_load[label], "discrete"),
+            ("moe_input", trace.moe_inputs[label], "tensor"),
+        )
+        for component, values, value_kind in groups:
+            for layer, value in sorted(values.items()):
+                parent_path = (
+                    f"layers.{layer}.attention"
+                    if component == "indexer"
+                    else f"layers.{layer}.moe"
+                    if component in {
+                        "router",
+                        "router_weights",
+                        "expert_load",
+                        "moe_input",
+                    }
+                    else "layers"
+                )
+                logical_path = (
+                    f"layers.{layer}"
+                    if component == "decoder_block"
+                    else f"{parent_path}.{component}"
+                )
+                self._capture_add(
+                    key=f"{case.section_id}/checkpoint/{logical_path}",
+                    section_id=case.section_id,
+                    tensor=value,
+                    scope="configured",
+                    component=component,
+                    layer=layer,
+                    value_kind=value_kind,
+                    module_path=logical_path,
+                    parent_path=parent_path,
+                    level=2 if component == "decoder_block" else 4,
+                    node_kind=(
+                        "discrete_checkpoint"
+                        if value_kind == "discrete"
+                        else "activation_checkpoint"
+                    ),
+                    positions_key=(
+                        positions_key
+                        if value_kind == "discrete" and value.ndim == 3
+                        else ""
+                    ),
+                )
+
+    def _capture_parameters_and_gradients(self, section_id: str) -> None:
+        endpoint = self.capture_endpoint
+        state = self._canonical_state(endpoint)
+        for state_key, value in sorted(state.items()):
+            layer_match = re.match(r"layers\.(\d+)", state_key)
+            layer: int | str = (
+                int(layer_match.group(1)) if layer_match else "global"
+            )
+            self._capture_add(
+                key=f"{section_id}/parameter/{state_key}",
+                section_id=section_id,
+                tensor=value,
+                scope="parameters",
+                component="state_dict",
+                layer=layer,
+                module_path=state_key,
+                parent_path=state_key.rpartition(".")[0],
+                level=len(state_key.split(".")) - 1,
+                node_kind="parameter",
+                tags={"state_key": state_key},
+            )
+        gradients, missing = self._canonical_gradient(endpoint)
+        for state_key, parameter_value in sorted(state.items()):
+            layer_match = re.match(r"layers\.(\d+)", state_key)
+            layer = int(layer_match.group(1)) if layer_match else "global"
+            is_missing = state_key in missing or state_key not in gradients
+            value = (
+                torch.zeros_like(parameter_value)
+                if is_missing
+                else gradients[state_key]
+            )
+            self._capture_add(
+                key=f"{section_id}/gradient/{state_key}",
+                section_id=section_id,
+                tensor=value,
+                scope="gradient",
+                component="gradient",
+                layer=layer,
+                module_path=f"{state_key}.grad",
+                parent_path=state_key.rpartition(".")[0],
+                level=len(state_key.split(".")) - 1,
+                node_kind="gradient",
+                tags={
+                    "state_key": state_key,
+                    "gradient_missing": "true" if is_missing else "false",
+                },
+            )
+        self.capture_missing_gradients = sorted(missing)
+
+    def _capture_common_moe_replay(
+        self,
+        case: ParityCase,
+        endpoint_trace: EndpointTrace,
+    ) -> None:
+        endpoint = self.capture_endpoint
+        label = endpoint.label
+        for layer_index in self._selected_layers():
+            layer = (
+                self.capture_model.model.layers[layer_index]
+                if endpoint.implementation == "hf"
+                else self.capture_model.layers[str(layer_index)]
+            )
+            is_moe = (
+                hasattr(layer.mlp, "gate")
+                if endpoint.implementation == "hf"
+                else getattr(layer, "moe_enabled", False)
+            )
+            if not is_moe:
+                continue
+            generated = endpoint_trace.moe_inputs[label].get(layer_index)
+            common_input = self._capture_probe(
+                case=case,
+                layer=layer_index,
+                name="common_moe_input",
+                value=generated.float() if generated is not None else None,
+            )
+            with torch.no_grad():
+                routed, weights, indices, expert_load = (
+                    self._run_routed_experts_on_input(
+                        endpoint, layer_index, common_input
+                    )
+                )
+            parent_path = f"layers.{layer_index}.moe.routed_experts"
+            for name, value, value_kind in (
+                ("common_input", routed, "tensor"),
+                ("weights", weights, "tensor"),
+                ("indices", indices, "discrete"),
+                ("expert_load", expert_load, "discrete"),
+            ):
+                self._capture_add(
+                    key=(
+                        f"{case.section_id}/causal_replay/"
+                        f"{parent_path}.{name}"
+                    ),
+                    section_id=case.section_id,
+                    tensor=value,
+                    scope="causal_replay",
+                    component=name,
+                    layer=layer_index,
+                    value_kind=value_kind,
+                    module_path=f"{parent_path}.{name}",
+                    parent_path=parent_path,
+                    level=4,
+                    node_kind=(
+                        "discrete_checkpoint"
+                        if value_kind == "discrete"
+                        else "activation_checkpoint"
+                    ),
+                )
+
+    def _capture_end_to_end_case(self, case: ParityCase) -> None:
+        endpoint = self.capture_endpoint
+        model = self.capture_model
+        batch = self._capture_batch(case)
+        layer_indices = self._selected_layers()
+        model.zero_grad(set_to_none=True)
+        with (
+            EndpointTrace.install({endpoint: model}, layer_indices) as endpoint_trace,
+            RecursiveModuleTrace.install(
+                {endpoint: model}, layer_indices, include_model_modules=True
+            ) as module_trace,
+        ):
+            logits, loss = _run_causal_lm_endpoint(model, endpoint, batch)
+            loss.backward()
+        self._capture_recursive_observations(
+            section_id=case.section_id,
+            trace=module_trace,
+            include_gradients=True,
+        )
+        self._capture_endpoint_trace(case, endpoint_trace)
+        self._capture_common_moe_replay(case, endpoint_trace)
+        self._capture_add(
+            key=f"{case.section_id}/output/logits",
+            section_id=case.section_id,
+            tensor=logits,
+            scope="configured",
+            component="logits",
+            layer="all",
+            module_path="lm_head",
+            parent_path="model",
+            level=1,
+            node_kind="logits_checkpoint",
+        )
+        self._capture_add(
+            key=f"{case.section_id}/output/loss",
+            section_id=case.section_id,
+            tensor=loss,
+            scope="configured",
+            component="loss",
+            layer="all",
+            module_path="loss",
+            parent_path="model",
+            level=1,
+            node_kind="loss_checkpoint",
+        )
+        self._capture_parameters_and_gradients(case.section_id)
+
+    def _run_capture_suite(self) -> None:
+        self.capture_writer = self._new_capture_writer()
+        artifact_parent = Path(self.ARTIFACT_PATH).parent
+        artifact_parent.mkdir(parents=True, exist_ok=True)
+        log_file = tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            prefix="glm5-parity-",
+            suffix=".log",
+            dir=artifact_parent,
+            delete=False,
+        )
+        log_path = Path(log_file.name)
+        failure: Exception | None = None
+        try:
+            with (
+                log_file,
+                redirect_stdout(_TeeStream(sys.stdout, log_file)),
+                redirect_stderr(_TeeStream(sys.stderr, log_file)),
+            ):
+                print(
+                    f"Starting GLM-5 parity capture: "
+                    f"{self.capture_endpoint.label}@{self.device_type}"
+                )
+                try:
+                    for case in self.capture_cases:
+                        self._active_capture_case = case
+                        self._active_data_seed = case.seed
+                        print(
+                            f"capture case {case.ordinal}: {case.case_id} "
+                            f"seed={case.seed}"
+                        )
+                        self._capture_fixture_batch(case)
+                        if case.section_id == "end-to-end":
+                            self._capture_end_to_end_case(case)
+                        else:
+                            self._capture_component_case(case)
+                except Exception as error:
+                    failure = error
+                    diagnostic = traceback.format_exc()
+                    self.capture_writer.mark_failed(diagnostic)
+                    print(diagnostic, file=sys.stderr)
+            self.capture_writer.add_attachment(
+                log_path, name="runtime.log"
+            )
+            try:
+                properties = self.device_module.get_device_properties(
+                    self.device
+                )
+                self.capture_writer.environment["peak_memory_bytes"] = str(
+                    self.device_module.max_memory_allocated(self.device)
+                )
+                self.capture_writer.environment["total_memory_bytes"] = str(
+                    properties.total_memory
+                )
+            except (AttributeError, RuntimeError) as error:
+                self.capture_writer.environment["memory_metadata_error"] = repr(
+                    error
+                )
+            output = self.capture_writer.write()
+        except Exception:
+            print(f"GLM-5 parity runtime log retained at: {log_path}")
+            raise
+        else:
+            log_path.unlink()
+        print(
+            f"GLM-5 parity artifact: {output} "
+            f"({self.capture_endpoint.label}@{self.device_type})"
+        )
+        if self.reference_reader is not None:
+            self.reference_reader.close()
+        if failure is not None:
+            raise failure
+
+    @staticmethod
+    def _artifact_policy(
+        actual: ParityArtifactReader,
+        expected: ParityArtifactReader,
+    ) -> PrecisionPolicy:
+        if (
+            actual.endpoint.precision == "fp32"
+            and expected.endpoint.precision == "fp32"
+        ):
+            return FP32
+        return BF16
+
+    def _compare_artifact_observation(
+        self,
+        *,
+        key: str,
+        actual: ParityArtifactReader,
+        expected: ParityArtifactReader,
+        recorder: ParityRecorder,
+        policy: PrecisionPolicy,
+    ) -> None:
+        actual_present = key in actual.observation_keys
+        expected_present = key in expected.observation_keys
+        source = actual if actual_present else expected
+        metadata = source.metadata(key)
+        actual_path = (
+            actual.metadata(key).module_path if actual_present else metadata.module_path
+        )
+        expected_path = (
+            expected.metadata(key).module_path
+            if expected_present
+            else metadata.module_path
+        )
+        module_path = (
+            f"{actual.endpoint.label}:{actual_path} <-> "
+            f"{expected.endpoint.label}:{expected_path}"
+        )
+        if not actual_present or not expected_present:
+            recorder.missing(
+                scope=metadata.scope,
+                component=metadata.component,
+                layer=metadata.layer,
+                module_path=module_path,
+                parent_path=metadata.parent_path,
+                level=metadata.level,
+                node_kind=metadata.node_kind,
+                checkpoint=metadata.checkpoint,
+                detail=(
+                    f"offline observation missing actual={actual_present}, "
+                    f"expected={expected_present}; key={key}"
+                ),
+            )
+            return
+        actual_metadata = actual.metadata(key)
+        expected_metadata = expected.metadata(key)
+        if actual_metadata.value_kind != expected_metadata.value_kind:
+            recorder.missing(
+                scope=metadata.scope,
+                component=metadata.component,
+                layer=metadata.layer,
+                module_path=module_path,
+                parent_path=metadata.parent_path,
+                level=metadata.level,
+                node_kind=metadata.node_kind,
+                checkpoint=True,
+                detail=(
+                    "offline observation kind mismatch actual=True, expected=True; "
+                    f"{actual_metadata.value_kind} != {expected_metadata.value_kind}"
+                ),
+            )
+            return
+        actual_gradient_missing = actual_metadata.tags.get("gradient_missing")
+        expected_gradient_missing = expected_metadata.tags.get("gradient_missing")
+        if actual_gradient_missing != expected_gradient_missing:
+            recorder.missing(
+                scope=metadata.scope,
+                component=metadata.component,
+                layer=metadata.layer,
+                module_path=module_path,
+                parent_path=metadata.parent_path,
+                level=metadata.level,
+                node_kind=metadata.node_kind,
+                checkpoint=True,
+                detail=(
+                    "gradient presence differs actual=True, expected=True; "
+                    f"missing={actual_gradient_missing} != "
+                    f"{expected_gradient_missing}"
+                ),
+            )
+            return
+        actual_tensor = actual.tensor(key)
+        expected_tensor = expected.tensor(key)
+        if (
+            "moe.routed_experts" in key
+            and actual_tensor.shape != expected_tensor.shape
+            and actual_tensor.numel() == expected_tensor.numel()
+        ):
+            if actual_tensor.ndim > expected_tensor.ndim:
+                expected_tensor = expected_tensor.reshape_as(actual_tensor)
+            else:
+                actual_tensor = actual_tensor.reshape_as(expected_tensor)
+        actual_dtype = actual_metadata.dtype_flow or (
+            f"out={str(actual_tensor.dtype).removeprefix('torch.')}"
+        )
+        expected_dtype = expected_metadata.dtype_flow or (
+            f"out={str(expected_tensor.dtype).removeprefix('torch.')}"
+        )
+        if metadata.value_kind == "discrete":
+            positions = None
+            positions_key = (
+                actual_metadata.positions_key or expected_metadata.positions_key
+            )
+            if positions_key:
+                if positions_key in actual.observation_keys:
+                    positions = actual.tensor(positions_key)
+                elif positions_key in expected.observation_keys:
+                    positions = expected.tensor(positions_key)
+            recorder.discrete(
+                scope=metadata.scope,
+                component=metadata.component,
+                layer=metadata.layer,
+                actual=actual_tensor,
+                expected=expected_tensor,
+                positions=positions,
+                module_path=module_path,
+                parent_path=metadata.parent_path,
+                level=metadata.level,
+                node_kind=metadata.node_kind,
+                checkpoint=metadata.checkpoint,
+                actual_dtype=actual_dtype,
+                expected_dtype=expected_dtype,
+            )
+            return
+        state_key = actual_metadata.tags.get("state_key", "")
+        routed_suffixes = (
+            "moe.routed_experts.inner_experts.w1_EFD",
+            "moe.routed_experts.inner_experts.w3_EFD",
+            "moe.routed_experts.inner_experts.w2_EDF",
+        )
+        if (
+            state_key.endswith(routed_suffixes)
+            and actual_tensor.ndim >= 1
+            and actual_tensor.shape == expected_tensor.shape
+        ):
+            layer_match = re.match(r"layers\.(\d+)", state_key)
+            layer = int(layer_match.group(1)) if layer_match else metadata.layer
+            for expert in range(actual_tensor.shape[0]):
+                expert_path = f"layers.{layer}.moe.routed_experts.{expert}"
+                recorder.tensor(
+                    scope=metadata.scope,
+                    component=(
+                        "expert_parameter"
+                        if metadata.scope == "parameters"
+                        else "expert_gradient"
+                    ),
+                    layer=layer,
+                    actual=actual_tensor[expert],
+                    expected=expected_tensor[expert],
+                    rtol=policy.rtol,
+                    atol=policy.atol,
+                    module_path=f"{module_path}[expert={expert}]",
+                    parent_path=expert_path,
+                    level=len(expert_path.split(".")) - 1,
+                    node_kind=metadata.node_kind,
+                    checkpoint=metadata.checkpoint,
+                    actual_dtype=actual_dtype,
+                    expected_dtype=expected_dtype,
+                )
+            return
+        recorder.tensor(
+            scope=metadata.scope,
+            component=metadata.component,
+            layer=metadata.layer,
+            actual=actual_tensor,
+            expected=expected_tensor,
+            rtol=float(
+                actual_metadata.tags.get(
+                    "rtol", expected_metadata.tags.get("rtol", policy.rtol)
+                )
+            ),
+            atol=float(
+                actual_metadata.tags.get(
+                    "atol", expected_metadata.tags.get("atol", policy.atol)
+                )
+            ),
+            module_path=module_path,
+            parent_path=metadata.parent_path,
+            level=metadata.level,
+            node_kind=metadata.node_kind,
+            checkpoint=metadata.checkpoint,
+            actual_dtype=actual_dtype,
+            expected_dtype=expected_dtype,
+        )
+
+    def _offline_report_path(
+        self,
+        actual: ParityArtifactReader,
+        expected: ParityArtifactReader,
+    ) -> str:
+        explicit = os.environ.get("GLM5_PARITY_REPORT")
+        if explicit:
+            return explicit
+        report_directory = Path(
+            os.environ.get("GLM5_PARITY_REPORT_DIR", ".")
+        )
+        report_directory.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        raw = (
+            f"glm5_{actual.endpoint.implementation}-{actual.endpoint.precision}-"
+            f"{actual.endpoint.device_type}_vs_"
+            f"{expected.endpoint.implementation}-{expected.endpoint.precision}-"
+            f"{expected.endpoint.device_type}_{timestamp}.html"
+        )
+        return str(report_directory / re.sub(r"[^A-Za-z0-9_.-]+", "-", raw))
+
+    def _run_offline_compare(self) -> None:
+        if not self.COMPARE_ACTUAL_ARTIFACT or not self.COMPARE_EXPECTED_ARTIFACT:
+            raise ValueError(
+                "GLM5_PARITY_MODE=compare requires "
+                "GLM5_PARITY_ACTUAL_ARTIFACT and GLM5_PARITY_EXPECTED_ARTIFACT"
+            )
+        actual = ParityArtifactReader(self.COMPARE_ACTUAL_ARTIFACT)
+        expected = ParityArtifactReader(self.COMPARE_EXPECTED_ARTIFACT)
+        actual.validate_compatible(expected)
+        actual_source = actual.manifest.get("environment", {})
+        expected_source = expected.manifest.get("environment", {})
+        actual_commit = actual_source.get("git_commit")
+        expected_commit = expected_source.get("git_commit")
+        if actual_commit != expected_commit:
+            raise ParityArtifactError(
+                "parity artifacts were produced by different Git commits: "
+                f"{actual_commit!r} != {expected_commit!r}"
+            )
+        if os.environ.get("GLM5_PARITY_ALLOW_DIRTY", "0") != "1":
+            dirty = {
+                "actual": actual_source.get("git_status", ""),
+                "expected": expected_source.get("git_status", ""),
+                "actual_untracked_source": actual_source.get(
+                    "git_untracked_source", ""
+                ),
+                "expected_untracked_source": expected_source.get(
+                    "git_untracked_source", ""
+                ),
+            }
+            if any(value for value in dirty.values()):
+                raise ParityArtifactError(
+                    "offline parity requires clean source trees; set "
+                    "GLM5_PARITY_ALLOW_DIRTY=1 only for exploratory runs. "
+                    f"dirty status={dirty}"
+                )
+        fixture_keys = {
+            key
+            for reader in (actual, expected)
+            for key in reader.observation_keys
+            if reader.metadata(key).value_kind == "fixture"
+        }
+        fixture_mismatches = []
+        for key in sorted(fixture_keys):
+            if (
+                key not in actual.observation_keys
+                or key not in expected.observation_keys
+            ):
+                fixture_mismatches.append(f"{key}: missing on one side")
+                continue
+            if actual.entry(key)["sha256"] != expected.entry(key)["sha256"]:
+                fixture_mismatches.append(f"{key}: tensor checksum differs")
+        if fixture_mismatches:
+            raise ParityArtifactError(
+                "parity artifacts used different fixture tensors:\n"
+                + "\n".join(fixture_mismatches[:20])
+            )
+        policy = self._artifact_policy(actual, expected)
+        title = (
+            f"GLM-5 offline parity: {actual.endpoint.label} "
+            f"vs {expected.endpoint.label}"
+        )
+        report = ParitySuiteReport(title)
+        comparable_keys = {
+            key
+            for reader in (actual, expected)
+            for key in reader.observation_keys
+            if reader.metadata(key).compare
+        }
+        sections = {
+            reader.metadata(key).section_id
+            for reader in (actual, expected)
+            for key in reader.observation_keys
+            if reader.metadata(key).compare
+        }
+        planned_sections = [
+            case["section_id"] for case in actual.manifest["test_plan"]["cases"]
+        ]
+        section_order = list(dict.fromkeys(planned_sections))
+        section_order.extend(sorted(sections - set(section_order)))
+        for section_id in section_order:
+            recorder = ParityRecorder(
+                policy,
+                precision_label=(
+                    f"{actual.endpoint.label} vs {expected.endpoint.label}"
+                ),
+                title=section_id,
+            )
+            for key in sorted(comparable_keys):
+                source = actual if key in actual.observation_keys else expected
+                if source.metadata(key).section_id != section_id:
+                    continue
+                self._compare_artifact_observation(
+                    key=key,
+                    actual=actual,
+                    expected=expected,
+                    recorder=recorder,
+                    policy=policy,
+                )
+            report.add(section_id, recorder)
+        report.configuration = [
+            ("artifact", "actual", str(actual.path)),
+            ("artifact", "expected", str(expected.path)),
+            ("identity", "actual", actual.endpoint.label),
+            ("identity", "expected", expected.endpoint.label),
+            (
+                "integrity",
+                "test_plan_digest",
+                actual.manifest["test_plan_digest"],
+            ),
+            ("integrity", "fixture_digest", actual.manifest["fixture_digest"]),
+            (
+                "source",
+                "actual_git_commit",
+                str(actual.manifest["environment"].get("git_commit", "unknown")),
+            ),
+            (
+                "source",
+                "expected_git_commit",
+                str(expected.manifest["environment"].get("git_commit", "unknown")),
+            ),
+        ]
+        for side, reader in (("actual", actual), ("expected", expected)):
+            report.configuration.extend(
+                (f"{side}_environment", str(name), str(value))
+                for name, value in sorted(reader.manifest["environment"].items())
+            )
+            report.configuration.extend(
+                (f"{side}_configuration", str(name), str(value))
+                for name, value in sorted(reader.manifest["configuration"].items())
+            )
+        output = self._offline_report_path(actual, expected)
+        report.write(output)
+        print(f"GLM-5 offline parity report: {output}")
+        actual.close()
+        expected.close()
+        if report.failed:
+            raise AssertionError(report.failure_message())
 
     def _report_path(self, _section_id: str = "suite") -> str:
         explicit = os.environ.get("GLM5_PARITY_REPORT")
@@ -3380,13 +5102,22 @@ class TestGlm5Parity(
             ),
             ("report", "path", report_path),
             ("hardware", "device", str(self.device)),
-            ("hardware", "cuda_device", torch.cuda.get_device_name(self.device)),
-            ("hardware", "model_parameters", f"{self.num_model_parameters:,}"),
-            ("hardware", "peak_cuda_gib", f"{peak_bytes / 2**30:.4f}"),
-            ("hardware", "total_cuda_gib", f"{total_bytes / 2**30:.4f}"),
             (
                 "hardware",
-                "peak_cuda_percent",
+                "device_type",
+                self.device_type,
+            ),
+            (
+                "hardware",
+                "device_name",
+                self.device_module.get_device_name(self.device),
+            ),
+            ("hardware", "model_parameters", f"{self.num_model_parameters:,}"),
+            ("hardware", "peak_memory_gib", f"{peak_bytes / 2**30:.4f}"),
+            ("hardware", "total_memory_gib", f"{total_bytes / 2**30:.4f}"),
+            (
+                "hardware",
+                "peak_memory_percent",
                 f"{100.0 * peak_bytes / total_bytes:.2f}",
             ),
         ]
@@ -3432,6 +5163,8 @@ class TestGlm5Parity(
 
     def _selected_layers(self) -> list[int]:
         if self.LAYER_INDICES.strip().lower() == "all":
+            if self.RUN_MODE == "capture":
+                return list(range(self.model_size.num_layers))
             return list(range(len(self.pair.hf.model.layers)))
         return [
             int(value.strip())
@@ -4587,8 +6320,14 @@ class TestGlm5Parity(
     # Complete entry point for the configured end-to-end and component tests.
     def test_configured_precision_suite(self) -> None:
         """Call independent tests and combine their results into one report."""
+        if self.RUN_MODE == "compare":
+            self._run_offline_compare()
+            return
         if not self.gpu_ready:
             self.skipTest(self.gpu_skip_reason)
+        if self.RUN_MODE == "capture":
+            self._run_capture_suite()
+            return
         spec = self._configured_spec()
         suite_report = ParitySuiteReport(
             f"GLM-5 parity: {self._configured_report_label()}; "
@@ -4612,10 +6351,12 @@ class TestGlm5Parity(
         finally:
             self._active_suite_report = None
 
-        peak_bytes = torch.cuda.max_memory_allocated(self.device)
-        total_bytes = torch.cuda.get_device_properties(self.device).total_memory
+        peak_bytes = self.device_module.max_memory_allocated(self.device)
+        total_bytes = self.device_module.get_device_properties(
+            self.device
+        ).total_memory
         suite_report.title += (
-            f"; peak_cuda={peak_bytes / 2**30:.2f}GiB"
+            f"; peak_{self.device_type}={peak_bytes / 2**30:.2f}GiB"
             f"/{total_bytes / 2**30:.2f}GiB"
             f" ({100.0 * peak_bytes / total_bytes:.1f}%)"
         )
