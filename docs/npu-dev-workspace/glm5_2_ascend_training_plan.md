@@ -127,6 +127,10 @@ GLM-5.2 模型需要在国产昇腾 NPU 平台上完成训练适配与优化，�
 
 ### 阶段二：分布式训练打通
 
+> 前置：GPU debug 模型的数据并行（DDP/HSDP 与 FSDP）已在 `feat/glm5-model-distributed`
+> 落地（CPU 测试通过；8 卡 A100 命令见 gpu_a100_experiment_runbook.md 的 G6）。
+> 本阶段 NPU 侧 DP/FSDP 基于该 GPU 基线推进。
+
 #### 第 5-6 周：双卡 DP 训练流程
 
 | 角色 | 任务 | 产出 |
@@ -237,6 +241,7 @@ GLM-5.2 模型需要在国产昇腾 NPU 平台上完成训练适配与优化，�
 | 2026-08-04 | GPU 缩小模型 CPU 功能验证 | 已完成 | 前向、loss、反向及重点公共模块测试通过 | `feat/glm5-model`，HEAD `4bc6832c1` | 共建 |
 | 2026-08-04 | GPU 单卡 BF16 Transformers 对齐 | 阻塞 | CUDA 测试已实现但未实际执行 | 当前环境 `torch.cuda.device_count() == 0` | 共建 |
 | 2026-08-04 | NPU 单卡训练 | 未开始 | 尚无执行结果 | 需要 CANN、torch_npu 和 A3 环境 | 叶瑶波 / 黄怡淞 |
+| 2026-08-11 | GPU debug 模型 DDP/FSDP 使能 | 已完成 | 放开数据并行校验、接入 FSDP/DDP 包裹、CPU 测试通过；8 卡命令已入手册 G6 | `feat/glm5-model-distributed` | 共建 |
 
 ### 5.3 周进展模板
 

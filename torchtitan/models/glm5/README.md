@@ -1,10 +1,11 @@
 # GLM-5 debug model
 
-`glm5_debugmodel` is a native, single-device TorchTitan implementation of a
-small but structurally faithful GLM-5 configuration. It is intended for model
-development, CPU training-step coverage, and numerical comparison with
-Transformers; it is not a production configuration and is not the released
-744B model.
+`glm5_debugmodel` is a native TorchTitan implementation of a small but
+structurally faithful GLM-5 configuration. It runs on a single device or in
+data-parallel mode (DDP/HSDP via `data_parallel_replicate_degree`, FSDP via
+`data_parallel_shard_degree`). It is intended for model development, CPU
+training-step coverage, and numerical comparison with Transformers; it is not
+a production configuration and is not the released 744B model.
 
 The numerical reference is Hugging Face Transformers'
 `src/transformers/models/glm_moe_dsa` implementation, specifically
@@ -24,6 +25,19 @@ For the repository launcher, request exactly one process/device:
 
 ```bash
 NGPU=1 MODULE=glm5 CONFIG=glm5_debugmodel ./run_train.sh
+```
+
+Data-parallel runs over 8 GPUs use the same launcher with the parallelism
+degrees set explicitly:
+
+```bash
+# DDP/HSDP: replicated weights, gradient all-reduce over 8 GPUs
+NGPU=8 MODULE=glm5 CONFIG=glm5_debugmodel ./run_train.sh \
+  --parallelism.data_parallel_replicate_degree 8 --parallelism.data_parallel_shard_degree 1
+
+# FSDP: sharded weights over 8 GPUs
+NGPU=8 MODULE=glm5 CONFIG=glm5_debugmodel ./run_train.sh \
+  --parallelism.data_parallel_replicate_degree 1 --parallelism.data_parallel_shard_degree 8
 ```
 
 The configuration uses the local test tokenizer assets and the `c4_test`
@@ -95,11 +109,11 @@ The current flavor explicitly does not support:
 - Flash-MLA or a production specialized DSA kernel;
 - cross-layer top-k sharing / shared indexers;
 - MTP layers or an auxiliary indexer training objective;
-- tensor, context, pipeline, expert, FSDP, or HSDP parallelism.
+- tensor, context, pipeline, or expert parallelism (TP/CP/PP/EP).
 
-The runtime rejects non-single-device parallel layouts. The indexer runs under
-`torch.no_grad()` by design, so language-model loss does not train its
-parameters.
+The runtime rejects every parallel layout except data parallelism
+(DDP/HSDP/FSDP). The indexer runs under `torch.no_grad()` by design, so
+language-model loss does not train its parameters.
 
 ## Roadmap
 
@@ -109,7 +123,8 @@ and is currently pending because this host has no CUDA device.
 
 After the single-device correctness milestone, later work may add:
 
-1. FSDP and expert parallelism for reduced-model distributed training.
+1. Expert parallelism, and EP combined with FSDP, for reduced-model
+   distributed training.
 2. Tensor parallelism with distributed index-head reduction and replicated
    global top-k indices.
 3. Context and pipeline parallelism and, when needed, cross-layer top-k

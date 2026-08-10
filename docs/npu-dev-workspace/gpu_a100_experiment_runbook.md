@@ -5,9 +5,9 @@
 本文档供拿到一台基本为空的 Linux x86_64、8×NVIDIA A100 服务器的同事使用，
 目标是从零建立 TorchTitan GPU 环境，并完成当前 GLM debug 模型的可复现实验。
 
-当前里程碑只支持单设备 GLM 训练。8 张 A100 中只使用 1 张完成模型精度和训练验收；
-8 卡仅执行 CUDA/NCCL 环境健康检查。当前代码会主动拒绝 TP、CP、PP、EP、FSDP、
-HSDP 和其他多设备模型配置，因此不得把 `NGPU=8` 用于 GLM 训练。
+当前里程碑支持 GLM 单设备训练和 8 卡数据并行训练（DDP/HSDP 与 FSDP）。8 张
+A100 中单卡完成模型精度和训练验收；8 卡完成 DDP 与 FSDP 训练验收（见 G6）。
+当前代码仍主动拒绝 TP、CP、PP、EP 及其他混合并行配置。
 
 本文档验收的是：
 
@@ -15,10 +15,11 @@ HSDP 和其他多设备模型配置，因此不得把 `NGPU=8` 用于 GLM 训练
 2. TorchTitan 缩小模型能与相同缩小配置的 Transformers 模型完成 FP32 组件和
    BF16 logits、loss、MoE block、代表性梯度对齐；
 3. TorchTitan 单卡 10 步训练能正常结束；
-4. 8 张 A100 能完成基本 NCCL all-reduce。
+4. 8 张 A100 能完成基本 NCCL all-reduce；
+5. TorchTitan GLM 8 卡 DDP 与 FSDP 各 10 步训练能正常结束。
 
-本文档不验收正式完整 GLM-5.2 checkpoint，不验收 8 卡 GLM 分布式训练，也不产生
-A3/A100 性能结论。
+本文档不验收正式完整 GLM-5.2 checkpoint，不验收 TP/CP/PP/EP 等混合并行训练，
+也不产生 A3/A100 性能结论。
 
 除非小节另有说明，命令均在 Linux Bash 中执行。文中的 `/path/to/...` 是路径示例，
 执行者必须替换为本机真实绝对路径；其他命令可以按门禁顺序直接复制执行。
@@ -28,7 +29,7 @@ A3/A100 性能结论。
 | 项目 | 基线 |
 | --- | --- |
 | 代码仓库 | `https://github.com/loveofguoke/torchtitan.git` |
-| 开发分支 | `feat/glm5-model` |
+| 开发分支 | `feat/glm5-model-distributed` |
 | 最低模型提交 | `4bc6832c1f01761811e6e5695a24297f992953b4` |
 | Python | 3.12 |
 | PyTorch | 与当前 TorchTitan 源码匹配的 CUDA Nightly；首次通过后冻结实际版本 |
@@ -338,13 +339,37 @@ NCCL_DEBUG=INFO torchrun --standalone --nproc_per_node=8 \
 验收要求：8 个 rank 均输出 `all_reduce=36.0`，命令退出码为 0，没有 NCCL timeout、
 unhandled system error 或进程异常退出。
 
-不要把本步骤改成：
+GLM 的 8 卡训练已由 G6 覆盖；本步骤只做通信环境健康检查。
+
+## 12.5. G6：8 卡 GLM DDP/FSDP 训练
+
+在 G4 与 G5 都通过后执行。两条命令都在 8 张 A100 上运行 GLM debug 模型 10 步：
+DDP（复本式权重）与 FSDP（分片权重）各一次。
 
 ```bash
-NGPU=8 MODULE=glm5 CONFIG=glm5_debugmodel ./run_train.sh
+# DDP/HSDP: replicate=8, shard=1
+NGPU=8 MODULE=glm5 CONFIG=glm5_debugmodel LOG_RANK=0 \
+  ./run_train.sh --parallelism.data_parallel_replicate_degree 8 \
+    --parallelism.data_parallel_shard_degree 1 --training.steps 10 \
+    2>&1 | tee "${RUN_DIR}/8gpu-ddp-train.log"
+
+# FSDP: replicate=1, shard=8
+NGPU=8 MODULE=glm5 CONFIG=glm5_debugmodel LOG_RANK=0 \
+  ./run_train.sh --parallelism.data_parallel_replicate_degree 1 \
+    --parallelism.data_parallel_shard_degree 8 --training.steps 10 \
+    2>&1 | tee "${RUN_DIR}/8gpu-fsdp-train.log"
 ```
 
-上述 GLM 8 卡命令在当前阶段不受支持。
+验收要求（两条命令分别满足）：
+
+- 各启动 8 个 worker，完成 10 步并以退出码 0 结束；
+- 每步 loss 都是有限值，没有 NaN/Inf；
+- 所有 rank 打印相同的全局 loss（trainer 会在 DP mesh 上做跨卡归约）；
+- 没有 CUDA OOM、非法显存访问或 NCCL timeout；
+- 第 2 步不报 `set_timeout` 相关 AttributeError（torch 2.12 已移除该 API）。
+
+可选：给两条命令都加 `--debug.seed 42 --debug.deterministic`，对比两条 loss/grad_norm
+曲线——同为数据并行，结果应当一致。
 
 ## 13. 结果摘要与归档
 

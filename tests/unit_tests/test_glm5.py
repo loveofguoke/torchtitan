@@ -663,8 +663,6 @@ class TestGlm5Registration(unittest.TestCase):
             "CP": ParallelismConfig(context_parallel_degree=2),
             "PP": ParallelismConfig(pipeline_parallel_degree=2),
             "EP": ParallelismConfig(expert_parallel_degree=2),
-            "DP replicate": ParallelismConfig(data_parallel_replicate_degree=2),
-            "DP shard": ParallelismConfig(data_parallel_shard_degree=2),
             "SPMD backend": ParallelismConfig(spmd_backend="full_dtensor"),
         }
 
@@ -673,32 +671,93 @@ class TestGlm5Registration(unittest.TestCase):
                 with self.assertRaisesRegex(NotImplementedError, mode):
                     validate(parallelism)
 
+    def test_parallelism_allows_dp_configs(self):
+        validate = glm5.validate_glm5_parallelism
+
+        self.assertIsNone(
+            validate(
+                ParallelismConfig(
+                    data_parallel_replicate_degree=8,
+                    data_parallel_shard_degree=1,
+                )
+            )
+        )
+        self.assertIsNone(
+            validate(
+                ParallelismConfig(
+                    data_parallel_replicate_degree=1,
+                    data_parallel_shard_degree=8,
+                )
+            )
+        )
+
     def test_parallelism_reports_every_offending_mode_together(self):
         validate = glm5.validate_glm5_parallelism
 
-        with self.assertRaisesRegex(NotImplementedError, "TP.*CP.*DP shard"):
+        with self.assertRaisesRegex(NotImplementedError, "TP.*CP.*PP"):
             validate(
                 ParallelismConfig(
                     tensor_parallel_degree=2,
                     context_parallel_degree=2,
-                    data_parallel_shard_degree=2,
+                    pipeline_parallel_degree=2,
                 )
             )
 
-    def test_parallelism_rejects_resolved_multi_rank_world(self):
+    def test_parallelism_allows_resolved_multi_rank_dp_world(self):
         validate = glm5.validate_glm5_parallelism
-        multi_rank_dims = ParallelDims(
-            dp_replicate=1,
-            dp_shard=-1,
-            cp=1,
-            tp=1,
-            pp=1,
-            ep=1,
-            world_size=2,
+
+        # DDP: replicate=8, shard=1 on 8 ranks.
+        self.assertIsNone(
+            validate(
+                ParallelismConfig(
+                    data_parallel_replicate_degree=8,
+                    data_parallel_shard_degree=1,
+                ),
+                ParallelDims(
+                    dp_replicate=8,
+                    dp_shard=1,
+                    cp=1,
+                    tp=1,
+                    pp=1,
+                    ep=1,
+                    world_size=8,
+                ),
+            )
         )
 
-        with self.assertRaisesRegex(NotImplementedError, "DP shard.*world_size"):
-            validate(ParallelismConfig(), multi_rank_dims)
+        # FSDP: shard=8, replicate=1 on 8 ranks.
+        self.assertIsNone(
+            validate(
+                ParallelismConfig(
+                    data_parallel_replicate_degree=1,
+                    data_parallel_shard_degree=8,
+                ),
+                ParallelDims(
+                    dp_replicate=1,
+                    dp_shard=8,
+                    cp=1,
+                    tp=1,
+                    pp=1,
+                    ep=1,
+                    world_size=8,
+                ),
+            )
+        )
+
+        # A resolved tensor-parallel layout is still rejected.
+        with self.assertRaisesRegex(NotImplementedError, "TP"):
+            validate(
+                ParallelismConfig(tensor_parallel_degree=2),
+                ParallelDims(
+                    dp_replicate=1,
+                    dp_shard=4,
+                    cp=1,
+                    tp=2,
+                    pp=1,
+                    ep=1,
+                    world_size=8,
+                ),
+            )
 
 
 class TestGlm5StateDictAdapter(unittest.TestCase):
