@@ -282,8 +282,14 @@ class Glm5Attention(BaseAttention):
             positions_BL,
             attention_masks[:, 0],
         )
-        selected_BLL = torch.zeros(
-            B, L, L, dtype=torch.bool, device=x_BLD.device
+        # The indexer is kept fully Replicated on TP, so its indices and the
+        # mask tensors must stay DTensor-consistent: aten.scatter/masked_fill
+        # reject mixing a plain base tensor with a DTensor arg. Building the
+        # mask from attention_masks (a Replicate DTensor at this boundary under
+        # TP; plain on a single device) keeps every op on a single tensor
+        # class. zeros_like propagates the DTensor layout.
+        selected_BLL = torch.zeros_like(
+            attention_masks[:, 0], dtype=torch.bool
         ).scatter(-1, topk_indices_BLK.long(), True)
         min_value = torch.finfo(x_BLD.dtype).min
         sparse_mask_B1LL = attention_masks.masked_fill(
@@ -353,12 +359,21 @@ class Glm5Model(Decoder):
         vocab_size: int = 2048
 
         def update_from_config(self, *, config, **kwargs) -> None:
-            # This import is deliberately local: Task 5 supplies the runtime
-            # validation module, while config construction remains usable now.
-            from torchtitan.models.glm5.parallelize import validate_glm5_parallelism
+            # This import is deliberately local: the sharding module pulls in
+            # the runtime validation, while config construction remains
+            # usable standalone.
+            from torchtitan.models.glm5.sharding import (
+                set_glm5_sharding_config,
+                validate_glm5_parallelism,
+            )
 
             validate_glm5_parallelism(config.parallelism)
             Decoder.Config.update_from_config(self, config=config, **kwargs)
+            set_glm5_sharding_config(
+                self,
+                enable_sp=config.parallelism.enable_sequence_parallel,
+                enable_ep=config.parallelism.expert_parallel_degree > 1,
+            )
 
         def get_nparams_and_flops(
             self, model: nn.Module, seq_len: int

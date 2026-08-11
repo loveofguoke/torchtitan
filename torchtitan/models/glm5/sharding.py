@@ -4,40 +4,241 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from typing import TYPE_CHECKING
+
+import spmd_types as spmd
+
 from torchtitan.config import ParallelismConfig
 from torchtitan.distributed import ParallelDims
+from torchtitan.models.common.decoder_sharding import (
+    colwise_config,
+    dense_activation_placement,
+    dense_param_placement,
+    dense_sequence_parallel_placement,
+    norm_config,
+    rowwise_config,
+    set_decoder_sharding_config,
+    set_dense_ffn_sharding,
+)
+from torchtitan.models.common.moe_sharding import set_moe_sharding_config
+from torchtitan.models.glm5.model import Glm5Attention, Glm5DsaIndexer
+from torchtitan.protocols.sharding import ShardingConfig
+
+if TYPE_CHECKING:
+    from torchtitan.models.glm5.model import Glm5Model, Glm5TransformerBlock
+
+
+# Routed-expert layout for the shared ``GroupedExperts`` (w1/w2/w3).
+_GROUPED_EXPERTS_PARAM_LAYOUT: dict[str, spmd.PerMeshAxisSpmdType] = {
+    "w1_EFD": spmd.S(1),
+    "w2_EDF": spmd.S(2),
+    "w3_EFD": spmd.S(1),
+}
 
 
 def validate_glm5_parallelism(
     parallelism: ParallelismConfig,
     parallel_dims: ParallelDims | None = None,
 ) -> None:
-    """Reject every runtime layout that is not pure data parallelism.
+    """Reject the runtime layouts GLM-5 does not yet support.
 
-    GLM-5's debug eager DSA path supports data parallelism (DDP/HSDP via
+    GLM-5 supports data parallelism (DDP/HSDP via
     ``data_parallel_replicate_degree``, and FSDP via
-    ``data_parallel_shard_degree``) but rejects tensor/context/pipeline/expert
-    parallelism and any non-default SPMD backend.  ``parallel_dims`` is kept
-    for signature parity with the runtime call site: once resolved,
-    ``ParallelDims._validate`` has already enforced
-    ``dp_replicate * dp_shard * cp * tp * pp == world_size``, so a resolved
-    multi-rank world is by construction a legal data-parallel layout.
+    ``data_parallel_shard_degree``) together with tensor, pipeline, and expert
+    parallelism. It still rejects:
+
+    - CP: the eager dense DSA attention builds a full ``[B, 1, L, L]`` mask and
+      runs a dense ``[B, N, L, L]`` score matmul, which is not shardable with
+      the framework's ``apply_cp_to_forward`` (that path targets FlexAttention /
+      SDPA inner attention, which GLM-5 never instantiates).
+    - Sequence parallelism combined with TP: the eager DSA attention's dense
+      mask path is only validated for replicated sequences.
+    - Any non-``default`` SPMD backend.
+
+    ``parallel_dims`` is kept for signature parity with the runtime call site;
+    once resolved, ``ParallelDims._validate`` has already enforced
+    ``dp_replicate * dp_shard * cp * tp * pp == world_size``.
     """
     unsupported: list[str] = []
-    degree_names = (
-        ("TP", parallelism.tensor_parallel_degree),
-        ("CP", parallelism.context_parallel_degree),
-        ("PP", parallelism.pipeline_parallel_degree),
-        ("EP", parallelism.expert_parallel_degree),
-    )
-    unsupported.extend(name for name, degree in degree_names if degree > 1)
-
+    if parallelism.context_parallel_degree > 1:
+        unsupported.append("CP")
+    if parallelism.enable_sequence_parallel and parallelism.tensor_parallel_degree > 1:
+        unsupported.append("SP")
     if parallelism.spmd_backend != "default":
         unsupported.append(f"SPMD backend ({parallelism.spmd_backend})")
 
     if unsupported:
         modes = ", ".join(unsupported)
         raise NotImplementedError(
-            "GLM-5 debugmodel supports only data-parallel layouts; "
+            "GLM-5 supports data parallelism with TP/PP/EP; "
             f"unsupported parallelism: {modes}."
         )
+
+
+def set_glm5_sharding_config(
+    config: "Glm5Model.Config",
+    *,
+    enable_sp: bool,
+    enable_ep: bool,
+) -> None:
+    """Fill ``sharding_config`` on all GLM-5 sub-configs.
+
+    Dense sub-configs (attention, norms, dense FFN) are populated
+    unconditionally -- ``Module.parallelize`` filters disabled axes
+    at runtime.
+
+    MoE sub-configs (router, shared experts, routed experts) are
+    populated unconditionally -- ``resolve_mesh`` filters disabled
+    axes at runtime.
+    """
+
+    set_decoder_sharding_config(config, enable_sp=enable_sp)
+    for layer_cfg in config.layers:
+        _set_glm5_layer_sharding(layer_cfg, enable_sp=enable_sp, enable_ep=enable_ep)
+
+
+def _set_glm5_layer_sharding(
+    layer_cfg: "Glm5TransformerBlock.Config",
+    *,
+    enable_sp: bool,
+    enable_ep: bool,
+) -> None:
+    """Set sharding on one GLM-5 transformer layer.
+
+    Attention and norms are sharded on all blocks (MoE and non-MoE).
+    Dense FFN is only sharded on non-MoE blocks; MoE FFN is routed
+    through ``set_moe_sharding_config``.
+    """
+    attention = layer_cfg.attention
+    assert isinstance(attention, Glm5Attention.Config)
+
+    norm = norm_config(enable_sp=enable_sp)
+    layer_cfg.attention_norm.sharding_config = norm
+    layer_cfg.ffn_norm.sharding_config = norm
+    attn_x_layout = (
+        dense_sequence_parallel_placement()
+        if enable_sp
+        else dense_activation_placement(tp=spmd.I)
+    )
+
+    set_glm5_attention_sharding(attention, enable_sp=enable_sp)
+
+    # Dense FFN (non-MoE layers only)
+    if layer_cfg.feed_forward is not None:
+        set_dense_ffn_sharding(
+            layer_cfg.feed_forward,
+            attn_x_layout=attn_x_layout,
+            enable_sp=enable_sp,
+        )
+
+    # MoE FFN (MoE-enabled layers only).
+    if layer_cfg.moe is not None:
+        set_moe_sharding_config(
+            layer_cfg.moe,
+            enable_ep=enable_ep,
+            enable_sp=enable_sp,
+            expert_param_layout=_GROUPED_EXPERTS_PARAM_LAYOUT,
+        )
+
+
+def set_glm5_attention_sharding(
+    attention: Glm5Attention.Config,
+    *,
+    enable_sp: bool,
+) -> None:
+    """GLM-5 MLA + DSA attention TP sharding.
+
+    Mirrors DeepSeek-V3's MLA plan: low-rank projections and norms stay
+    Replicate on TP, up-projections are Colwise (shard on the head dim),
+    ``wo`` is Rowwise. The DSA indexer is kept fully Replicate on TP (see
+    ``set_glm5_indexer_sharding``).
+    """
+    # ``attention_masks`` must arrive as a Replicate DTensor under TP: the
+    # eager DSA mask construction (zeros_like + scatter, masked_fill) rejects
+    # mixing a plain base tensor with a DTensor arg, so the whole mask path
+    # runs on Replicate DTensors. On a single device the mesh is absent and the
+    # input stays plain.
+    attention.sharding_config = ShardingConfig(
+        in_src_shardings={
+            "x_BLD": (
+                dense_sequence_parallel_placement()
+                if enable_sp
+                else dense_activation_placement(tp=spmd.I)
+            ),
+            "attention_masks": dense_activation_placement(tp=spmd.R),
+        },
+        in_dst_shardings={
+            "x_BLD": dense_activation_placement(tp=spmd.R),
+            "attention_masks": dense_activation_placement(tp=spmd.R),
+        },
+    )
+    attention.rope.sharding_config = ShardingConfig(
+        state_shardings={"cache": dense_param_placement(tp=spmd.R)},
+    )
+    # Low-rank projections and norms keep Replicate weights on TP. We still
+    # distribute them (Replicate DTensor) so DTensor activations flow through
+    # without mixing plain Tensor + DTensor in the matmul.
+    replicate_weight = ShardingConfig(
+        state_shardings={"weight": dense_param_placement(tp=spmd.R)},
+    )
+    attention.wq_a.sharding_config = replicate_weight
+    attention.q_norm.sharding_config = replicate_weight
+    attention.wkv_a.sharding_config = replicate_weight
+    attention.kv_norm.sharding_config = replicate_weight
+
+    attention.wq_b.sharding_config = colwise_config()
+    attention.wkv_b.sharding_config = colwise_config()
+    attention.wo.sharding_config = rowwise_config(output_sp=enable_sp)
+
+    set_glm5_indexer_sharding(attention.indexer)
+
+
+def set_glm5_indexer_sharding(indexer: Glm5DsaIndexer.Config) -> None:
+    """DSA indexer sharding: fully Replicate on TP (correctness first).
+
+    ``Glm5DsaIndexer.forward`` sums per-index-head scores into a
+    ``[B, L, L]`` tensor and then runs ``topk`` on it. The declarative
+    ``sharding_config`` redistributes module *outputs* after ``forward``
+    returns, so sharding the index heads (Colwise) would leave ``topk``
+    running on a partial (per-rank head-shard) score tensor -- incorrect.
+
+    Keeping the whole indexer Replicated makes every TP rank compute the
+    DSA indices redundantly. The indexer is small (``index_n_heads=4`` in the
+    debugmodel), so the redundant cost is acceptable; a distributed
+    index-head reduction with a replicated global ``topk`` is a documented
+    follow-up (glm5 README roadmap).
+    """
+    replicate_weight = ShardingConfig(
+        state_shardings={"weight": dense_param_placement(tp=spmd.R)},
+    )
+    indexer.wq_b.sharding_config = replicate_weight
+    indexer.wk.sharding_config = replicate_weight
+    indexer.weights_proj.sharding_config = replicate_weight
+    indexer.k_norm.sharding_config = ShardingConfig(
+        state_shardings={
+            "weight": dense_param_placement(tp=spmd.R),
+            "bias": dense_param_placement(tp=spmd.R),
+        },
+    )
+    indexer.rope.sharding_config = ShardingConfig(
+        state_shardings={"cache": dense_param_placement(tp=spmd.R)},
+    )
+
+    # Keep every indexer input Replicate on TP so the forward body operates on
+    # Replicate DTensors end to end.
+    indexer.sharding_config = ShardingConfig(
+        in_src_shardings={
+            "hidden_states_BLD": dense_activation_placement(tp=spmd.R),
+            "q_resid_BLR": dense_activation_placement(tp=spmd.R),
+            "positions_BL": dense_activation_placement(tp=spmd.R),
+            "attention_mask_BLL": dense_activation_placement(tp=spmd.R),
+        },
+        in_dst_shardings={
+            "hidden_states_BLD": dense_activation_placement(tp=spmd.R),
+            "q_resid_BLR": dense_activation_placement(tp=spmd.R),
+            "positions_BL": dense_activation_placement(tp=spmd.R),
+            "attention_mask_BLL": dense_activation_placement(tp=spmd.R),
+        },
+        out_src_shardings=dense_activation_placement(tp=spmd.R),
+        out_dst_shardings=dense_activation_placement(tp=spmd.R),
+    )

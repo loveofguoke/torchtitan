@@ -18,6 +18,7 @@ import torchtitan.models.glm5 as glm5
 from torchtitan.components.optimizer import register_moe_load_balancing_hook
 from torchtitan.config import ParallelismConfig
 from torchtitan.distributed import ParallelDims
+from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.models.common import (
     ComplexRoPE,
     FlexAttention,
@@ -623,7 +624,7 @@ class TestGlm5Registration(unittest.TestCase):
         self.assertEqual(spec.flavor, "debugmodel")
         self.assertIsInstance(spec.model, Glm5Model.Config)
         self.assertIs(spec.state_dict_adapter, Glm5StateDictAdapter)
-        self.assertIsNone(spec.pipelining_fn)
+        self.assertIs(spec.pipelining_fn, pipeline_llm)
         self.assertIs(spec.post_optimizer_build_fn, register_moe_load_balancing_hook)
 
     def test_debug_training_config_uses_single_device_defaults(self):
@@ -639,7 +640,11 @@ class TestGlm5Registration(unittest.TestCase):
         self.assertEqual(config.optimizer.param_groups[0].optimizer_kwargs["lr"], 8e-4)
         self.assertFalse(config.compile.enable)
         self.assertIsNone(config.activation_checkpoint)
-        self.assertEqual(config.parallelism, ParallelismConfig())
+        # SP is off in the debugmodel: the eager DSA dense-mask path is only
+        # validated for replicated sequences (SP with tp>1 is rejected).
+        self.assertEqual(
+            config.parallelism, ParallelismConfig(enable_sequence_parallel=False)
+        )
 
     def test_parallelism_allows_only_one_unresolved_single_device_layout(self):
         validate = glm5.validate_glm5_parallelism
@@ -656,13 +661,14 @@ class TestGlm5Registration(unittest.TestCase):
         )
         self.assertIsNone(validate(ParallelismConfig(), single_rank_dims))
 
-    def test_parallelism_rejects_each_multi_rank_mode(self):
+    def test_parallelism_rejects_each_unsupported_layout(self):
         validate = glm5.validate_glm5_parallelism
         invalid_configs = {
-            "TP": ParallelismConfig(tensor_parallel_degree=2),
             "CP": ParallelismConfig(context_parallel_degree=2),
-            "PP": ParallelismConfig(pipeline_parallel_degree=2),
-            "EP": ParallelismConfig(expert_parallel_degree=2),
+            # SP alone (tp==1) is inert; SP with tp>1 is rejected.
+            "SP": ParallelismConfig(
+                tensor_parallel_degree=2, enable_sequence_parallel=True
+            ),
             "SPMD backend": ParallelismConfig(spmd_backend="full_dtensor"),
         }
 
@@ -670,6 +676,31 @@ class TestGlm5Registration(unittest.TestCase):
             with self.subTest(mode=mode):
                 with self.assertRaisesRegex(NotImplementedError, mode):
                     validate(parallelism)
+
+    def test_parallelism_allows_tp_pp_ep(self):
+        validate = glm5.validate_glm5_parallelism
+
+        # TP/PP/EP are supported independently and combined; SP must be off
+        # whenever tp > 1 (the eager DSA dense-mask path is not SP-validated).
+        self.assertIsNone(
+            validate(
+                ParallelismConfig(
+                    tensor_parallel_degree=2, enable_sequence_parallel=False
+                )
+            )
+        )
+        self.assertIsNone(validate(ParallelismConfig(pipeline_parallel_degree=2)))
+        self.assertIsNone(validate(ParallelismConfig(expert_parallel_degree=2)))
+        self.assertIsNone(
+            validate(
+                ParallelismConfig(
+                    tensor_parallel_degree=2,
+                    pipeline_parallel_degree=2,
+                    expert_parallel_degree=2,
+                    enable_sequence_parallel=False,
+                )
+            )
+        )
 
     def test_parallelism_allows_dp_configs(self):
         validate = glm5.validate_glm5_parallelism
@@ -694,12 +725,12 @@ class TestGlm5Registration(unittest.TestCase):
     def test_parallelism_reports_every_offending_mode_together(self):
         validate = glm5.validate_glm5_parallelism
 
-        with self.assertRaisesRegex(NotImplementedError, "TP.*CP.*PP"):
+        with self.assertRaisesRegex(NotImplementedError, "CP.*SP"):
             validate(
                 ParallelismConfig(
                     tensor_parallel_degree=2,
                     context_parallel_degree=2,
-                    pipeline_parallel_degree=2,
+                    enable_sequence_parallel=True,
                 )
             )
 
@@ -744,8 +775,9 @@ class TestGlm5Registration(unittest.TestCase):
             )
         )
 
-        # A resolved tensor-parallel layout is still rejected.
-        with self.assertRaisesRegex(NotImplementedError, "TP"):
+        # A resolved sequence-parallel layout (tp=2 with SP still on) is
+        # rejected.
+        with self.assertRaisesRegex(NotImplementedError, "SP"):
             validate(
                 ParallelismConfig(tensor_parallel_degree=2),
                 ParallelDims(
@@ -758,6 +790,109 @@ class TestGlm5Registration(unittest.TestCase):
                     world_size=8,
                 ),
             )
+
+        # A resolved TP+PP+EP layout (SP off) is allowed. EP borrows ranks
+        # from dp_shard x cp x tp, so it does not multiply world_size: here
+        # dp_shard(2) * tp(2) * pp(2) = world_size(8), and the routed experts
+        # span efsdp(2) x ep(2) = 4 ranks.
+        self.assertIsNone(
+            validate(
+                ParallelismConfig(
+                    tensor_parallel_degree=2,
+                    pipeline_parallel_degree=2,
+                    expert_parallel_degree=2,
+                    enable_sequence_parallel=False,
+                ),
+                ParallelDims(
+                    dp_replicate=1,
+                    dp_shard=2,
+                    cp=1,
+                    tp=2,
+                    pp=2,
+                    ep=2,
+                    world_size=8,
+                ),
+            )
+        )
+
+    def test_sharding_config_populated_for_tp_ep(self):
+        import spmd_types as spmd
+        from torchtitan.models.common.decoder_sharding import dense_param_placement
+        from torchtitan.models.common.moe_sharding import expert_param_placement_sparse
+        from torchtitan.models.glm5.sharding import _GROUPED_EXPERTS_PARAM_LAYOUT
+
+        trainer_config = glm5_debugmodel()
+        trainer_config.parallelism = ParallelismConfig(
+            tensor_parallel_degree=2,
+            expert_parallel_degree=2,
+            enable_sequence_parallel=False,
+        )
+        model_config = trainer_config.model_spec.model
+        self.assertIsInstance(model_config, Glm5Model.Config)
+        model_config.update_from_config(config=trainer_config)
+
+        # Root-level decoder configs (tok_embeddings / norm / lm_head).
+        self.assertIsNotNone(model_config.tok_embeddings.sharding_config)
+        self.assertIsNotNone(model_config.norm.sharding_config)
+        self.assertIsNotNone(model_config.lm_head.sharding_config)
+
+        dense_layer = model_config.layers[0]
+        moe_layer = model_config.layers[1]
+
+        # Attention MLA: input boundary, RoPE cache, low-rank projections and
+        # norms all populated.
+        attention = dense_layer.attention
+        self.assertIsNotNone(attention.sharding_config)
+        self.assertIsNotNone(attention.rope.sharding_config)
+        self.assertIsNotNone(attention.wq_a.sharding_config)
+        self.assertIsNotNone(attention.q_norm.sharding_config)
+        self.assertIsNotNone(attention.wkv_a.sharding_config)
+        self.assertIsNotNone(attention.kv_norm.sharding_config)
+        self.assertIsNotNone(attention.wq_b.sharding_config)
+        self.assertIsNotNone(attention.wkv_b.sharding_config)
+        self.assertIsNotNone(attention.wo.sharding_config)
+
+        # DSA indexer: every projection is Replicate on TP (correctness-first:
+        # a head-shard would leave topk on a partial score tensor).
+        indexer = attention.indexer
+        self.assertIsNotNone(indexer.sharding_config)
+        self.assertIsNotNone(indexer.wq_b.sharding_config)
+        self.assertIsNotNone(indexer.wk.sharding_config)
+        self.assertIsNotNone(indexer.k_norm.sharding_config)
+        self.assertIsNotNone(indexer.weights_proj.sharding_config)
+        self.assertIsNotNone(indexer.rope.sharding_config)
+        replicate_placement = dense_param_placement(tp=spmd.R)
+        for proj in (indexer.wq_b, indexer.wk, indexer.weights_proj):
+            self.assertEqual(
+                proj.sharding_config.state_shardings["weight"],
+                replicate_placement,
+            )
+
+        # Norms + dense FFN on the dense layer.
+        self.assertIsNotNone(dense_layer.attention_norm.sharding_config)
+        self.assertIsNotNone(dense_layer.ffn_norm.sharding_config)
+        self.assertIsNotNone(dense_layer.feed_forward.sharding_config)
+        self.assertIsNone(dense_layer.moe)
+
+        # MoE layer: wrapper + router + shared experts + routed experts filled.
+        # With EP on, expert weights use the sparse layout keyed by the
+        # grouped-experts param layout names.
+        moe = moe_layer.moe
+        self.assertIsNotNone(moe.sharding_config)
+        self.assertIsNotNone(moe.router.gate.sharding_config)
+        self.assertIsNotNone(moe.shared_experts.sharding_config)
+        self.assertIsNotNone(moe.routed_experts.inner_experts.sharding_config)
+        expert_state_shardings = (
+            moe.routed_experts.inner_experts.sharding_config.state_shardings
+        )
+        self.assertEqual(
+            set(expert_state_shardings), set(_GROUPED_EXPERTS_PARAM_LAYOUT)
+        )
+        for name in _GROUPED_EXPERTS_PARAM_LAYOUT:
+            self.assertEqual(
+                expert_state_shardings[name], expert_param_placement_sparse()
+            )
+        self.assertIsNone(moe_layer.feed_forward)
 
 
 class TestGlm5StateDictAdapter(unittest.TestCase):
