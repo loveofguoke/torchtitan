@@ -274,7 +274,10 @@ class TokenChoiceTopKRouter(Module):
             group_scores, k=self.num_limited_groups, dim=-1, sorted=False
         )
         group_mask = torch.ones_like(group_scores, dtype=torch.bool)
-        group_mask.scatter_(-1, group_idx, False)  # False = selected groups (keep)
+        # Out-of-place: DTensor rejects in-place scatter on a token-sharded
+        # activation even though the write is along the replicated group dim.
+        # Values are identical to scatter_ for plain tensors.
+        group_mask = group_mask.scatter(-1, group_idx, False)  # False = selected
         # Mask out experts from non-selected groups
         scores_for_choice_BLE = scores_grouped.masked_fill(
             group_mask.unsqueeze(-1), float("-inf")
@@ -379,6 +382,7 @@ class MoE(Module):
         super().__init__()
 
         num_experts = config.num_experts
+        self.num_experts = num_experts
         self.seq_dim_tp_sharded = config.seq_dim_tp_sharded
         self.routed_experts = config.routed_experts.build()
         self.router = config.router.build()
@@ -465,16 +469,20 @@ class MoE(Module):
             scores_BLE,
         ) = self.router(x_BLD, self.expert_bias_E)
 
-        # Build a one-hot routing map (B, L, E) marking the experts each token
-        # is routed to. Under TP/SP the router outputs are DTensors sharded on
-        # the token dim; scatter_ writes along the (replicated) expert dim, so
-        # DTensor runs it as a local op with no redistribution.
-        routing_map_BLE = torch.zeros_like(scores_BLE, dtype=torch.bool).scatter_(
-            -1,
-            topk_expert_ids_BLK,
-            True,
+        # Per-expert token count for this rank's token shard, used for load
+        # balancing and by the token dispatcher to size the EP all-to-all.
+        # Build it from the (token-sharded) expert ids via one_hot: a DTensor
+        # scatter_ on a Shard placement is rejected, and the out-of-place
+        # scatter_ replacement would flip the map to Replicate (each rank would
+        # then hold the *global* count instead of its local partial count).
+        # one_hot preserves the Shard(1) layout, so the reduction over the
+        # batch/seq dims yields a Partial count, as the token dispatcher
+        # expects.
+        num_local_tokens_per_expert_E = (
+            F.one_hot(topk_expert_ids_BLK, num_classes=self.num_experts)
+            .to(torch.int64)
+            .sum(dim=(0, 1, 2))
         )
-        num_local_tokens_per_expert_E = routing_map_BLE.sum(dim=(0, 1))
 
         # tokens_per_expert_E will be used to update the expert bias for load balancing,
         # and also to count the expert usage.
