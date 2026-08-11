@@ -399,7 +399,16 @@ class Glm5Model(Decoder):
     def get_attention_masks(self, positions: torch.Tensor) -> torch.Tensor:
         positions_BL = positions
         B, L = positions_BL.shape
-        token_dtype = self.tok_embeddings.weight.dtype
+        # Non-first pipeline stages have tok_embeddings pruned away, but each
+        # PP rank builds the mask for its own stage. Every stage receives the
+        # same positions, so any float parameter dtype gives the same mask
+        # dtype; fall back to the first layer's norm weight when embeddings
+        # are absent. layers is a ModuleDict whose keys keep their original
+        # indices after pruning, so iterate values rather than indexing [0].
+        if self.tok_embeddings is not None:
+            token_dtype = self.tok_embeddings.weight.dtype
+        else:
+            token_dtype = next(iter(self.layers.values())).attention_norm.weight.dtype
         document_ids_BL = (positions_BL == 0).cumsum(dim=1)
         sequence_indices_L = torch.arange(L, device=positions_BL.device)
         causal_BLL = (

@@ -18,7 +18,11 @@ import torchtitan.models.glm5 as glm5
 from torchtitan.components.optimizer import register_moe_load_balancing_hook
 from torchtitan.config import ParallelismConfig
 from torchtitan.distributed import ParallelDims
-from torchtitan.distributed.pipeline_parallel import pipeline_llm
+from torchtitan.distributed.pipeline_parallel import (
+    _generate_llm_fqn_per_model_part,
+    _split_module,
+    pipeline_llm,
+)
 from torchtitan.models.common import (
     ComplexRoPE,
     FlexAttention,
@@ -563,6 +567,23 @@ class TestGlm5Model(unittest.TestCase):
         mask_B1LL = model.get_attention_masks(positions=positions_BL)
 
         self.assertEqual(mask_B1LL.shape, (1, 1, 4, 4))
+
+    def test_non_first_pp_stage_builds_dense_mask_without_embeddings(self):
+        # Every PP rank builds the mask for its own stage in
+        # post_dataloading_process. A non-first stage is pruned by
+        # _split_module (tok_embeddings=None, layers keys keep original
+        # indices), so get_attention_masks must not touch tok_embeddings.
+        config = glm5_configs["debugmodel"]()
+        model = config.build()
+        model.init_states()
+        fqn_per_stage = _generate_llm_fqn_per_model_part(2, len(config.layers), 1, 1)
+        stage = _split_module(model, fqn_per_stage[1])
+        self.assertIsNone(stage.tok_embeddings)
+
+        mask_B1LL = stage.get_attention_masks(torch.arange(5).unsqueeze(0))
+
+        self.assertEqual(mask_B1LL.shape, (1, 1, 5, 5))
+        self.assertTrue(torch.isfinite(mask_B1LL).all())
 
     def test_debug_model_forward_shape(self):
         model = _build_debug_model()
