@@ -154,7 +154,8 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
             if suffix == "moe.router.gate.weight":
                 return self._linear_shape(moe.router.gate)
             if suffix == "moe.expert_bias_E":
-                return (moe.num_experts,)
+                experts = moe.routed_experts.inner_experts
+                return (experts.num_experts,)
             if suffix in {self._TITAN_GATE, self._TITAN_UP}:
                 experts = moe.routed_experts.inner_experts
                 return (experts.num_experts, experts.hidden_dim, experts.dim)
