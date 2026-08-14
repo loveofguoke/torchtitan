@@ -310,7 +310,7 @@ def _debugmodel() -> Glm5Model.Config:
             param_init=_output_linear_init(dim),
         ),
         layers=build_glm5_layers(
-            n_layers=4,
+            n_layers=8,
             n_dense_layers=1,
             dim=dim,
             n_heads=8,
