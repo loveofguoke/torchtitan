@@ -15,7 +15,6 @@ from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.models.common import (
     ComplexRoPE,
     Embedding,
-    FlexAttention,
     LayerNorm,
     Linear,
     RMSNorm,
@@ -30,12 +29,21 @@ from torchtitan.models.common.config_utils import (
 from torchtitan.models.common.param_init import depth_scaled_std
 from torchtitan.protocols.model_spec import ModelSpec
 
-from .model import Glm5Attention, Glm5DsaIndexer, Glm5Model, Glm5TransformerBlock
+from .model import (
+    DSAIndexerTopK,
+    DSAInnerAttention,
+    Glm5Attention,
+    Glm5DsaIndexer,
+    Glm5Model,
+    Glm5TransformerBlock,
+)
 from .parallelize import parallelize_glm5
 from .sharding import validate_glm5_parallelism
 from .state_dict_adapter import Glm5StateDictAdapter
 
 __all__ = [
+    "DSAIndexerTopK",
+    "DSAInnerAttention",
     "Glm5Attention",
     "Glm5DsaIndexer",
     "Glm5Model",
@@ -108,7 +116,6 @@ def make_glm5_attention_config(
         qk_nope_head_dim=qk_nope_head_dim,
         qk_rope_head_dim=qk_rope_head_dim,
         v_head_dim=v_head_dim,
-        attention_dropout=attention_dropout,
         wq_a=Linear.Config(
             in_features=dim, out_features=q_lora_rank, param_init=_LINEAR_INIT
         ),
@@ -165,8 +172,14 @@ def make_glm5_attention_config(
                 in_features=dim, out_features=index_n_heads, param_init=_LINEAR_INIT
             ),
             rope=dataclasses.replace(rope),
+            topk=DSAIndexerTopK.Config(
+                index_topk=index_topk,
+                softmax_scale=index_head_dim**-0.5,
+            ),
         ),
-        inner_attention=FlexAttention.Config(),
+        inner_attention=DSAInnerAttention.Config(
+            attention_dropout=attention_dropout,
+        ),
     )
 
 

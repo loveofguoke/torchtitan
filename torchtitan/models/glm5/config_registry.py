@@ -39,11 +39,10 @@ def glm5_debugmodel() -> Trainer.Config:
             # opt into bf16 explicitly as a documented precision change.
             mixed_precision_param="float32",
         ),
-        # SP is off: the eager DSA attention's dense mask path is only validated
-        # for replicated sequences (validate_glm5_parallelism rejects SP with
-        # tp > 1). With tp == 1 the flag is inert, but turning it off in the
-        # debugmodel keeps a default tp>1 run from tripping the validate error.
-        parallelism=ParallelismConfig(enable_sequence_parallel=False),
+        parallelism=ParallelismConfig(
+            enable_sequence_parallel=True,
+            context_parallel_load_balancer=None,
+        ),
         checkpoint=CheckpointManager.Config(interval=10),
         activation_checkpoint=None,
     )

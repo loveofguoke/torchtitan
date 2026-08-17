@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
@@ -12,7 +12,6 @@ from torch import nn
 
 from torchtitan.models.common import (
     ComplexRoPE,
-    FlexAttention,
     LayerNorm,
     Linear,
     RMSNorm,
@@ -21,6 +20,60 @@ from torchtitan.models.common.attention import BaseAttention
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.models.utils import get_moe_model_nparams_and_flops
 from torchtitan.protocols.module import Module
+
+
+class DSAIndexerTopK(Module):
+    """Compute local-query top-k indices against a global key sequence."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        index_topk: int
+        softmax_scale: float
+
+        def __post_init__(self) -> None:
+            if self.index_topk <= 0:
+                raise ValueError("index_topk must be > 0.")
+            if self.softmax_scale <= 0.0:
+                raise ValueError("softmax_scale must be > 0.")
+
+    def __init__(self, config: Config) -> None:
+        super().__init__()
+        self.index_topk = config.index_topk
+        self.softmax_scale = config.softmax_scale
+
+    def forward(
+        self,
+        q_BQNH: torch.Tensor,
+        k_BKH: torch.Tensor,
+        weights_BQN: torch.Tensor,
+        attention_mask_BQK: torch.Tensor,
+    ) -> torch.Tensor:
+        if q_BQNH.ndim != 4 or k_BKH.ndim != 3:
+            raise ValueError("DSA indexer q and k must have rank 4 and 3.")
+        B, Q, N, H = q_BQNH.shape
+        K = k_BKH.shape[1]
+        if k_BKH.shape != (B, K, H):
+            raise ValueError("DSA indexer k must have shape [B, K, H].")
+        if weights_BQN.shape != (B, Q, N):
+            raise ValueError("DSA indexer weights must have shape [B, Q, N].")
+        if attention_mask_BQK.shape != (B, Q, K):
+            raise ValueError(
+                "DSA indexer attention_masks must have shape [B, Q, K]."
+            )
+        scores_BNQK = (
+            torch.matmul(
+                q_BQNH.float().transpose(1, 2),
+                k_BKH.float().transpose(1, 2).unsqueeze(1),
+            )
+            * self.softmax_scale
+        )
+        scores_BNQK = F.relu(scores_BNQK)
+        index_scores_BQK = torch.matmul(
+            weights_BQN.unsqueeze(-2), scores_BNQK.transpose(1, 2)
+        ).squeeze(-2)
+        index_scores_BQK = index_scores_BQK + attention_mask_BQK.float()
+        topk = min(self.index_topk, index_scores_BQK.shape[-1])
+        return index_scores_BQK.topk(topk, dim=-1).indices.to(torch.int32)
 
 
 class Glm5DsaIndexer(Module):
@@ -37,6 +90,7 @@ class Glm5DsaIndexer(Module):
         k_norm: LayerNorm.Config
         weights_proj: Linear.Config
         rope: ComplexRoPE.Config
+        topk: DSAIndexerTopK.Config
 
         def __post_init__(self) -> None:
             if self.q_lora_rank <= 0:
@@ -47,6 +101,10 @@ class Glm5DsaIndexer(Module):
                 raise ValueError("qk_rope_head_dim must be even.")
             if self.index_topk <= 0:
                 raise ValueError("index_topk must be > 0.")
+            if self.topk.index_topk != self.index_topk:
+                raise ValueError("indexer and topk index_topk must match.")
+            if self.topk.softmax_scale != self.head_dim**-0.5:
+                raise ValueError("topk softmax_scale must equal head_dim**-0.5.")
 
     def __init__(self, config: Config):
         super().__init__()
@@ -60,6 +118,7 @@ class Glm5DsaIndexer(Module):
         self.k_norm = config.k_norm.build()
         self.weights_proj = config.weights_proj.build().float()
         self.rope = config.rope.build()
+        self.topk = config.topk.build()
 
     def _apply(self, fn, recurse: bool = True):
         super()._apply(fn, recurse=recurse)
@@ -91,31 +150,97 @@ class Glm5DsaIndexer(Module):
         q_BLNH = torch.cat((q_rot_BLNR, q_pass_BLNP), dim=-1)
         k_BLH = torch.cat((k_rot_BL1R, k_pass_BL1P), dim=-1).squeeze(2)
 
-        scores_BNLL = (
-            torch.matmul(
-                q_BLNH.float().transpose(1, 2),
-                k_BLH.float().transpose(1, 2).unsqueeze(1),
-            )
-            * self.softmax_scale
-        )
-        scores_BNLL = F.relu(scores_BNLL)
         weights_BLN = self.weights_proj(
             hidden_states_BLD.to(self.weights_proj.weight.dtype)
         ).float() * (self.n_heads**-0.5)
-        index_scores_BLL = torch.matmul(
-            weights_BLN.unsqueeze(-2), scores_BNLL.transpose(1, 2)
-        ).squeeze(-2)
-        if attention_mask_BLL is not None:
-            index_scores_BLL = index_scores_BLL + attention_mask_BLL.float()
-        else:
+        if attention_mask_BLL is None:
             key_positions_11L = torch.arange(L, device=positions_BL.device)[
                 None, None, :
             ]
-            index_scores_BLL = index_scores_BLL.masked_fill(
+            attention_mask_BLL = torch.zeros(
+                B,
+                L,
+                L,
+                dtype=torch.float32,
+                device=positions_BL.device,
+            ).masked_fill(
                 key_positions_11L > positions_BL.unsqueeze(-1), float("-inf")
             )
-        topk = min(self.index_topk, index_scores_BLL.shape[-1])
-        return index_scores_BLL.topk(topk, dim=-1).indices.to(torch.int32)
+        return self.topk(q_BLNH, k_BLH, weights_BLN, attention_mask_BLL)
+
+
+class DSAInnerAttention(Module):
+    """Dense reference implementation of GLM-5 DSA attention.
+
+    Keeping score computation behind an inner-attention boundary makes the
+    configured module real (rather than dead metadata) and gives distributed
+    backends one well-defined kernel boundary for TP and CP support.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        attention_dropout: float = 0.0
+
+        def __post_init__(self) -> None:
+            if not 0.0 <= self.attention_dropout < 1.0:
+                raise ValueError("attention_dropout must be in [0, 1).")
+
+    def __init__(self, config: Config) -> None:
+        super().__init__()
+        self.attention_dropout = config.attention_dropout
+
+    def forward(
+        self,
+        q_BQNH: torch.Tensor,
+        k_BKNH: torch.Tensor,
+        v_BKNV: torch.Tensor,
+        attention_masks_B1QK: torch.Tensor,
+        topk_indices_BQT: torch.Tensor,
+        *,
+        scale: float,
+    ) -> torch.Tensor:
+        if q_BQNH.ndim != 4 or k_BKNH.ndim != 4 or v_BKNV.ndim != 4:
+            raise ValueError("GLM-5 DSA q, k, and v must have rank 4.")
+        B, Q, N, H = q_BQNH.shape
+        K = k_BKNH.shape[1]
+        if k_BKNH.shape != (B, K, N, H):
+            raise ValueError("GLM-5 DSA k must have shape [B, K, N, H].")
+        if v_BKNV.shape[:3] != (B, K, N):
+            raise ValueError("GLM-5 DSA v must have shape [B, K, N, V].")
+        if topk_indices_BQT.shape[:2] != (B, Q):
+            raise ValueError("GLM-5 DSA top-k indices must have shape [B, Q, T].")
+        if attention_masks_B1QK.layout != torch.strided:
+            raise ValueError("GLM-5 DSA requires dense attention_masks.")
+        if attention_masks_B1QK.shape != (B, 1, Q, K):
+            raise ValueError(
+                "attention_masks must have shape [B, 1, query_len, key_len]."
+            )
+        if attention_masks_B1QK.device != q_BQNH.device:
+            raise ValueError("attention_masks must be on the same device as q.")
+        if not attention_masks_B1QK.is_floating_point():
+            raise ValueError("attention_masks must use a floating additive dtype.")
+
+        selected_BQK = torch.zeros_like(
+            attention_masks_B1QK[:, 0], dtype=torch.bool
+        ).scatter(-1, topk_indices_BQT.long(), True)
+        sparse_mask_B1QK = attention_masks_B1QK.masked_fill(
+            ~selected_BQK.unsqueeze(1), torch.finfo(q_BQNH.dtype).min
+        )
+        scores_BNQK = (
+            torch.matmul(
+                q_BQNH.transpose(1, 2),
+                k_BKNH.transpose(1, 2).transpose(-1, -2),
+            )
+            * scale
+        )
+        scores_BNQK = scores_BNQK + sparse_mask_B1QK
+        probs_BNQK = F.softmax(scores_BNQK, dim=-1, dtype=torch.float32).to(
+            q_BQNH.dtype
+        )
+        probs_BNQK = F.dropout(
+            probs_BNQK, p=self.attention_dropout, training=self.training
+        )
+        return torch.matmul(probs_BNQK, v_BKNV.transpose(1, 2)).transpose(1, 2)
 
 
 class Glm5Attention(BaseAttention):
@@ -127,7 +252,6 @@ class Glm5Attention(BaseAttention):
         qk_nope_head_dim: int
         qk_rope_head_dim: int
         v_head_dim: int
-        attention_dropout: float
         wq_a: Linear.Config
         q_norm: RMSNorm.Config
         wq_b: Linear.Config
@@ -137,7 +261,7 @@ class Glm5Attention(BaseAttention):
         wo: Linear.Config
         rope: ComplexRoPE.Config
         indexer: Glm5DsaIndexer.Config
-        inner_attention: Module.Config = field(default_factory=FlexAttention.Config)
+        inner_attention: DSAInnerAttention.Config
 
         @property
         def qk_head_dim(self) -> int:
@@ -160,8 +284,6 @@ class Glm5Attention(BaseAttention):
                 raise ValueError("GLM-5 MLA requires v_head_dim > 0.")
             if self.n_heads <= 0:
                 raise ValueError("GLM-5 MLA requires n_heads > 0.")
-            if not 0.0 <= self.attention_dropout < 1.0:
-                raise ValueError("attention_dropout must be in [0, 1).")
             if (
                 self.wq_a.in_features != self.dim
                 or self.wq_a.out_features != self.q_lora_rank
@@ -212,7 +334,6 @@ class Glm5Attention(BaseAttention):
         self.qk_nope_head_dim = config.qk_nope_head_dim
         self.qk_rope_head_dim = config.qk_rope_head_dim
         self.v_head_dim = config.v_head_dim
-        self.attention_dropout = config.attention_dropout
         self.softmax_scale = config.qk_head_dim**-0.5
         self.wq_a = config.wq_a.build()
         self.q_norm = config.q_norm.build()
@@ -223,6 +344,7 @@ class Glm5Attention(BaseAttention):
         self.wo = config.wo.build()
         self.rope = config.rope.build()
         self.indexer = config.indexer.build()
+        self.inner_attention = config.inner_attention.build()
 
     @property
     def qk_head_dim(self) -> int:
@@ -235,13 +357,20 @@ class Glm5Attention(BaseAttention):
         positions_BL: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if not isinstance(attention_masks, torch.Tensor):
-            raise ValueError("GLM-5 eager attention requires dense attention_masks.")
+            raise ValueError("GLM-5 DSA requires dense attention_masks.")
 
         B, L, _ = x_BLD.shape
         if attention_masks.layout != torch.strided:
-            raise ValueError("GLM-5 eager attention requires dense attention_masks.")
-        if attention_masks.shape != (B, 1, L, L):
-            raise ValueError("attention_masks must have shape [B, 1, L, L].")
+            raise ValueError("GLM-5 DSA requires dense attention_masks.")
+        if (
+            attention_masks.ndim != 4
+            or attention_masks.shape[0] != B
+            or attention_masks.shape[1] != 1
+            or attention_masks.shape[2] != L
+        ):
+            raise ValueError(
+                "attention_masks must have shape [B, 1, query_len, key_len]."
+            )
         if attention_masks.device != x_BLD.device:
             raise ValueError("attention_masks must be on the same device as x_BLD.")
         if not attention_masks.is_floating_point():
@@ -282,33 +411,14 @@ class Glm5Attention(BaseAttention):
             positions_BL,
             attention_masks[:, 0],
         )
-        # The indexer is kept fully Replicated on TP, so its indices and the
-        # mask tensors must stay DTensor-consistent: aten.scatter/masked_fill
-        # reject mixing a plain base tensor with a DTensor arg. Building the
-        # mask from attention_masks (a Replicate DTensor at this boundary under
-        # TP; plain on a single device) keeps every op on a single tensor
-        # class. zeros_like propagates the DTensor layout.
-        selected_BLL = torch.zeros_like(
-            attention_masks[:, 0], dtype=torch.bool
-        ).scatter(-1, topk_indices_BLK.long(), True)
-        min_value = torch.finfo(x_BLD.dtype).min
-        sparse_mask_B1LL = attention_masks.masked_fill(
-            ~selected_BLL.unsqueeze(1), min_value
+        output_BLNV = self.inner_attention(
+            q_BLNH,
+            k_BLNH,
+            v_BLNV,
+            attention_masks,
+            topk_indices_BLK,
+            scale=self.softmax_scale,
         )
-        scores_BNLL = (
-            torch.matmul(
-                q_BLNH.transpose(1, 2), k_BLNH.transpose(1, 2).transpose(-1, -2)
-            )
-            * self.softmax_scale
-        )
-        scores_BNLL = scores_BNLL + sparse_mask_B1LL
-        probs_BNLL = F.softmax(scores_BNLL, dim=-1, dtype=torch.float32).to(
-            q_BLNH.dtype
-        )
-        probs_BNLL = F.dropout(
-            probs_BNLL, p=self.attention_dropout, training=self.training
-        )
-        output_BLNV = torch.matmul(probs_BNLL, v_BLNV.transpose(1, 2)).transpose(1, 2)
         return self.wo(output_BLNV.contiguous().view(B, L, -1))
 
 
@@ -351,12 +461,12 @@ class Glm5TransformerBlock(TransformerBlock):
 
 
 class Glm5Model(Decoder):
-    """Single-device GLM-5 debug decoder with dense DSA-safe masks."""
+    """GLM-5 decoder with dense reference DSA attention."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(Decoder.Config):
-        dim: int = 256
-        vocab_size: int = 2048
+        dim: int = 6144
+        vocab_size: int = 154880
 
         def update_from_config(self, *, config, **kwargs) -> None:
             # This import is deliberately local: the sharding module pulls in
