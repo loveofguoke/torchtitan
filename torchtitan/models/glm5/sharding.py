@@ -246,8 +246,11 @@ def set_glm5_dsa_inner_attention_sharding(inner_attention) -> None:
                 q_layout,
                 kv_grad_layout,
                 kv_grad_layout,
-                None,
-                None,
+                # Mask and top-k indices are non-differentiable metadata, but
+                # they are still DTensor inputs and local_map requires their
+                # placements whenever in_grad_placements is specified.
+                mask_layout,
+                topk_layout,
             )
         ),
     )

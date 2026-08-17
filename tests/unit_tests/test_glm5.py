@@ -1003,6 +1003,13 @@ class TestGlm5Registration(unittest.TestCase):
         self.assertIsNotNone(attention.wo.sharding_config)
         self.assertIsNotNone(attention.inner_attention.sharding_config)
         self.assertIsNotNone(attention.inner_attention.sharding_config.local_map)
+        inner_grad_layouts = (
+            attention.inner_attention.sharding_config.local_map.in_grad_placements
+        )
+        self.assertIsNotNone(inner_grad_layouts)
+        self.assertEqual(len(inner_grad_layouts), 5)
+        self.assertIsNotNone(inner_grad_layouts[3])
+        self.assertIsNotNone(inner_grad_layouts[4])
 
         # DSA indexer: every projection is Replicate on TP (correctness-first:
         # a head-shard would leave topk on a partial score tensor).
