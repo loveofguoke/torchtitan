@@ -475,6 +475,32 @@ class TestGlm5Attention(unittest.TestCase):
         self.assertEqual(actual_BQNV.shape, (1, 2, 2, 3))
         torch.testing.assert_close(actual_BQNV, expected_BQNV)
 
+    def test_attention_allows_independent_index_head_dimension(self):
+        config = _attention_config()
+        index_head_dim = 12
+        indexer = dataclasses.replace(
+            config.indexer,
+            head_dim=index_head_dim,
+            wq_b=Linear.Config(
+                in_features=config.q_lora_rank,
+                out_features=config.indexer.n_heads * index_head_dim,
+            ),
+            wk=Linear.Config(
+                in_features=config.dim,
+                out_features=index_head_dim,
+            ),
+            k_norm=LayerNorm.Config(normalized_shape=index_head_dim),
+            topk=dataclasses.replace(
+                config.indexer.topk,
+                softmax_scale=index_head_dim**-0.5,
+            ),
+        )
+
+        updated = dataclasses.replace(config, indexer=indexer)
+
+        self.assertEqual(updated.qk_head_dim, 8)
+        self.assertEqual(updated.indexer.head_dim, index_head_dim)
+
     def test_attention_topk_cannot_reopen_causal_mask(self):
         attention = _attention_config().build()
         attention.init_states()
