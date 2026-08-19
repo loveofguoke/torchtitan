@@ -43,7 +43,12 @@ def glm5_debugmodel() -> Trainer.Config:
         # for replicated sequences (validate_glm5_parallelism rejects SP with
         # tp > 1). With tp == 1 the flag is inert, but turning it off in the
         # debugmodel keeps a default tp>1 run from tripping the validate error.
-        parallelism=ParallelismConfig(enable_sequence_parallel=False),
+        parallelism=ParallelismConfig(
+            enable_sequence_parallel=False,
+            # Keep one transformer layer on every rank for the eight-layer
+            # debug model under PP8. The final stage also owns norm and lm_head.
+            pipeline_parallel_last_stage_less_layers=0,
+        ),
         checkpoint=CheckpointManager.Config(interval=10),
         activation_checkpoint=None,
     )
