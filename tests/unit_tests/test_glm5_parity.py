@@ -26,18 +26,19 @@ from __future__ import annotations
 import os
 import re
 import unittest
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from html import escape
 from types import MethodType
-from typing import Any, Callable, Iterator
+from typing import Any
 
 import torch
 import torch.nn.functional as F
 
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import TokenChoiceTopKRouter
-from torchtitan.models.glm5 import Glm5StateDictAdapter, glm5_configs
+from torchtitan.models.glm5 import glm5_configs, Glm5StateDictAdapter
 from torchtitan.ops.scatter_add import deterministic_scatter_add
 
 _TRANSFORMERS_IMPORT_ERROR: Exception | None = None
@@ -126,23 +127,31 @@ class ParityDataFactory:
         # Generate deterministic synthetic data for repeatable comparisons.
         if data_case == "zeros":
             hidden_states = torch.zeros(
-                batch_size, sequence_length, hidden_size,
-                device=device, dtype=dtype,
+                batch_size,
+                sequence_length,
+                hidden_size,
+                device=device,
+                dtype=dtype,
             )
         elif data_case == "ones":
             hidden_states = torch.ones(
-                batch_size, sequence_length, hidden_size,
-                device=device, dtype=dtype,
+                batch_size,
+                sequence_length,
+                hidden_size,
+                device=device,
+                dtype=dtype,
             )
         elif data_case == "extreme":
             hidden_states = 20.0 * torch.randn(
-                batch_size, sequence_length, hidden_size,
-                device=device, dtype=dtype, generator=generator,
+                batch_size,
+                sequence_length,
+                hidden_size,
+                device=device,
+                dtype=dtype,
+                generator=generator,
             )
         elif data_case == "alternating":
-            values = torch.tensor(
-                (-1.0, 1.0), device=device, dtype=dtype
-            )
+            values = torch.tensor((-1.0, 1.0), device=device, dtype=dtype)
             pattern = torch.arange(
                 batch_size * sequence_length * hidden_size,
                 device=device,
@@ -150,8 +159,12 @@ class ParityDataFactory:
             hidden_states = values[(pattern % 2).long()]
         elif data_case == "random":
             hidden_states = torch.randn(
-                batch_size, sequence_length, hidden_size,
-                device=device, dtype=dtype, generator=generator,
+                batch_size,
+                sequence_length,
+                hidden_size,
+                device=device,
+                dtype=dtype,
+                generator=generator,
             )
         else:
             raise ValueError(f"unsupported parity data case: {data_case}")
@@ -166,13 +179,18 @@ class ParityDataFactory:
                 )
             elif data_case == "ones":
                 tokens = torch.full(
-                    (batch_size, sequence_length), vocab_size - 1,
-                    device=device, dtype=torch.long,
+                    (batch_size, sequence_length),
+                    vocab_size - 1,
+                    device=device,
+                    dtype=torch.long,
                 )
             elif data_case == "alternating":
-                tokens = torch.arange(
-                    batch_size * sequence_length, device=device
-                ).reshape(batch_size, sequence_length) % vocab_size
+                tokens = (
+                    torch.arange(batch_size * sequence_length, device=device).reshape(
+                        batch_size, sequence_length
+                    )
+                    % vocab_size
+                )
             else:
                 tokens = torch.randint(
                     vocab_size,
@@ -204,7 +222,9 @@ class ParityDataFactory:
         return batch
 
     @staticmethod
-    def cast(batch: ParityBatch, *, model: torch.nn.Module, dtype: torch.dtype) -> ParityBatch:
+    def cast(
+        batch: ParityBatch, *, model: torch.nn.Module, dtype: torch.dtype
+    ) -> ParityBatch:
         """Cast numeric inputs for one endpoint and recompute its RoPE cache."""
         hidden_states = batch.hidden_states.to(dtype=dtype)
         positions = batch.positions
@@ -274,7 +294,7 @@ def _hf_config() -> Any:
         hidden_size=256,
         intermediate_size=1024,
         moe_intermediate_size=256,
-        num_hidden_layers=4,
+        num_hidden_layers=8,
         num_attention_heads=8,
         num_key_value_heads=8,
         n_shared_experts=1,
@@ -296,7 +316,7 @@ def _hf_config() -> Any:
         index_head_dim=64,
         index_n_heads=4,
         first_k_dense_replace=1,
-        indexer_types=["full", "full", "full", "full"],
+        indexer_types=["full"] * 8,
         rope_parameters={"rope_type": "default", "rope_theta": 1_000_000.0},
         use_cache=False,
         _attn_implementation="eager",
@@ -319,9 +339,7 @@ def _build_pair(
     titan_model.init_states()  # Initialize decoder runtime state.
     adapter = Glm5StateDictAdapter(titan_config, hf_assets_path=None)
     # The adapter is the single source of truth for HF -> TorchTitan names.
-    titan_model.load_state_dict(
-        adapter.from_hf(hf_model.state_dict()), strict=True
-    )
+    titan_model.load_state_dict(adapter.from_hf(hf_model.state_dict()), strict=True)
     pair = ParityModelPair(
         hf=hf_model.to(device).eval(),
         titan=titan_model.to(device).eval(),
@@ -364,24 +382,16 @@ def _set_hf_routed_expert_compute_dtype(
                 expert_mask = F.one_hot(
                     top_k_index, num_classes=self.num_experts
                 ).permute(2, 1, 0)
-                expert_hit = torch.greater(
-                    expert_mask.sum(dim=(-1, -2)), 0
-                ).nonzero()
+                expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
                 for expert_index_tensor in expert_hit:
                     expert_index = expert_index_tensor[0]
-                    top_k_position, token_index = torch.where(
-                        expert_mask[expert_index]
-                    )
+                    top_k_position, token_index = torch.where(expert_mask[expert_index])
                     current_state = hidden_states[token_index].to(_compute_dtype)
-                    gate_weight, up_weight = self.gate_up_proj[
-                        expert_index
-                    ].chunk(2, dim=0)
-                    gate = F.linear(
-                        current_state, gate_weight.to(_compute_dtype)
+                    gate_weight, up_weight = self.gate_up_proj[expert_index].chunk(
+                        2, dim=0
                     )
-                    up = F.linear(
-                        current_state, up_weight.to(_compute_dtype)
-                    )
+                    gate = F.linear(current_state, gate_weight.to(_compute_dtype))
+                    up = F.linear(current_state, up_weight.to(_compute_dtype))
                     current_hidden_states = self.act_fn(gate) * up
                     current_hidden_states = F.linear(
                         current_hidden_states,
@@ -676,10 +686,7 @@ class ParityRecorder:
     def _path_key(cls, result: ComparisonResult) -> tuple[tuple[int, object], ...]:
         path = cls._display_path(result)
         parts = [part for part in re.split(r"(\d+)", path) if part]
-        return tuple(
-            (0, int(part)) if part.isdigit() else (1, part)
-            for part in parts
-        )
+        return tuple((0, int(part)) if part.isdigit() else (1, part) for part in parts)
 
     @staticmethod
     def _phase(result: ComparisonResult) -> int:
@@ -716,11 +723,7 @@ class ParityRecorder:
         checkpoint_total = sum(result.checkpoint for result in self.results)
         trace_total = len(self.results) - checkpoint_total
         passed = checkpoint_total - len(self.failed)
-        rate = (
-            100.0
-            if checkpoint_total == 0
-            else 100.0 * passed / checkpoint_total
-        )
+        rate = 100.0 if checkpoint_total == 0 else 100.0 * passed / checkpoint_total
         component_names = sorted({result.component for result in self.results})
         return (
             f"rows={len(self.results)} checkpoints={checkpoint_total} "
@@ -751,7 +754,12 @@ class ParityRecorder:
         atol = self.precision.atol if atol is None else atol
         if actual_cpu.shape != expected_cpu.shape:
             result = ComparisonResult(
-                scope, component, self.precision_label, layer, 0, False,
+                scope,
+                component,
+                self.precision_label,
+                layer,
+                0,
+                False,
                 module_path=module_path,
                 detail=f"shape {tuple(actual_cpu.shape)} != {tuple(expected_cpu.shape)}",
                 parent_path=parent_path,
@@ -771,14 +779,16 @@ class ParityRecorder:
                 position_max = diff.amax(dim=tuple([0] + list(range(2, diff.ndim))))
                 peak_position = int(position_max.argmax())
                 mismatch_mask = diff > atol + rtol * expected_cpu.abs()
-                position_mismatch = mismatch_mask.any(dim=tuple([0] + list(range(2, diff.ndim))))
+                position_mismatch = mismatch_mask.any(
+                    dim=tuple([0] + list(range(2, diff.ndim)))
+                )
                 mismatch_positions = [
-                    index for index, value in enumerate(position_mismatch.tolist()) if value
+                    index
+                    for index, value in enumerate(position_mismatch.tolist())
+                    if value
                 ]
                 detail = f"peak_position={peak_position}"
-            mismatch_count = int(
-                (diff > atol + rtol * expected_cpu.abs()).sum().item()
-            )
+            mismatch_count = int((diff > atol + rtol * expected_cpu.abs()).sum().item())
             result = ComparisonResult(
                 scope,
                 component,
@@ -918,8 +928,7 @@ class ParityRecorder:
     @property
     def failed(self) -> list[ComparisonResult]:
         return [
-            result for result in self.results
-            if result.checkpoint and not result.passed
+            result for result in self.results if result.checkpoint and not result.passed
         ]
 
     @staticmethod
@@ -978,8 +987,7 @@ class ParityRecorder:
         for result in self.ordered_results():
             status = self._status(result)
             status_class = (
-                "pass" if status == "PASS"
-                else "fail" if status == "FAIL" else "trace"
+                "pass" if status == "PASS" else "fail" if status == "FAIL" else "trace"
             )
             rows.append(
                 "<tr>"
@@ -1103,8 +1111,12 @@ def _format_parity_diagnostics(
 ) -> str:
     """Format layer-local block, indexer, and router parity evidence."""
     expected_record_names = (
-        "hf_blocks", "titan_blocks", "hf_indexer", "titan_indexer",
-        "hf_router", "titan_router",
+        "hf_blocks",
+        "titan_blocks",
+        "hf_indexer",
+        "titan_indexer",
+        "hf_router",
+        "titan_router",
     )
     missing_record_names = [
         name for name in expected_record_names if name not in records
@@ -1112,21 +1124,29 @@ def _format_parity_diagnostics(
     if missing_record_names:
         return f"missing record groups: {missing_record_names}"
     recorder = ParityRecorder(BF16)
-    for layer in sorted(set(records.get("hf_blocks", {})) | set(records.get("titan_blocks", {}))):
+    for layer in sorted(
+        set(records.get("hf_blocks", {})) | set(records.get("titan_blocks", {}))
+    ):
         hf_block = records.get("hf_blocks", {}).get(layer)
         titan_block = records.get("titan_blocks", {}).get(layer)
         if hf_block is not None and titan_block is not None:
             recorder.tensor(
-                scope="e2e", component="block", layer=layer,
-                actual=titan_block, expected=hf_block,
+                scope="e2e",
+                component="block",
+                layer=layer,
+                actual=titan_block,
+                expected=hf_block,
             )
         for component in ("indexer", "router"):
             hf_value = records.get(f"hf_{component}", {}).get(layer)
             titan_value = records.get(f"titan_{component}", {}).get(layer)
             if hf_value is not None and titan_value is not None:
                 recorder.discrete(
-                    scope="e2e", component=component, layer=layer,
-                    actual=titan_value, expected=hf_value,
+                    scope="e2e",
+                    component=component,
+                    layer=layer,
+                    actual=titan_value,
+                    expected=hf_value,
                     positions=positions_BL,
                 )
     lines = []
@@ -1248,7 +1268,9 @@ class LayerTrace:
 
     @staticmethod
     @contextmanager
-    def install(pair: ParityModelPair, layer_indices: list[int]) -> Iterator["LayerTrace"]:
+    def install(
+        pair: ParityModelPair, layer_indices: list[int]
+    ) -> Iterator["LayerTrace"]:
         trace = LayerTrace()
         handles = []
 
@@ -1264,19 +1286,36 @@ class LayerTrace:
         for layer_index in layer_indices:
             hf_layer = pair.hf_layer(layer_index)
             titan_layer = pair.titan_layer(layer_index)
-            handles.append(hf_layer.register_forward_hook(
-                lambda _m, _i, o, layer=layer_index: save(trace.blocks_hf, layer, o, 0)
-            ))
-            handles.append(titan_layer.register_forward_hook(
-                lambda _m, _i, o, layer=layer_index: save(trace.blocks_titan, layer, o)
-            ))
-            handles.append(hf_layer.self_attn.indexer.register_forward_hook(
-                lambda _m, _i, o, layer=layer_index: save(trace.indexer_hf, layer, o)
-            ))
-            handles.append(titan_layer.attention.indexer.register_forward_hook(
-                lambda _m, _i, o, layer=layer_index: save(trace.indexer_titan, layer, o)
-            ))
+            handles.append(
+                hf_layer.register_forward_hook(
+                    lambda _m, _i, o, layer=layer_index: save(
+                        trace.blocks_hf, layer, o, 0
+                    )
+                )
+            )
+            handles.append(
+                titan_layer.register_forward_hook(
+                    lambda _m, _i, o, layer=layer_index: save(
+                        trace.blocks_titan, layer, o
+                    )
+                )
+            )
+            handles.append(
+                hf_layer.self_attn.indexer.register_forward_hook(
+                    lambda _m, _i, o, layer=layer_index: save(
+                        trace.indexer_hf, layer, o
+                    )
+                )
+            )
+            handles.append(
+                titan_layer.attention.indexer.register_forward_hook(
+                    lambda _m, _i, o, layer=layer_index: save(
+                        trace.indexer_titan, layer, o
+                    )
+                )
+            )
             if getattr(titan_layer, "moe_enabled", False):
+
                 def save_hf_router(
                     _module, inputs, output, *, layer=layer_index
                 ) -> None:
@@ -1285,9 +1324,13 @@ class LayerTrace:
                     trace.router_hf[layer] = value.detach().cpu()
 
                 handles.append(hf_layer.mlp.gate.register_forward_hook(save_hf_router))
-                handles.append(titan_layer.moe.router.register_forward_hook(
-                    lambda _m, _i, o, layer=layer_index: save(trace.router_titan, layer, o, 1)
-                ))
+                handles.append(
+                    titan_layer.moe.router.register_forward_hook(
+                        lambda _m, _i, o, layer=layer_index: save(
+                            trace.router_titan, layer, o, 1
+                        )
+                    )
+                )
         try:
             yield trace
         finally:
@@ -1323,7 +1366,9 @@ class EndpointTrace:
             trace.router_weights[label] = {}
             trace.expert_load[label] = {}
             trace.moe_inputs[label] = {}
-            layers = model.model.layers if endpoint.implementation == "hf" else model.layers
+            layers = (
+                model.model.layers if endpoint.implementation == "hf" else model.layers
+            )
             for layer_index in layer_indices:
                 layer = (
                     layers[layer_index]
@@ -1341,12 +1386,16 @@ class EndpointTrace:
                     implementation=endpoint.implementation,
                 ) -> None:
                     value = output[0] if implementation == "hf" else output
-                    trace.blocks[label][layer_index] = _first_tensor(value).detach().cpu()
+                    trace.blocks[label][layer_index] = (
+                        _first_tensor(value).detach().cpu()
+                    )
 
                 def capture_indexer(
                     _module, _inputs, output, *, label=label, layer_index=layer_index
                 ) -> None:
-                    trace.indexer[label][layer_index] = _first_tensor(output).detach().cpu()
+                    trace.indexer[label][layer_index] = (
+                        _first_tensor(output).detach().cpu()
+                    )
 
                 handles.append(layer.register_forward_hook(capture_block))
                 indexer = (
@@ -1356,6 +1405,7 @@ class EndpointTrace:
                 )
                 handles.append(indexer.register_forward_hook(capture_indexer))
                 if endpoint.implementation == "hf" and hasattr(layer.mlp, "gate"):
+
                     def capture_moe_input(
                         _module, inputs, *, label=label, layer_index=layer_index
                     ) -> None:
@@ -1372,16 +1422,24 @@ class EndpointTrace:
                         indices = output[2].view(batch_size, sequence_length, -1)
                         weights = output[1].view(batch_size, sequence_length, -1)
                         trace.router[label][layer_index] = indices.detach().cpu()
-                        trace.router_weights[label][layer_index] = (
-                            weights.detach().cpu()
+                        trace.router_weights[label][
+                            layer_index
+                        ] = weights.detach().cpu()
+                        trace.expert_load[label][layer_index] = (
+                            F.one_hot(
+                                indices,
+                                num_classes=_module.num_experts,
+                            )
+                            .sum(dim=(0, 1, 2))
+                            .detach()
+                            .cpu()
                         )
-                        trace.expert_load[label][layer_index] = F.one_hot(
-                            indices,
-                            num_classes=_module.num_experts,
-                        ).sum(dim=(0, 1, 2)).detach().cpu()
 
-                    handles.append(layer.mlp.gate.register_forward_hook(capture_hf_router))
+                    handles.append(
+                        layer.mlp.gate.register_forward_hook(capture_hf_router)
+                    )
                 elif getattr(layer, "moe_enabled", False):
+
                     def capture_moe_input(
                         _module, inputs, *, label=label, layer_index=layer_index
                     ) -> None:
@@ -1392,19 +1450,31 @@ class EndpointTrace:
                     )
 
                     def capture_titan_router(
-                        _module, _inputs, output, *, label=label, layer_index=layer_index
+                        _module,
+                        _inputs,
+                        output,
+                        *,
+                        label=label,
+                        layer_index=layer_index,
                     ) -> None:
                         indices = output[1]
                         trace.router[label][layer_index] = indices.detach().cpu()
                         trace.router_weights[label][layer_index] = (
                             output[0].detach().cpu()
                         )
-                        trace.expert_load[label][layer_index] = F.one_hot(
-                            indices,
-                            num_classes=_module.num_experts,
-                        ).sum(dim=(0, 1, 2)).detach().cpu()
+                        trace.expert_load[label][layer_index] = (
+                            F.one_hot(
+                                indices,
+                                num_classes=_module.num_experts,
+                            )
+                            .sum(dim=(0, 1, 2))
+                            .detach()
+                            .cpu()
+                        )
 
-                    handles.append(layer.moe.router.register_forward_hook(capture_titan_router))
+                    handles.append(
+                        layer.moe.router.register_forward_hook(capture_titan_router)
+                    )
         try:
             yield trace
         finally:
@@ -1433,7 +1503,9 @@ class RecursiveModuleTrace:
             label = endpoint.label
             trace.activations[label] = {}
             trace.gradients[label] = {}
-            layers = model.model.layers if endpoint.implementation == "hf" else model.layers
+            layers = (
+                model.model.layers if endpoint.implementation == "hf" else model.layers
+            )
             for layer_index in layer_indices:
                 layer = (
                     layers[layer_index]
@@ -1457,12 +1529,14 @@ class RecursiveModuleTrace:
                         path=path,
                     ) -> None:
                         for suffix, value in _tensor_leaves(output):
-                            trace.activations[label][path + suffix] = value.detach().cpu()
+                            trace.activations[label][
+                                path + suffix
+                            ] = value.detach().cpu()
                             if value.requires_grad:
                                 value.register_hook(
-                                    lambda gradient,
-                                    label=label,
-                                    path=path + suffix: trace.gradients[label].__setitem__(
+                                    lambda gradient, label=label, path=path + suffix: trace.gradients[
+                                        label
+                                    ].__setitem__(
                                         path, gradient.detach().cpu()
                                     )
                                 )
@@ -1470,9 +1544,7 @@ class RecursiveModuleTrace:
                     handles.append(module.register_forward_hook(capture))
             if include_model_modules:
                 layer_prefix = (
-                    "model.layers."
-                    if endpoint.implementation == "hf"
-                    else "layers."
+                    "model.layers." if endpoint.implementation == "hf" else "layers."
                 )
                 for suffix, module in model.named_modules():
                     if (
@@ -1492,12 +1564,14 @@ class RecursiveModuleTrace:
                         path=path,
                     ) -> None:
                         for branch, value in _tensor_leaves(output):
-                            trace.activations[label][path + branch] = value.detach().cpu()
+                            trace.activations[label][
+                                path + branch
+                            ] = value.detach().cpu()
                             if value.requires_grad:
                                 value.register_hook(
-                                    lambda gradient,
-                                    label=label,
-                                    path=path + branch: trace.gradients[label].__setitem__(
+                                    lambda gradient, label=label, path=path + branch: trace.gradients[
+                                        label
+                                    ].__setitem__(
                                         path, gradient.detach().cpu()
                                     )
                                 )
@@ -1606,9 +1680,7 @@ class ComponentParityMixin:
         )
 
     def _normalized(self, layer_index: int) -> torch.Tensor:
-        return self.pair.hf_layer(layer_index).input_layernorm(
-            self.batch.hidden_states
-        )
+        return self.pair.hf_layer(layer_index).input_layernorm(self.batch.hidden_states)
 
     def _normalized_hidden_states(self, layer_index: int) -> torch.Tensor:
         """Compatibility alias for the original component-test helper."""
@@ -1658,7 +1730,7 @@ class ComponentParityMixin:
             f"layers.{layer_index}.",
         ):
             if name.startswith(prefix):
-                name = name[len(prefix):]
+                name = name[len(prefix) :]
                 break
         name = re.sub(r"^(?:model\.)?layers\.\d+\.", "", name)
         if name in {"decoder_block", "layer", "block", ""}:
@@ -1774,7 +1846,10 @@ class ComponentParityMixin:
             "input_norm": (hf_layer.input_layernorm, titan_layer.attention_norm),
             "ffn_norm": (hf_layer.post_attention_layernorm, titan_layer.ffn_norm),
             "q_norm": (hf_layer.self_attn.q_a_layernorm, titan_layer.attention.q_norm),
-            "kv_norm": (hf_layer.self_attn.kv_a_layernorm, titan_layer.attention.kv_norm),
+            "kv_norm": (
+                hf_layer.self_attn.kv_a_layernorm,
+                titan_layer.attention.kv_norm,
+            ),
         }
         if component == "router":
             if not hasattr(titan_layer, "moe"):
@@ -1816,9 +1891,7 @@ class ComponentParityMixin:
             spec.actual: self._model(spec.actual),
             spec.expected: self._model(spec.expected),
         }
-        recorder = ParityRecorder(
-            spec.actual.precision, precision_label=spec.label
-        )
+        recorder = ParityRecorder(spec.actual.precision, precision_label=spec.label)
         with RecursiveModuleTrace.install(
             endpoints, [], include_model_modules=True
         ) as trace:
@@ -1887,9 +1960,7 @@ class ComponentParityMixin:
             spec.actual: self._model(spec.actual),
             spec.expected: self._model(spec.expected),
         }
-        recorder = ParityRecorder(
-            spec.actual.precision, precision_label=spec.label
-        )
+        recorder = ParityRecorder(spec.actual.precision, precision_label=spec.label)
         with RecursiveModuleTrace.install(endpoints, layer_indices) as trace:
             for endpoint in (spec.actual, spec.expected):
                 batch = self._batch_for(endpoint)
@@ -1975,9 +2046,7 @@ class ComponentParityMixin:
         }
         if component in runners and spec is None and not sequential:
             recorder = runners[component](layer_indices)
-            self._record_component_trace(
-                component, layer_indices, recorder
-            )
+            self._record_component_trace(component, layer_indices, recorder)
             return recorder
         return self.compare_component_trace(
             component, layer_indices, spec=spec, sequential=sequential
@@ -1989,11 +2058,16 @@ class ComponentParityMixin:
             hf_attention = self.pair.hf_layer(layer_index).self_attn
             titan_attention = self.pair.titan_layer(layer_index).attention
             hidden_states = self._normalized(layer_index)
-            hf_q_resid = hf_attention.q_a_layernorm(hf_attention.q_a_proj(hidden_states))
+            hf_q_resid = hf_attention.q_a_layernorm(
+                hf_attention.q_a_proj(hidden_states)
+            )
             titan_q_resid = titan_attention.q_norm(titan_attention.wq_a(hidden_states))
             recorder.tensor(
-                scope="component", component="q_residual", layer=layer_index,
-                actual=titan_q_resid, expected=hf_q_resid,
+                scope="component",
+                component="q_residual",
+                layer=layer_index,
+                actual=titan_q_resid,
+                expected=hf_q_resid,
                 rtol=1e-6 if self.precision is FP32 else self.precision.rtol,
                 atol=1e-7 if self.precision is FP32 else self.precision.atol,
                 module_path=(
@@ -2006,16 +2080,25 @@ class ComponentParityMixin:
             )
             common_q_resid = hf_q_resid
             hf_topk = hf_attention.indexer(
-                hidden_states, common_q_resid, self.batch.hf_position_embeddings,
-                self.batch.causal_mask[:, 0], self.batch.positions,
+                hidden_states,
+                common_q_resid,
+                self.batch.hf_position_embeddings,
+                self.batch.causal_mask[:, 0],
+                self.batch.positions,
             )
             titan_topk = titan_attention.indexer(
-                hidden_states, common_q_resid, self.batch.positions,
+                hidden_states,
+                common_q_resid,
+                self.batch.positions,
                 self.batch.causal_mask[:, 0],
             )
             recorder.discrete(
-                scope="component", component="indexer", layer=layer_index,
-                actual=titan_topk, expected=hf_topk, positions=self.batch.positions,
+                scope="component",
+                component="indexer",
+                layer=layer_index,
+                actual=titan_topk,
+                expected=hf_topk,
+                positions=self.batch.positions,
                 module_path=self._module_path(layer_index, "indexer"),
                 parent_path=f"layers.{layer_index}.attention",
                 level=4,
@@ -2035,15 +2118,20 @@ class ComponentParityMixin:
                 normalized, titan_moe.expert_bias_E
             )
             recorder.discrete(
-                scope="component", component="router_indices", layer=layer_index,
-                actual=titan_indices.view_as(hf_indices), expected=hf_indices,
+                scope="component",
+                component="router_indices",
+                layer=layer_index,
+                actual=titan_indices.view_as(hf_indices),
+                expected=hf_indices,
                 module_path=self._module_path(layer_index, "router"),
                 parent_path=f"layers.{layer_index}.moe",
                 level=4,
                 node_kind="discrete_checkpoint",
             )
             recorder.tensor(
-                scope="component", component="router_weights", layer=layer_index,
+                scope="component",
+                component="router_weights",
+                layer=layer_index,
                 actual=titan_weights,
                 expected=hf_weights.view_as(titan_weights),
                 rtol=1e-6,
@@ -2069,8 +2157,11 @@ class ComponentParityMixin:
                 normalized, self.batch.causal_mask, self.batch.positions
             )
             recorder.tensor(
-                scope="component", component="attention", layer=layer_index,
-                actual=titan_output, expected=hf_output,
+                scope="component",
+                component="attention",
+                layer=layer_index,
+                actual=titan_output,
+                expected=hf_output,
                 module_path=self._module_path(layer_index, "attention"),
                 parent_path=f"layers.{layer_index}",
                 level=3,
@@ -2094,8 +2185,11 @@ class ComponentParityMixin:
                 self.batch.positions,
             )
             recorder.tensor(
-                scope="composition", component="decoder_block", layer=layer_index,
-                actual=titan_output, expected=hf_output,
+                scope="composition",
+                component="decoder_block",
+                layer=layer_index,
+                actual=titan_output,
+                expected=hf_output,
                 module_path=self._module_path(layer_index, "block"),
                 parent_path="layers",
                 level=2,
@@ -2157,14 +2251,19 @@ class _ParityDiagnostics:
     def _check_recorder_reports_tensor_and_discrete_rows(self) -> None:
         recorder = ParityRecorder(BF16)
         recorder.tensor(
-            scope="component", component="block", layer=1,
+            scope="component",
+            component="block",
+            layer=1,
             actual=torch.tensor([1.0, 1.5]),
             expected=torch.tensor([1.0, 1.0]),
             module_path="layers.1.moe.routed_experts.7.w1",
         )
         recorder.discrete(
-            scope="component", component="indexer", layer=1,
-            actual=torch.tensor([[[0, 2]]]), expected=torch.tensor([[[0, 1]]]),
+            scope="component",
+            component="indexer",
+            layer=1,
+            actual=torch.tensor([[[0, 2]]]),
+            expected=torch.tensor([[[0, 1]]]),
         )
         report = recorder.table()
         self.assertIn("block", report)
@@ -2175,8 +2274,11 @@ class _ParityDiagnostics:
     def _check_recorder_writes_plain_text_report(self) -> None:
         recorder = ParityRecorder(FP32)
         recorder.tensor(
-            scope="unit", component="identity", layer="-",
-            actual=torch.ones(2), expected=torch.ones(2),
+            scope="unit",
+            component="identity",
+            layer="-",
+            actual=torch.ones(2),
+            expected=torch.ones(2),
         )
         self.assertIn("pass_rate=100.0%", recorder.write())
 
@@ -2216,7 +2318,11 @@ class _ParityRouterPrecision:
         finally:
             hook.remove()
         expected_scores = torch.sigmoid(
-            F.linear(hidden_states.float(), router.gate.weight.float(), router.gate.bias.float())
+            F.linear(
+                hidden_states.float(),
+                router.gate.weight.float(),
+                router.gate.bias.float(),
+            )
         )
         self.assertEqual(calls, 1)
         torch.testing.assert_close(scores, expected_scores, rtol=0, atol=0)
@@ -2237,8 +2343,7 @@ class _ParityComponentTests(ComponentParityMixin):
         """Publish one test now or register it with the active suite report."""
         recorder.precision_label = self._configured_report_label()
         recorder.title = (
-            f"{title} [{recorder.precision_label}] "
-            f"(layers={self.LAYER_INDICES})"
+            f"{title} [{recorder.precision_label}] " f"(layers={self.LAYER_INDICES})"
         )
         if self._active_suite_report is not None:
             self._active_suite_report.add(section_id, recorder)
@@ -2289,8 +2394,6 @@ class _ParityComponentTests(ComponentParityMixin):
 
     def _check_dense_block_output(self) -> ParityRecorder:
         return self._configured_component_recorder("block")
-
-
 
 
 class TestGlm5Parity(
@@ -2350,7 +2453,9 @@ class TestGlm5Parity(
         try:
             precision = policies[precision_name]
         except KeyError as error:
-            raise ValueError(f"unsupported GLM-5 precision: {precision_name}") from error
+            raise ValueError(
+                f"unsupported GLM-5 precision: {precision_name}"
+            ) from error
         return ModelEndpoint(implementation, precision)
 
     @classmethod
@@ -2367,7 +2472,9 @@ class TestGlm5Parity(
     def setUpClass(cls) -> None:
         if _TRANSFORMERS_IMPORT_ERROR is not None:
             cls.gpu_ready = False
-            cls.gpu_skip_reason = f"Transformers unavailable: {_TRANSFORMERS_IMPORT_ERROR!r}"
+            cls.gpu_skip_reason = (
+                f"Transformers unavailable: {_TRANSFORMERS_IMPORT_ERROR!r}"
+            )
             return
         if not torch.cuda.is_available():
             cls.gpu_ready = False
@@ -2405,9 +2512,7 @@ class TestGlm5Parity(
                 _set_hf_routed_expert_compute_dtype(
                     pair.hf,
                     torch.bfloat16,
-                    use_grouped_mm=(
-                        cls.HF_ROUTED_EXPERT_COMPUTE == "grouped_mm"
-                    ),
+                    use_grouped_mm=(cls.HF_ROUTED_EXPERT_COMPUTE == "grouped_mm"),
                 )
             cls.pairs[precision.name] = pair
             cls.models[("hf", precision.name)] = pair.hf
@@ -2519,9 +2624,7 @@ class TestGlm5Parity(
             "indexer": ".self_attn.indexer"
             if endpoint.implementation == "hf"
             else ".attention.indexer",
-            "router": ".mlp.gate"
-            if endpoint.implementation == "hf"
-            else ".moe.router",
+            "router": ".mlp.gate" if endpoint.implementation == "hf" else ".moe.router",
         }[component]
         return f"{endpoint.label}:{base}.{layer}{suffix}"
 
@@ -2667,17 +2770,17 @@ class TestGlm5Parity(
                 continue
             values = logical[logical_path]
             layer_match = re.match(r"layers\.(\d+)", base_logical)
-            layer: int | str = (
-                int(layer_match.group(1)) if layer_match else "global"
-            )
+            layer: int | str = int(layer_match.group(1)) if layer_match else "global"
             parent_path = base_logical.rpartition(".")[0]
             level = len(logical_path.split(".")) - 1
             component = logical_path.rsplit(".", 1)[-1]
             checkpoint = (
-                composition_checkpoints
-                and base_logical.endswith((".attention", ".moe", ".feed_forward"))
-            ) or base_logical in filter_paths or (
-                leaf_filter and base_logical.endswith(f".{normalized_filter}")
+                (
+                    composition_checkpoints
+                    and base_logical.endswith((".attention", ".moe", ".feed_forward"))
+                )
+                or base_logical in filter_paths
+                or (leaf_filter and base_logical.endswith(f".{normalized_filter}"))
             )
             node_kind = "composition_checkpoint" if checkpoint else "activation"
             actual_value = values.get(spec.actual.label)
@@ -2687,10 +2790,7 @@ class TestGlm5Parity(
                 f" <-> {spec.expected.label}:"
                 f"{expected_value[0] if expected_value else logical_path}"
             )
-            if (
-                actual_value is not None
-                and spec.actual.label == spec.expected.label
-            ):
+            if actual_value is not None and spec.actual.label == spec.expected.label:
                 expected_value = actual_value
             if actual_value is None or expected_value is None:
                 recorder.missing(
@@ -2844,16 +2944,14 @@ class TestGlm5Parity(
                 continue
             values = logical[logical_path]
             layer_match = re.match(r"layers\.(\d+)", base_logical)
-            layer: int | str = (
-                int(layer_match.group(1)) if layer_match else "global"
-            )
+            layer: int | str = int(layer_match.group(1)) if layer_match else "global"
             parent_path = base_logical.rpartition(".")[0]
             level = len(logical_path.split(".")) - 1
             component = logical_path.rsplit(".", 1)[-1]
-            checkpoint = base_logical.endswith(
-                (".attention", ".moe", ".feed_forward")
-            ) or base_logical in filter_paths or (
-                leaf_filter and base_logical.endswith(f".{normalized_filter}")
+            checkpoint = (
+                base_logical.endswith((".attention", ".moe", ".feed_forward"))
+                or base_logical in filter_paths
+                or (leaf_filter and base_logical.endswith(f".{normalized_filter}"))
             )
             node_kind = "gradient_checkpoint" if checkpoint else "gradient_activation"
             actual_value = values.get(spec.actual.label)
@@ -2863,10 +2961,7 @@ class TestGlm5Parity(
                 f" <-> {spec.expected.label}:"
                 f"{expected_value[0] if expected_value else logical_path}.grad"
             )
-            if (
-                actual_value is not None
-                and spec.actual.label == spec.expected.label
-            ):
+            if actual_value is not None and spec.actual.label == spec.expected.label:
                 expected_value = actual_value
             if actual_value is None or expected_value is None:
                 recorder.missing(
@@ -2924,9 +3019,7 @@ class TestGlm5Parity(
             num_experts = mlp.experts.num_experts
         else:
             moe = model.layers[str(layer_index)].moe
-            weights, indices, scores = moe.router(
-                hidden_states, moe.expert_bias_E
-            )
+            weights, indices, scores = moe.router(hidden_states, moe.expert_bias_E)
             routing_map = torch.zeros_like(scores, dtype=torch.bool).scatter_(
                 -1, indices, True
             )
@@ -3085,9 +3178,7 @@ class TestGlm5Parity(
             if expected_model is not actual_model:
                 expected_loss.backward()
 
-        self._record_common_input_moe_replay(
-            spec, trace, recorder, layer_indices
-        )
+        self._record_common_input_moe_replay(spec, trace, recorder, layer_indices)
 
         self._record_recursive_trace(
             spec, module_trace, recorder, layer_indices=layer_indices
@@ -3262,9 +3353,7 @@ class TestGlm5Parity(
         self._record_gradient_tree(spec, recorder)
         return recorder
 
-    def _canonical_state(
-        self, endpoint: ModelEndpoint
-    ) -> dict[str, torch.Tensor]:
+    def _canonical_state(self, endpoint: ModelEndpoint) -> dict[str, torch.Tensor]:
         # Parameters are the stable adapter surface; transient buffers such
         # as rotary caches are intentionally excluded from this tree.
         state = dict(self._model(endpoint).named_parameters())
@@ -3307,10 +3396,7 @@ class TestGlm5Parity(
         actual_state, actual_missing = self._canonical_gradient(spec.actual)
         expected_state, expected_missing = self._canonical_gradient(spec.expected)
         for key in sorted(
-            set(actual_state)
-            | set(expected_state)
-            | actual_missing
-            | expected_missing
+            set(actual_state) | set(expected_state) | actual_missing | expected_missing
         ):
             actual = actual_state.get(key)
             expected = expected_state.get(key)
@@ -3341,9 +3427,7 @@ class TestGlm5Parity(
                     parent_path=parent_path,
                     level=level,
                     node_kind="gradient",
-                    checkpoint=not (
-                        key in actual_missing and key in expected_missing
-                    ),
+                    checkpoint=not (key in actual_missing and key in expected_missing),
                     detail=(
                         f"gradient missing actual={actual is not None}, "
                         f"expected={expected is not None}"
@@ -3372,9 +3456,7 @@ class TestGlm5Parity(
                 for expert in range(actual.shape[0]):
                     actual_expert_path = f"{actual_key}[expert={expert}]"
                     expected_expert_path = f"{expected_key}[expert={expert}]"
-                    expert_parent = (
-                        f"layers.{layer}.moe.routed_experts.{expert}"
-                    )
+                    expert_parent = f"layers.{layer}.moe.routed_experts.{expert}"
                     recorder.tensor(
                         scope="gradient",
                         component=f"expert_{expert_name}_gradient",
@@ -3484,6 +3566,7 @@ class TestGlm5Parity(
             ):
                 expert_name, hf_projection = routed_suffix
                 for expert in range(actual.shape[0]):
+
                     def expert_path(endpoint: ModelEndpoint) -> str:
                         if endpoint.implementation == "titan":
                             return (
@@ -3514,12 +3597,11 @@ class TestGlm5Parity(
                         rtol=spec.rtol,
                         atol=spec.atol,
                         module_path=module_path,
-                        parent_path=(
-                            f"layers.{layer}.moe.routed_experts.{expert}"
-                        ),
+                        parent_path=(f"layers.{layer}.moe.routed_experts.{expert}"),
                         level=len(
                             f"layers.{layer}.moe.routed_experts.{expert}".split(".")
-                        ) - 1,
+                        )
+                        - 1,
                         node_kind="parameter",
                         checkpoint=False,
                     )

@@ -9,6 +9,7 @@
 
 import dataclasses
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -23,21 +24,18 @@ from torchtitan.distributed.pipeline_parallel import (
     _split_module,
     pipeline_llm,
 )
-from torchtitan.models.common import (
-    ComplexRoPE,
-    FlexAttention,
-    LayerNorm,
-    Linear,
-    RMSNorm,
-)
+from torchtitan.models.common import ComplexRoPE, LayerNorm, Linear, RMSNorm
 from torchtitan.models.glm5 import build_glm5_layers, glm5_configs, Glm5StateDictAdapter
 from torchtitan.models.glm5.config_registry import glm5_debugmodel
 from torchtitan.models.glm5.model import (
+    DSAIndexerTopK,
+    DSAInnerAttention,
     Glm5Attention,
     Glm5DsaIndexer,
     Glm5Model,
     Glm5TransformerBlock,
 )
+from torchtitan.models.glm5.parallelize import apply_glm5_cp_to_forward
 
 
 def _indexer_config() -> Glm5DsaIndexer.Config:
@@ -53,6 +51,7 @@ def _indexer_config() -> Glm5DsaIndexer.Config:
         k_norm=LayerNorm.Config(normalized_shape=8),
         weights_proj=Linear.Config(in_features=16, out_features=2),
         rope=ComplexRoPE.Config(dim=4, max_seq_len=8, theta=1_000_000),
+        topk=DSAIndexerTopK.Config(index_topk=3, softmax_scale=8**-0.5),
     )
 
 
@@ -65,7 +64,6 @@ def _attention_config() -> Glm5Attention.Config:
         qk_nope_head_dim=4,
         qk_rope_head_dim=4,
         v_head_dim=4,
-        attention_dropout=0.0,
         wq_a=Linear.Config(in_features=16, out_features=8),
         q_norm=RMSNorm.Config(normalized_shape=8),
         wq_b=Linear.Config(in_features=8, out_features=16),
@@ -75,7 +73,7 @@ def _attention_config() -> Glm5Attention.Config:
         wo=Linear.Config(in_features=8, out_features=16),
         rope=ComplexRoPE.Config(dim=4, max_seq_len=8, theta=1_000_000),
         indexer=_indexer_config(),
-        inner_attention=FlexAttention.Config(),
+        inner_attention=DSAInnerAttention.Config(attention_dropout=0.0),
     )
 
 
@@ -115,7 +113,7 @@ def _debug_layer_kwargs() -> dict:
         "index_n_heads": attention.indexer.n_heads,
         "index_head_dim": attention.indexer.head_dim,
         "index_topk": attention.indexer.index_topk,
-        "attention_dropout": attention.attention_dropout,
+        "attention_dropout": attention.inner_attention.attention_dropout,
         "rope": attention.rope,
     }
 
@@ -299,6 +297,39 @@ def _reference_indexer_topk(
 
 # DSA Indexer模块测试
 class TestGlm5DsaIndexer(unittest.TestCase):
+    def test_topk_supports_local_queries_against_global_keys(self):
+        topk = DSAIndexerTopK.Config(index_topk=2, softmax_scale=0.5).build()
+        q_BQNH = torch.randn(1, 2, 3, 4)
+        k_BKH = torch.randn(1, 5, 4)
+        weights_BQN = torch.randn(1, 2, 3)
+        attention_mask_BQK = torch.zeros(1, 2, 5)
+        attention_mask_BQK[:, 0, 4] = float("-inf")
+
+        actual_BQK = topk(
+            q_BQNH,
+            k_BKH,
+            weights_BQN,
+            attention_mask_BQK,
+        )
+        scores_BNQK = F.relu(
+            torch.matmul(
+                q_BQNH.float().transpose(1, 2),
+                k_BKH.float().transpose(1, 2).unsqueeze(1),
+            )
+            * 0.5
+        )
+        expected_scores_BQK = (
+            torch.matmul(
+                weights_BQN.unsqueeze(-2),
+                scores_BNQK.transpose(1, 2),
+            ).squeeze(-2)
+            + attention_mask_BQK
+        )
+        expected_BQK = expected_scores_BQK.topk(2, dim=-1).indices.to(torch.int32)
+
+        self.assertEqual(actual_BQK.shape, (1, 2, 2))
+        self.assertTrue(torch.equal(actual_BQK, expected_BQK))
+
     # 测试torchtitan indexer自身的基本契约
     def test_indexer_returns_masked_int32_topk(self):
         indexer = _indexer_config().build()
@@ -393,6 +424,78 @@ class TestGlm5DsaIndexer(unittest.TestCase):
 
 # glm5 MLA+DSA Attention模块测试
 class TestGlm5Attention(unittest.TestCase):
+    def test_dsa_inner_attention_rejects_invalid_dropout(self):
+        with self.assertRaisesRegex(ValueError, "attention_dropout"):
+            DSAInnerAttention.Config(attention_dropout=1.0)
+
+    def test_dsa_inner_attention_supports_local_queries_and_global_kv(self):
+        inner_attention = DSAInnerAttention.Config(attention_dropout=0.0).build()
+        q_BQNH = torch.randn(1, 2, 2, 4)
+        k_BKNH = torch.randn(1, 5, 2, 4)
+        v_BKNV = torch.randn(1, 5, 2, 3)
+        attention_mask_B1QK = torch.zeros(1, 1, 2, 5)
+        topk_indices_BQT = torch.tensor([[[0, 3], [1, 4]]], dtype=torch.int32)
+
+        actual_BQNV = inner_attention(
+            q_BQNH,
+            k_BKNH,
+            v_BKNV,
+            attention_mask_B1QK,
+            topk_indices_BQT,
+            scale=0.5,
+        )
+        selected_BQK = torch.zeros(1, 2, 5, dtype=torch.bool).scatter(
+            -1,
+            topk_indices_BQT.long(),
+            True,
+        )
+        sparse_mask_B1QK = attention_mask_B1QK.masked_fill(
+            ~selected_BQK.unsqueeze(1),
+            torch.finfo(q_BQNH.dtype).min,
+        )
+        scores_BNQK = (
+            torch.matmul(
+                q_BQNH.transpose(1, 2),
+                k_BKNH.transpose(1, 2).transpose(-1, -2),
+            )
+            * 0.5
+            + sparse_mask_B1QK
+        )
+        probs_BNQK = F.softmax(scores_BNQK, dim=-1, dtype=torch.float32)
+        expected_BQNV = torch.matmul(
+            probs_BNQK,
+            v_BKNV.transpose(1, 2),
+        ).transpose(1, 2)
+
+        self.assertEqual(actual_BQNV.shape, (1, 2, 2, 3))
+        torch.testing.assert_close(actual_BQNV, expected_BQNV)
+
+    def test_attention_allows_independent_index_head_dimension(self):
+        config = _attention_config()
+        index_head_dim = 12
+        indexer = dataclasses.replace(
+            config.indexer,
+            head_dim=index_head_dim,
+            wq_b=Linear.Config(
+                in_features=config.q_lora_rank,
+                out_features=config.indexer.n_heads * index_head_dim,
+            ),
+            wk=Linear.Config(
+                in_features=config.dim,
+                out_features=index_head_dim,
+            ),
+            k_norm=LayerNorm.Config(normalized_shape=index_head_dim),
+            topk=dataclasses.replace(
+                config.indexer.topk,
+                softmax_scale=index_head_dim**-0.5,
+            ),
+        )
+
+        updated = dataclasses.replace(config, indexer=indexer)
+
+        self.assertEqual(updated.qk_head_dim, 8)
+        self.assertEqual(updated.indexer.head_dim, index_head_dim)
+
     def test_attention_topk_cannot_reopen_causal_mask(self):
         attention = _attention_config().build()
         attention.init_states()
@@ -473,6 +576,10 @@ class TestGlm5Attention(unittest.TestCase):
             wk=Linear.Config(in_features=16, out_features=4),
             k_norm=LayerNorm.Config(normalized_shape=4),
             rope=dataclasses.replace(config.indexer.rope, dim=0),
+            topk=dataclasses.replace(
+                config.indexer.topk,
+                softmax_scale=4**-0.5,
+            ),
         )
         with self.assertRaisesRegex(ValueError, "qk_rope_head_dim"):
             dataclasses.replace(
@@ -506,7 +613,7 @@ class TestGlm5Model(unittest.TestCase):
 
         self.assertEqual(config.vocab_size, 2048)
         self.assertEqual(config.dim, 256)
-        self.assertEqual(len(config.layers), 4)
+        self.assertEqual(len(config.layers), 8)
         self.assertEqual(config.max_seq_len, 128)
         self.assertEqual(config.norm.eps, 1e-5)
         for layer_id, layer_config in enumerate(config.layers):
@@ -518,7 +625,8 @@ class TestGlm5Model(unittest.TestCase):
             self.assertEqual(attention.qk_nope_head_dim, 32)
             self.assertEqual(attention.qk_rope_head_dim, 32)
             self.assertEqual(attention.v_head_dim, 64)
-            self.assertEqual(attention.attention_dropout, 0.0)
+            self.assertIsInstance(attention.inner_attention, DSAInnerAttention.Config)
+            self.assertEqual(attention.inner_attention.attention_dropout, 0.0)
             self.assertEqual(attention.rope.max_seq_len, 128)
             self.assertEqual(attention.rope.theta, 1_000_000)
             self.assertEqual(attention.rope.scaling, "none")
@@ -569,10 +677,10 @@ class TestGlm5Model(unittest.TestCase):
         self.assertEqual(mask_B1LL.shape, (1, 1, 4, 4))
 
     def test_non_first_pp_stage_builds_dense_mask_without_embeddings(self):
-        # Every PP rank builds the mask for its own stage in
-        # post_dataloading_process. A non-first stage is pruned by
-        # _split_module (tok_embeddings=None, layers keys keep original
-        # indices), so get_attention_masks must not touch tok_embeddings.
+        # Every PP stage containing attention builds its own mask. A non-first
+        # stage is pruned by _split_module (tok_embeddings=None, layers keys
+        # keep original indices), so get_attention_masks must not touch
+        # tok_embeddings.
         config = glm5_configs["debugmodel"]()
         model = config.build()
         model.init_states()
@@ -610,6 +718,26 @@ class TestGlm5Model(unittest.TestCase):
                 ["layers.7", "norm", "lm_head"],
             ],
         )
+
+    def test_output_only_pp_stage_does_not_build_attention_mask(self):
+        config = glm5_configs["debugmodel"]()
+        model = config.build()
+        model.init_states()
+        fqn_per_stage = _generate_llm_fqn_per_model_part(8, len(config.layers), 1, 1)
+        self.assertEqual(fqn_per_stage[-1], ["norm", "lm_head"])
+
+        stage = _split_module(model, fqn_per_stage[-1])
+        self.assertEqual(len(stage.layers), 0)
+        self.assertIsNone(stage.tok_embeddings)
+        self.assertIsNotNone(stage.norm)
+        self.assertIsNotNone(stage.lm_head)
+
+        positions_BL = torch.arange(5).unsqueeze(0)
+        self.assertIsNone(stage.get_attention_masks(positions_BL))
+
+        hidden_BLD = torch.randn(1, 5, config.dim)
+        logits_BLV = stage(hidden_BLD, positions=positions_BL)
+        self.assertEqual(logits_BLV.shape, (1, 5, config.vocab_size))
 
     def test_debug_model_forward_shape(self):
         model = _build_debug_model()
@@ -664,6 +792,14 @@ class TestGlm5Model(unittest.TestCase):
 
 
 class TestGlm5Registration(unittest.TestCase):
+    def test_model_config_defaults_match_official_glm5(self):
+        config_fields = {
+            config_field.name: config_field
+            for config_field in dataclasses.fields(Glm5Model.Config)
+        }
+        self.assertEqual(config_fields["dim"].default, 6144)
+        self.assertEqual(config_fields["vocab_size"].default, 154880)
+
     def test_model_registry_has_single_device_glm5_hooks(self):
         spec = glm5.model_registry("debugmodel")
 
@@ -687,10 +823,13 @@ class TestGlm5Registration(unittest.TestCase):
         self.assertEqual(config.optimizer.param_groups[0].optimizer_kwargs["lr"], 8e-4)
         self.assertFalse(config.compile.enable)
         self.assertIsNone(config.activation_checkpoint)
-        # SP is off in the debugmodel: the eager DSA dense-mask path is only
-        # validated for replicated sequences (SP with tp>1 is rejected).
         self.assertEqual(
-            config.parallelism, ParallelismConfig(enable_sequence_parallel=False)
+            config.parallelism,
+            ParallelismConfig(
+                enable_sequence_parallel=True,
+                context_parallel_load_balancer=None,
+                pipeline_parallel_last_stage_less_layers=0,
+            ),
         )
 
     def test_parallelism_allows_only_one_unresolved_single_device_layout(self):
@@ -711,11 +850,7 @@ class TestGlm5Registration(unittest.TestCase):
     def test_parallelism_rejects_each_unsupported_layout(self):
         validate = glm5.validate_glm5_parallelism
         invalid_configs = {
-            "CP": ParallelismConfig(context_parallel_degree=2),
-            # SP alone (tp==1) is inert; SP with tp>1 is rejected.
-            "SP": ParallelismConfig(
-                tensor_parallel_degree=2, enable_sequence_parallel=True
-            ),
+            "CP load balancing": ParallelismConfig(context_parallel_degree=2),
             "SPMD backend": ParallelismConfig(spmd_backend="full_dtensor"),
         }
 
@@ -724,15 +859,39 @@ class TestGlm5Registration(unittest.TestCase):
                 with self.assertRaisesRegex(NotImplementedError, mode):
                     validate(parallelism)
 
+    def test_parallelism_allows_cp_with_contiguous_sequence_shards(self):
+        self.assertIsNone(
+            glm5.validate_glm5_parallelism(
+                ParallelismConfig(
+                    context_parallel_degree=2,
+                    context_parallel_load_balancer=None,
+                )
+            )
+        )
+
+        resolved_cp_dims = ParallelDims(
+            dp_replicate=1,
+            dp_shard=1,
+            cp=2,
+            tp=1,
+            pp=1,
+            ep=1,
+            world_size=2,
+        )
+        with self.assertRaisesRegex(NotImplementedError, "CP load balancing"):
+            glm5.validate_glm5_parallelism(
+                ParallelismConfig(),
+                resolved_cp_dims,
+            )
+
     def test_parallelism_allows_tp_pp_ep(self):
         validate = glm5.validate_glm5_parallelism
 
-        # TP/PP/EP are supported independently and combined; SP must be off
-        # whenever tp > 1 (the eager DSA dense-mask path is not SP-validated).
+        # TP/PP/EP are supported independently and combined with SP.
         self.assertIsNone(
             validate(
                 ParallelismConfig(
-                    tensor_parallel_degree=2, enable_sequence_parallel=False
+                    tensor_parallel_degree=2, enable_sequence_parallel=True
                 )
             )
         )
@@ -744,7 +903,7 @@ class TestGlm5Registration(unittest.TestCase):
                     tensor_parallel_degree=2,
                     pipeline_parallel_degree=2,
                     expert_parallel_degree=2,
-                    enable_sequence_parallel=False,
+                    enable_sequence_parallel=True,
                 )
             )
         )
@@ -772,12 +931,13 @@ class TestGlm5Registration(unittest.TestCase):
     def test_parallelism_reports_every_offending_mode_together(self):
         validate = glm5.validate_glm5_parallelism
 
-        with self.assertRaisesRegex(NotImplementedError, "CP.*SP"):
+        with self.assertRaisesRegex(NotImplementedError, "CP.*SPMD backend"):
             validate(
                 ParallelismConfig(
                     tensor_parallel_degree=2,
                     context_parallel_degree=2,
                     enable_sequence_parallel=True,
+                    spmd_backend="full_dtensor",
                 )
             )
 
@@ -822,9 +982,8 @@ class TestGlm5Registration(unittest.TestCase):
             )
         )
 
-        # A resolved sequence-parallel layout (tp=2 with SP still on) is
-        # rejected.
-        with self.assertRaisesRegex(NotImplementedError, "SP"):
+        # A resolved sequence-parallel layout is supported.
+        self.assertIsNone(
             validate(
                 ParallelismConfig(tensor_parallel_degree=2),
                 ParallelDims(
@@ -837,6 +996,7 @@ class TestGlm5Registration(unittest.TestCase):
                     world_size=8,
                 ),
             )
+        )
 
         # A resolved TP+PP+EP layout (SP off) is allowed. EP borrows ranks
         # from dp_shard x cp x tp, so it does not multiply world_size: here
@@ -848,7 +1008,7 @@ class TestGlm5Registration(unittest.TestCase):
                     tensor_parallel_degree=2,
                     pipeline_parallel_degree=2,
                     expert_parallel_degree=2,
-                    enable_sequence_parallel=False,
+                    enable_sequence_parallel=True,
                 ),
                 ParallelDims(
                     dp_replicate=1,
@@ -864,7 +1024,10 @@ class TestGlm5Registration(unittest.TestCase):
 
     def test_sharding_config_populated_for_tp_ep(self):
         import spmd_types as spmd
-        from torchtitan.models.common.decoder_sharding import dense_param_placement
+        from torchtitan.models.common.decoder_sharding import (
+            dense_param_placement,
+            dense_sequence_parallel_placement,
+        )
         from torchtitan.models.common.moe_sharding import expert_param_placement_sparse
         from torchtitan.models.glm5.sharding import _GROUPED_EXPERTS_PARAM_LAYOUT
 
@@ -872,7 +1035,7 @@ class TestGlm5Registration(unittest.TestCase):
         trainer_config.parallelism = ParallelismConfig(
             tensor_parallel_degree=2,
             expert_parallel_degree=2,
-            enable_sequence_parallel=False,
+            enable_sequence_parallel=True,
         )
         model_config = trainer_config.model_spec.model
         self.assertIsInstance(model_config, Glm5Model.Config)
@@ -890,6 +1053,14 @@ class TestGlm5Registration(unittest.TestCase):
         # norms all populated.
         attention = dense_layer.attention
         self.assertIsNotNone(attention.sharding_config)
+        sequence_layout = dense_sequence_parallel_placement()
+        self.assertEqual(
+            attention.sharding_config.in_src_shardings["x_BLD"], sequence_layout
+        )
+        self.assertEqual(
+            attention.wo.sharding_config.out_dst_shardings,
+            sequence_layout,
+        )
         self.assertIsNotNone(attention.rope.sharding_config)
         self.assertIsNotNone(attention.wq_a.sharding_config)
         self.assertIsNotNone(attention.q_norm.sharding_config)
@@ -898,6 +1069,15 @@ class TestGlm5Registration(unittest.TestCase):
         self.assertIsNotNone(attention.wq_b.sharding_config)
         self.assertIsNotNone(attention.wkv_b.sharding_config)
         self.assertIsNotNone(attention.wo.sharding_config)
+        self.assertIsNotNone(attention.inner_attention.sharding_config)
+        self.assertIsNotNone(attention.inner_attention.sharding_config.local_map)
+        inner_grad_layouts = (
+            attention.inner_attention.sharding_config.local_map.in_grad_placements
+        )
+        self.assertIsNotNone(inner_grad_layouts)
+        self.assertEqual(len(inner_grad_layouts), 5)
+        self.assertIsNotNone(inner_grad_layouts[3])
+        self.assertIsNotNone(inner_grad_layouts[4])
 
         # DSA indexer: every projection is Replicate on TP (correctness-first:
         # a head-shard would leave topk on a partial score tensor).
@@ -908,6 +1088,8 @@ class TestGlm5Registration(unittest.TestCase):
         self.assertIsNotNone(indexer.k_norm.sharding_config)
         self.assertIsNotNone(indexer.weights_proj.sharding_config)
         self.assertIsNotNone(indexer.rope.sharding_config)
+        self.assertIsNotNone(indexer.topk.sharding_config)
+        self.assertIsNotNone(indexer.topk.sharding_config.local_map)
         replicate_placement = dense_param_placement(tp=spmd.R)
         for proj in (indexer.wq_b, indexer.wk, indexer.weights_proj):
             self.assertEqual(
@@ -926,6 +1108,7 @@ class TestGlm5Registration(unittest.TestCase):
         # grouped-experts param layout names.
         moe = moe_layer.moe
         self.assertIsNotNone(moe.sharding_config)
+        self.assertTrue(moe.seq_dim_tp_sharded)
         self.assertIsNotNone(moe.router.gate.sharding_config)
         self.assertIsNotNone(moe.shared_experts.sharding_config)
         self.assertIsNotNone(moe.routed_experts.inner_experts.sharding_config)
@@ -940,6 +1123,141 @@ class TestGlm5Registration(unittest.TestCase):
                 expert_state_shardings[name], expert_param_placement_sparse()
             )
         self.assertIsNone(moe_layer.feed_forward)
+
+
+class TestGlm5ContextParallel(unittest.TestCase):
+    def test_cp_wrapper_skips_collectives_for_output_only_pp_stage(self):
+        observed = {}
+
+        def model_forward(tokens, positions, attention_masks):
+            observed["positions"] = positions
+            observed["attention_masks"] = attention_masks
+            return tokens
+
+        model = SimpleNamespace(
+            layers={},
+            forward=model_forward,
+            get_attention_masks=mock.Mock(),
+        )
+        cp_mesh = mock.Mock()
+        cp_mesh.get_group.return_value = object()
+        tokens_BLD = torch.randn(1, 4, 8)
+        positions_BL = torch.arange(4).unsqueeze(0)
+
+        with (
+            mock.patch(
+                "torchtitan.models.glm5.parallelize.dist._get_process_group_name",
+                return_value="cp_group",
+            ),
+            mock.patch(
+                "torchtitan.models.glm5.parallelize.dist.all_gather"
+            ) as all_gather,
+        ):
+            apply_glm5_cp_to_forward(model, cp_mesh)
+            output = model.forward(tokens_BLD, positions_BL)
+
+        self.assertIs(output, tokens_BLD)
+        self.assertIs(observed["positions"], positions_BL)
+        self.assertIsNone(observed["attention_masks"])
+        model.get_attention_masks.assert_not_called()
+        all_gather.assert_not_called()
+
+    def test_cp_wrapper_builds_mask_and_gathers_indexer_keys_and_attention_kv(self):
+        attention = _attention_config().build()
+        observed = {}
+
+        def model_forward(tokens, positions, attention_masks):
+            observed["model_positions"] = positions
+            observed["attention_masks"] = attention_masks
+            return tokens
+
+        def get_attention_masks(global_positions):
+            observed["global_positions"] = global_positions
+            return torch.arange(16, dtype=torch.float32).reshape(1, 1, 4, 4)
+
+        model = SimpleNamespace(
+            layers={"0": SimpleNamespace(attention=attention)},
+            forward=model_forward,
+            get_attention_masks=get_attention_masks,
+        )
+        cp_mesh = mock.Mock()
+        cp_mesh.size.return_value = 2
+        cp_mesh.get_local_rank.return_value = 1
+        process_group = object()
+        cp_mesh.get_group.return_value = process_group
+
+        def topk_forward(q, k, weights, attention_mask):
+            observed["indexer_k"] = k
+            return torch.zeros(q.shape[:2] + (2,), dtype=torch.int32)
+
+        def inner_forward(q, k, v, attention_mask, topk_indices, *, scale):
+            observed["attention_k"] = k
+            observed["attention_v"] = v
+            return torch.zeros(q.shape[:-1] + (v.shape[-1],))
+
+        attention.indexer.topk.forward = topk_forward
+        attention.inner_attention.forward = inner_forward
+
+        def fake_all_gather(outputs, local_tensor, *, group):
+            self.assertIs(group, process_group)
+            outputs[0].copy_(local_tensor)
+            outputs[1].copy_(local_tensor + 10)
+
+        def fake_flex_allgather(k, v, sequence_dim, process_group_name):
+            self.assertEqual(sequence_dim, 1)
+            self.assertEqual(process_group_name, "cp_group")
+            return torch.cat((k, k + 10), dim=1), torch.cat((v, v + 20), dim=1)
+
+        with (
+            mock.patch(
+                "torchtitan.models.glm5.parallelize.dist._get_process_group_name",
+                return_value="cp_group",
+            ),
+            mock.patch(
+                "torchtitan.models.glm5.parallelize.dist.all_gather",
+                side_effect=fake_all_gather,
+            ),
+            mock.patch(
+                "torchtitan.models.glm5.parallelize.flex_cp_allgather",
+                side_effect=fake_flex_allgather,
+            ),
+        ):
+            apply_glm5_cp_to_forward(model, cp_mesh)
+            local_positions = torch.tensor([[2, 3]])
+            local_tokens = torch.tensor([[7, 8]])
+            model.forward(local_tokens, local_positions)
+
+            q_BQNH = torch.randn(1, 2, 2, 4)
+            k_BKH = torch.randn(1, 2, 4)
+            weights_BQN = torch.randn(1, 2, 2)
+            mask_BQK = torch.zeros(1, 2, 4)
+            attention.indexer.topk(q_BQNH, k_BKH, weights_BQN, mask_BQK)
+
+            k_BLNH = torch.randn(1, 2, 2, 4)
+            v_BLNH = torch.randn(1, 2, 2, 3)
+            attention.inner_attention(
+                q_BQNH,
+                k_BLNH,
+                v_BLNH,
+                torch.zeros(1, 1, 2, 4),
+                torch.zeros(1, 2, 2, dtype=torch.int32),
+                scale=0.5,
+            )
+
+        self.assertTrue(
+            torch.equal(observed["global_positions"], torch.tensor([[2, 3, 12, 13]]))
+        )
+        self.assertIs(observed["model_positions"], local_positions)
+        self.assertTrue(
+            torch.equal(
+                observed["attention_masks"],
+                torch.arange(16, dtype=torch.float32).reshape(1, 1, 4, 4)[:, :, 2:4, :],
+            )
+        )
+        self.assertEqual(observed["indexer_k"].shape[1], 4)
+        self.assertTrue(torch.equal(observed["indexer_k"][:, 2:], k_BKH + 10))
+        self.assertEqual(observed["attention_k"].shape[1], 4)
+        self.assertEqual(observed["attention_v"].shape[1], 4)
 
 
 class TestGlm5StateDictAdapter(unittest.TestCase):
@@ -1034,13 +1352,13 @@ class TestGlm5StateDictAdapter(unittest.TestCase):
     def test_only_next_mtp_layer_namespace_is_warned_and_skipped(self):
         with self.assertWarnsRegex(UserWarning, "MTP"):
             titan_state = self._adapter().from_hf(
-                {"model.layers.4.some_mtp_weight": torch.ones(1)}
+                {"model.layers.8.some_mtp_weight": torch.ones(1)}
             )
         self.assertEqual(titan_state, {})
 
     def test_later_layer_namespace_is_rejected(self):
         with self.assertRaisesRegex(KeyError, "unmapped HF key"):
-            self._adapter().from_hf({"model.layers.5.some_mtp_weight": torch.ones(1)})
+            self._adapter().from_hf({"model.layers.9.some_mtp_weight": torch.ones(1)})
 
     def test_to_hf_rejects_incomplete_fused_expert_mapping(self):
         with self.assertRaisesRegex(KeyError, "incomplete"):

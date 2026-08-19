@@ -10,6 +10,7 @@ import spmd_types as spmd
 
 from torchtitan.config import ParallelismConfig
 from torchtitan.distributed import ParallelDims
+from torchtitan.distributed.parallel_dims import MeshAxisName
 from torchtitan.models.common.decoder_sharding import (
     colwise_config,
     dense_activation_placement,
@@ -22,7 +23,7 @@ from torchtitan.models.common.decoder_sharding import (
 )
 from torchtitan.models.common.moe_sharding import set_moe_sharding_config
 from torchtitan.models.glm5.model import Glm5Attention, Glm5DsaIndexer
-from torchtitan.protocols.sharding import ShardingConfig
+from torchtitan.protocols.sharding import LocalMapConfig, ShardingConfig, SpmdLayout
 
 if TYPE_CHECKING:
     from torchtitan.models.glm5.model import Glm5Model, Glm5TransformerBlock
@@ -36,6 +37,18 @@ _GROUPED_EXPERTS_PARAM_LAYOUT: dict[str, spmd.PerMeshAxisSpmdType] = {
 }
 
 
+def _dsa_mask_layout() -> SpmdLayout:
+    """Describe dense ``[B, 1, query, key]`` mask placement."""
+
+    return SpmdLayout(
+        {
+            MeshAxisName.DP: spmd.S(0),
+            MeshAxisName.CP: spmd.S(2),
+            MeshAxisName.TP: spmd.R,
+        }
+    )
+
+
 def validate_glm5_parallelism(
     parallelism: ParallelismConfig,
     parallel_dims: ParallelDims | None = None,
@@ -44,15 +57,11 @@ def validate_glm5_parallelism(
 
     GLM-5 supports data parallelism (DDP/HSDP via
     ``data_parallel_replicate_degree``, and FSDP via
-    ``data_parallel_shard_degree``) together with tensor, pipeline, and expert
-    parallelism. It still rejects:
+    ``data_parallel_shard_degree``) together with context, tensor, pipeline,
+    and expert parallelism. It still rejects:
 
-    - CP: the eager dense DSA attention builds a full ``[B, 1, L, L]`` mask and
-      runs a dense ``[B, N, L, L]`` score matmul, which is not shardable with
-      the framework's ``apply_cp_to_forward`` (that path targets FlexAttention /
-      SDPA inner attention, which GLM-5 never instantiates).
-    - Sequence parallelism combined with TP: the eager DSA attention's dense
-      mask path is only validated for replicated sequences.
+    - CP load balancing: the correctness-first DSA path requires contiguous
+      sequence shards so gathered keys retain global token order.
     - Any non-``default`` SPMD backend.
 
     ``parallel_dims`` is kept for signature parity with the runtime call site;
@@ -60,17 +69,20 @@ def validate_glm5_parallelism(
     ``dp_replicate * dp_shard * cp * tp * pp == world_size``.
     """
     unsupported: list[str] = []
-    if parallelism.context_parallel_degree > 1:
-        unsupported.append("CP")
-    if parallelism.enable_sequence_parallel and parallelism.tensor_parallel_degree > 1:
-        unsupported.append("SP")
+    cp_enabled = parallelism.context_parallel_degree > 1 or (
+        parallel_dims is not None and parallel_dims.cp_enabled
+    )
+    if cp_enabled and parallelism.context_parallel_load_balancer is not None:
+        unsupported.append(
+            "CP load balancing " f"({parallelism.context_parallel_load_balancer})"
+        )
     if parallelism.spmd_backend != "default":
         unsupported.append(f"SPMD backend ({parallelism.spmd_backend})")
 
     if unsupported:
         modes = ", ".join(unsupported)
         raise NotImplementedError(
-            "GLM-5 supports data parallelism with TP/PP/EP; "
+            "GLM-5 supports data parallelism with CP/TP/PP/EP; "
             f"unsupported parallelism: {modes}."
         )
 
@@ -165,11 +177,11 @@ def set_glm5_attention_sharding(
                 if enable_sp
                 else dense_activation_placement(tp=spmd.I)
             ),
-            "attention_masks": dense_activation_placement(tp=spmd.R),
+            "attention_masks": _dsa_mask_layout(),
         },
         in_dst_shardings={
             "x_BLD": dense_activation_placement(tp=spmd.R),
-            "attention_masks": dense_activation_placement(tp=spmd.R),
+            "attention_masks": _dsa_mask_layout(),
         },
     )
     attention.rope.sharding_config = ShardingConfig(
@@ -189,8 +201,55 @@ def set_glm5_attention_sharding(
     attention.wq_b.sharding_config = colwise_config()
     attention.wkv_b.sharding_config = colwise_config()
     attention.wo.sharding_config = rowwise_config(output_sp=enable_sp)
+    set_glm5_dsa_inner_attention_sharding(attention.inner_attention)
 
     set_glm5_indexer_sharding(attention.indexer)
+
+
+def set_glm5_dsa_inner_attention_sharding(inner_attention) -> None:
+    """Run dense DSA score computation on TP-local tensors.
+
+    Q/K/V are TP-sharded on the head dimension. The dense mask and DSA top-k
+    indices are replicated on TP. Keeping this boundary in ``local_map`` avoids
+    mixing DTensors with the local dense attention kernel. On the default
+    backend, CP K/V gathering is installed separately by
+    ``apply_glm5_cp_to_forward`` before this local-map boundary is captured.
+    """
+    q_layout = dense_activation_placement(tp=spmd.S(2))
+    kv_src_layout = dense_activation_placement(tp=spmd.S(2))
+    kv_dst_layout = dense_activation_placement(tp=spmd.S(2), cp=spmd.R)
+    kv_grad_layout = dense_activation_placement(tp=spmd.S(2), cp=spmd.P)
+    mask_layout = _dsa_mask_layout()
+    topk_layout = dense_activation_placement(tp=spmd.R)
+    inner_attention.sharding_config = ShardingConfig(
+        in_src_shardings={
+            "q_BQNH": q_layout,
+            "k_BKNH": kv_src_layout,
+            "v_BKNV": kv_src_layout,
+            "attention_masks_B1QK": mask_layout,
+            "topk_indices_BQT": topk_layout,
+        },
+        in_dst_shardings={
+            "q_BQNH": q_layout,
+            "k_BKNH": kv_dst_layout,
+            "v_BKNV": kv_dst_layout,
+            "attention_masks_B1QK": mask_layout,
+            "topk_indices_BQT": topk_layout,
+        },
+        out_src_shardings=q_layout,
+        local_map=LocalMapConfig(
+            in_grad_placements=(
+                q_layout,
+                kv_grad_layout,
+                kv_grad_layout,
+                # Mask and top-k indices are non-differentiable metadata, but
+                # they are still DTensor inputs and local_map requires their
+                # placements whenever in_grad_placements is specified.
+                mask_layout,
+                topk_layout,
+            )
+        ),
+    )
 
 
 def set_glm5_indexer_sharding(indexer: Glm5DsaIndexer.Config) -> None:
@@ -206,7 +265,8 @@ def set_glm5_indexer_sharding(indexer: Glm5DsaIndexer.Config) -> None:
     DSA indices redundantly. The indexer is small (``index_n_heads=4`` in the
     debugmodel), so the redundant cost is acceptable; a distributed
     index-head reduction with a replicated global ``topk`` is a documented
-    follow-up (glm5 README roadmap).
+    follow-up. CP gathers the indexer key sequence in the model-specific
+    forward wrapper before this TP-local top-k kernel runs.
     """
     replicate_weight = ShardingConfig(
         state_shardings={"weight": dense_param_placement(tp=spmd.R)},
@@ -222,6 +282,26 @@ def set_glm5_indexer_sharding(indexer: Glm5DsaIndexer.Config) -> None:
     )
     indexer.rope.sharding_config = ShardingConfig(
         state_shardings={"cache": dense_param_placement(tp=spmd.R)},
+    )
+
+    query_layout = dense_activation_placement(tp=spmd.R)
+    key_src_layout = dense_activation_placement(tp=spmd.R)
+    key_dst_layout = dense_activation_placement(tp=spmd.R, cp=spmd.R)
+    indexer.topk.sharding_config = ShardingConfig(
+        in_src_shardings={
+            "q_BQNH": query_layout,
+            "k_BKH": key_src_layout,
+            "weights_BQN": query_layout,
+            "attention_mask_BQK": query_layout,
+        },
+        in_dst_shardings={
+            "q_BQNH": query_layout,
+            "k_BKH": key_dst_layout,
+            "weights_BQN": query_layout,
+            "attention_mask_BQK": query_layout,
+        },
+        out_src_shardings=query_layout,
+        local_map=LocalMapConfig(in_grad_placements=None),
     )
 
     # Keep every indexer input Replicate on TP so the forward body operates on
