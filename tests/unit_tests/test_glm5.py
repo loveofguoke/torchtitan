@@ -693,32 +693,6 @@ class TestGlm5Model(unittest.TestCase):
         self.assertEqual(mask_B1LL.shape, (1, 1, 5, 5))
         self.assertTrue(torch.isfinite(mask_B1LL).all())
 
-    def test_debug_model_pp8_assigns_one_transformer_layer_per_rank(self):
-        trainer_config = glm5_debugmodel()
-        model_config = trainer_config.model_spec.model
-        parallelism = trainer_config.parallelism
-
-        fqn_per_stage = _generate_llm_fqn_per_model_part(
-            8,
-            len(model_config.layers),
-            parallelism.pipeline_parallel_first_stage_less_layers,
-            parallelism.pipeline_parallel_last_stage_less_layers,
-        )
-
-        self.assertEqual(
-            fqn_per_stage,
-            [
-                ["tok_embeddings", "layers.0"],
-                ["layers.1"],
-                ["layers.2"],
-                ["layers.3"],
-                ["layers.4"],
-                ["layers.5"],
-                ["layers.6"],
-                ["layers.7", "norm", "lm_head"],
-            ],
-        )
-
     def test_output_only_pp_stage_does_not_build_attention_mask(self):
         config = glm5_configs["debugmodel"]()
         model = config.build()

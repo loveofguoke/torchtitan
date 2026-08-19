@@ -42,9 +42,6 @@ def glm5_debugmodel() -> Trainer.Config:
         parallelism=ParallelismConfig(
             enable_sequence_parallel=True,
             context_parallel_load_balancer=None,
-            # Keep one transformer layer on every rank for the eight-layer
-            # debug model under PP8. The final stage also owns norm and lm_head.
-            pipeline_parallel_last_stage_less_layers=0,
         ),
         checkpoint=CheckpointManager.Config(interval=10),
         activation_checkpoint=None,
