@@ -682,10 +682,10 @@ class TestGlm5Model(unittest.TestCase):
         self.assertEqual(mask_B1LL.shape, (1, 1, 4, 4))
 
     def test_non_first_pp_stage_builds_dense_mask_without_embeddings(self):
-        # Every PP rank builds the mask for its own stage in
-        # post_dataloading_process. A non-first stage is pruned by
-        # _split_module (tok_embeddings=None, layers keys keep original
-        # indices), so get_attention_masks must not touch tok_embeddings.
+        # Every PP stage containing attention builds its own mask. A non-first
+        # stage is pruned by _split_module (tok_embeddings=None, layers keys
+        # keep original indices), so get_attention_masks must not touch
+        # tok_embeddings.
         config = glm5_configs["debugmodel"]()
         model = config.build()
         model.init_states()
@@ -697,6 +697,28 @@ class TestGlm5Model(unittest.TestCase):
 
         self.assertEqual(mask_B1LL.shape, (1, 1, 5, 5))
         self.assertTrue(torch.isfinite(mask_B1LL).all())
+
+    def test_output_only_pp_stage_does_not_build_attention_mask(self):
+        config = glm5_configs["debugmodel"]()
+        model = config.build()
+        model.init_states()
+        fqn_per_stage = _generate_llm_fqn_per_model_part(
+            8, len(config.layers), 1, 1
+        )
+        self.assertEqual(fqn_per_stage[-1], ["norm", "lm_head"])
+
+        stage = _split_module(model, fqn_per_stage[-1])
+        self.assertEqual(len(stage.layers), 0)
+        self.assertIsNone(stage.tok_embeddings)
+        self.assertIsNotNone(stage.norm)
+        self.assertIsNotNone(stage.lm_head)
+
+        positions_BL = torch.arange(5).unsqueeze(0)
+        self.assertIsNone(stage.get_attention_masks(positions_BL))
+
+        hidden_BLD = torch.randn(1, 5, config.dim)
+        logits_BLV = stage(hidden_BLD, positions=positions_BL)
+        self.assertEqual(logits_BLV.shape, (1, 5, config.vocab_size))
 
     def test_debug_model_forward_shape(self):
         model = _build_debug_model()
@@ -1084,6 +1106,42 @@ class TestGlm5Registration(unittest.TestCase):
 
 
 class TestGlm5ContextParallel(unittest.TestCase):
+    def test_cp_wrapper_skips_collectives_for_output_only_pp_stage(self):
+        observed = {}
+
+        def model_forward(tokens, positions, attention_masks):
+            observed["positions"] = positions
+            observed["attention_masks"] = attention_masks
+            return tokens
+
+        model = SimpleNamespace(
+            layers={},
+            forward=model_forward,
+            get_attention_masks=mock.Mock(),
+        )
+        cp_mesh = mock.Mock()
+        cp_mesh.get_group.return_value = object()
+        tokens_BLD = torch.randn(1, 4, 8)
+        positions_BL = torch.arange(4).unsqueeze(0)
+
+        with (
+            mock.patch(
+                "torchtitan.models.glm5.parallelize.dist._get_process_group_name",
+                return_value="cp_group",
+            ),
+            mock.patch(
+                "torchtitan.models.glm5.parallelize.dist.all_gather"
+            ) as all_gather,
+        ):
+            apply_glm5_cp_to_forward(model, cp_mesh)
+            output = model.forward(tokens_BLD, positions_BL)
+
+        self.assertIs(output, tokens_BLD)
+        self.assertIs(observed["positions"], positions_BL)
+        self.assertIsNone(observed["attention_masks"])
+        model.get_attention_masks.assert_not_called()
+        all_gather.assert_not_called()
+
     def test_cp_wrapper_builds_mask_and_gathers_indexer_keys_and_attention_kv(self):
         attention = _attention_config().build()
         observed = {}

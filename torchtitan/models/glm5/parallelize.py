@@ -76,9 +76,13 @@ def apply_glm5_cp_to_forward(model: Glm5Model, cp_mesh: DeviceMesh) -> None:
     ):
         if positions is None:
             raise ValueError("GLM-5 Context Parallel requires explicit positions.")
-        if attention_masks is None:
+        # PP may leave this rank with an embedding-only or output-only stage.
+        # There is no attention computation on such a stage, so neither the
+        # global positions nor a dense attention mask is needed.
+        if attention_masks is None and len(model.layers) > 0:
             global_positions = _all_gather_sequence_no_grad(positions, cp_mesh)
             global_mask = model.get_attention_masks(global_positions)
+            assert global_mask is not None
             local_query_len = positions.shape[1]
             query_start = cp_mesh.get_local_rank() * local_query_len
             attention_masks = global_mask[
