@@ -112,6 +112,10 @@ class Glm5DsaIndexer(Module):
         self.weights_proj = config.weights_proj.build().float()
         self.rope = config.rope.build()
         self.topk = config.topk.build()
+        # Released GLM-5 checkpoints contain a pretrained indexer. This model
+        # has no auxiliary indexer objective, so LM training must keep it fixed
+        # and exclude its parameters from optimizer state.
+        self.requires_grad_(False)
 
     def _apply(self, fn, recurse: bool = True):
         super()._apply(fn, recurse=recurse)

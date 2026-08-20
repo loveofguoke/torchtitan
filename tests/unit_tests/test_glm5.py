@@ -409,6 +409,8 @@ class TestGlm5DsaIndexer(unittest.TestCase):
     def test_indexer_is_no_grad_and_keeps_weights_projection_fp32(self):
         indexer = _indexer_config().build()
         indexer.init_states()
+        self.assertTrue(all(not param.requires_grad for param in indexer.parameters()))
+        self.assertIn("wq_b.weight", indexer.state_dict())
         indexer.bfloat16()
         # 测试 BF16 转换后 weights_proj.weight 仍是 FP32
         self.assertEqual(indexer.weights_proj.weight.dtype, torch.float32)

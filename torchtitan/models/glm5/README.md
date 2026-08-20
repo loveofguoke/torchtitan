@@ -128,7 +128,9 @@ gathers attention K/V before sparse attention. This preserves GLM DSA semantics
 but does not yet reduce global-key communication or storage. The runtime accepts
 DDP/HSDP/FSDP, CP, TP, PP, and EP on the default backend and rejects the
 unsupported layouts above. The indexer runs under `torch.no_grad()` by design,
-so language-model loss does not train its parameters.
+so language-model loss does not train its parameters. Its pretrained parameters
+are explicitly frozen and excluded from optimizer state, while remaining part
+of the model state dict and checkpoints.
 
 ## Roadmap
 
