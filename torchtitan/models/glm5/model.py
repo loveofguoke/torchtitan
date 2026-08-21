@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 import torch.nn.functional as F
@@ -448,11 +448,13 @@ class Glm5TransformerBlock(TransformerBlock):
             self.attention_norm(x_BLD), attention_masks, positions
         )
         normalized_BLD = self.ffn_norm(x_BLD)
-        ffn_output_BLD = (
-            self.moe(normalized_BLD)
-            if self.moe_enabled
-            else self.feed_forward(normalized_BLD)
-        )
+        if self.moe_enabled:
+            B, L, D = normalized_BLD.shape
+            ffn_output_BLD = self.moe(normalized_BLD.reshape(B * L, D)).reshape(
+                B, L, D
+            )
+        else:
+            ffn_output_BLD = self.feed_forward(normalized_BLD)
         return x_BLD + ffn_output_BLD
 
 
@@ -474,7 +476,22 @@ class Glm5Model(Decoder):
             )
 
             validate_glm5_parallelism(config.parallelism)
-            Decoder.Config.update_from_config(self, config=config, **kwargs)
+            # Generic Decoder CP uses SPMD sharding and therefore requires the
+            # spmd_types backend. GLM-5 owns a model-specific partial-DTensor
+            # DSA CP path, so run generic setup with CP disabled and apply the
+            # GLM sharding contract below.
+            generic_config = replace(
+                config,
+                parallelism=replace(
+                    config.parallelism,
+                    context_parallel_degree=1,
+                ),
+            )
+            Decoder.Config.update_from_config(
+                self,
+                config=generic_config,
+                **kwargs,
+            )
             set_glm5_sharding_config(
                 self,
                 enable_sp=config.parallelism.enable_sequence_parallel,
@@ -508,7 +525,7 @@ class Glm5Model(Decoder):
         if len(self.layers) == 0:
             return None
 
-        positions_BL = positions
+        positions_BL = positions.unsqueeze(0) if positions.ndim == 1 else positions
         B, L = positions_BL.shape
         # Non-first pipeline stages have tok_embeddings pruned away, but each
         # PP stage containing attention builds its own mask. Every stage
@@ -540,11 +557,17 @@ class Glm5Model(Decoder):
         positions: torch.Tensor | None = None,
         attention_masks: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        input_was_flat = tokens_BL.ndim == 1
+        if input_was_flat:
+            tokens_BL = tokens_BL.unsqueeze(0)
         B, L = tokens_BL.shape[:2]
         if positions is None:
             positions = torch.arange(
                 tokens_BL.shape[1], device=tokens_BL.device
             ).expand(B, -1)
+        elif positions.ndim == 1:
+            positions = positions.unsqueeze(0)
         if attention_masks is None:
             attention_masks = self.get_attention_masks(positions)
-        return super().forward(tokens_BL, positions, attention_masks)
+        output = super().forward(tokens_BL, positions, attention_masks)
+        return output.squeeze(0) if input_was_flat else output

@@ -204,13 +204,6 @@ class TokenChoiceTopKRouter(Module):
     def __init__(self, config: Config):
         super().__init__()
         self.gate = config.gate.build()
-        if not type(self.gate).__dict__.get("supports_compute_dtype", False):
-            raise ValueError(
-                f"TokenChoiceTopKRouter gate {type(self.gate).__name__} must support "
-                "explicit compute_dtype for stable FP32 routing. Exclude the gate "
-                "from this Linear replacement or implement and declare "
-                "supports_compute_dtype."
-            )
         self.num_experts = config.num_experts
         self.num_expert_groups = config.num_expert_groups
         self.num_limited_groups = config.num_limited_groups
@@ -295,11 +288,11 @@ class TokenChoiceTopKRouter(Module):
             scores_TE: Full routing scores ``(T, E)``.
         """
         # Compute gate in float32 to help stability of expert load balancing.
-        # Use the module call so parallelization wrappers and hooks stay active.
-        scores_TE = self.gate(x_TD, compute_dtype=torch.float32)
+        with torch.autocast(device_type=x_TD.device.type, dtype=torch.float32):
+            scores_TE = self.gate(x_TD)
 
         # By default, sigmoid or softmax is performed in float32 to avoid loss explosion.
-        # scores_TE is already float32 from the gate's explicit compute dtype.
+        # scores_TE is already float32 from the autocast above.
         if self.score_func == "sigmoid":
             scores_TE = torch.sigmoid(scores_TE)
         elif self.score_func == "softmax":

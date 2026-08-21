@@ -789,12 +789,12 @@ class TestGlm5Registration(unittest.TestCase):
     def test_debug_training_config_uses_single_device_defaults(self):
         config = glm5_debugmodel()
 
-        self.assertEqual(config.training.local_batch_size, 2)
-        self.assertEqual(config.training.seq_len, 128)
+        self.assertEqual(config.training.num_tokens_per_microbatch_per_dp_rank, 256)
+        self.assertEqual(config.training.max_context_length, 128)
         self.assertEqual(config.training.steps, 10)
         self.assertEqual(config.metrics.log_freq, 1)
         self.assertEqual(config.checkpoint.interval, 10)
-        self.assertEqual(config.dataloader.dataset, "c4_test")
+        self.assertFalse(config.dataloader.shuffle)
         self.assertEqual(config.hf_assets_path, "./tests/assets/tokenizer")
         self.assertEqual(config.optimizer.param_groups[0].optimizer_kwargs["lr"], 8e-4)
         self.assertFalse(config.compile.enable)
@@ -805,13 +805,16 @@ class TestGlm5Registration(unittest.TestCase):
                 enable_sequence_parallel=True,
                 context_parallel_load_balancer=None,
                 pipeline_parallel_last_stage_less_layers=0,
+                spmd_backend="partial_dtensor",
             ),
         )
 
     def test_parallelism_allows_only_one_unresolved_single_device_layout(self):
         validate = glm5.validate_glm5_parallelism
 
-        self.assertIsNone(validate(ParallelismConfig()))
+        self.assertIsNone(
+            validate(ParallelismConfig(spmd_backend="partial_dtensor"))
+        )
         single_rank_dims = ParallelDims(
             dp_replicate=1,
             dp_shard=-1,
@@ -821,13 +824,18 @@ class TestGlm5Registration(unittest.TestCase):
             ep=1,
             world_size=1,
         )
-        self.assertIsNone(validate(ParallelismConfig(), single_rank_dims))
+        self.assertIsNone(
+            validate(
+                ParallelismConfig(spmd_backend="partial_dtensor"),
+                single_rank_dims,
+            )
+        )
 
     def test_parallelism_rejects_each_unsupported_layout(self):
         validate = glm5.validate_glm5_parallelism
         invalid_configs = {
             "CP load balancing": ParallelismConfig(context_parallel_degree=2),
-            "SPMD backend": ParallelismConfig(spmd_backend="full_dtensor"),
+            "SPMD backend": ParallelismConfig(spmd_backend="spmd_types"),
         }
 
         for mode, parallelism in invalid_configs.items():
@@ -841,6 +849,7 @@ class TestGlm5Registration(unittest.TestCase):
                 ParallelismConfig(
                     context_parallel_degree=2,
                     context_parallel_load_balancer=None,
+                    spmd_backend="partial_dtensor",
                 )
             )
         )
@@ -856,7 +865,7 @@ class TestGlm5Registration(unittest.TestCase):
         )
         with self.assertRaisesRegex(NotImplementedError, "CP load balancing"):
             glm5.validate_glm5_parallelism(
-                ParallelismConfig(),
+                ParallelismConfig(spmd_backend="partial_dtensor"),
                 resolved_cp_dims,
             )
 
@@ -867,12 +876,28 @@ class TestGlm5Registration(unittest.TestCase):
         self.assertIsNone(
             validate(
                 ParallelismConfig(
-                    tensor_parallel_degree=2, enable_sequence_parallel=True
+                    tensor_parallel_degree=2,
+                    enable_sequence_parallel=True,
+                    spmd_backend="partial_dtensor",
                 )
             )
         )
-        self.assertIsNone(validate(ParallelismConfig(pipeline_parallel_degree=2)))
-        self.assertIsNone(validate(ParallelismConfig(expert_parallel_degree=2)))
+        self.assertIsNone(
+            validate(
+                ParallelismConfig(
+                    pipeline_parallel_degree=2,
+                    spmd_backend="partial_dtensor",
+                )
+            )
+        )
+        self.assertIsNone(
+            validate(
+                ParallelismConfig(
+                    expert_parallel_degree=2,
+                    spmd_backend="partial_dtensor",
+                )
+            )
+        )
         self.assertIsNone(
             validate(
                 ParallelismConfig(
@@ -880,6 +905,7 @@ class TestGlm5Registration(unittest.TestCase):
                     pipeline_parallel_degree=2,
                     expert_parallel_degree=2,
                     enable_sequence_parallel=True,
+                    spmd_backend="partial_dtensor",
                 )
             )
         )
@@ -892,6 +918,7 @@ class TestGlm5Registration(unittest.TestCase):
                 ParallelismConfig(
                     data_parallel_replicate_degree=8,
                     data_parallel_shard_degree=1,
+                    spmd_backend="partial_dtensor",
                 )
             )
         )
@@ -900,6 +927,7 @@ class TestGlm5Registration(unittest.TestCase):
                 ParallelismConfig(
                     data_parallel_replicate_degree=1,
                     data_parallel_shard_degree=8,
+                    spmd_backend="partial_dtensor",
                 )
             )
         )
@@ -913,7 +941,7 @@ class TestGlm5Registration(unittest.TestCase):
                     tensor_parallel_degree=2,
                     context_parallel_degree=2,
                     enable_sequence_parallel=True,
-                    spmd_backend="full_dtensor",
+                    spmd_backend="spmd_types",
                 )
             )
 
@@ -926,6 +954,7 @@ class TestGlm5Registration(unittest.TestCase):
                 ParallelismConfig(
                     data_parallel_replicate_degree=8,
                     data_parallel_shard_degree=1,
+                    spmd_backend="partial_dtensor",
                 ),
                 ParallelDims(
                     dp_replicate=8,
@@ -945,6 +974,7 @@ class TestGlm5Registration(unittest.TestCase):
                 ParallelismConfig(
                     data_parallel_replicate_degree=1,
                     data_parallel_shard_degree=8,
+                    spmd_backend="partial_dtensor",
                 ),
                 ParallelDims(
                     dp_replicate=1,
@@ -961,7 +991,10 @@ class TestGlm5Registration(unittest.TestCase):
         # A resolved sequence-parallel layout is supported.
         self.assertIsNone(
             validate(
-                ParallelismConfig(tensor_parallel_degree=2),
+                ParallelismConfig(
+                    tensor_parallel_degree=2,
+                    spmd_backend="partial_dtensor",
+                ),
                 ParallelDims(
                     dp_replicate=1,
                     dp_shard=4,
@@ -985,6 +1018,7 @@ class TestGlm5Registration(unittest.TestCase):
                     pipeline_parallel_degree=2,
                     expert_parallel_degree=2,
                     enable_sequence_parallel=True,
+                    spmd_backend="partial_dtensor",
                 ),
                 ParallelDims(
                     dp_replicate=1,
@@ -1012,6 +1046,7 @@ class TestGlm5Registration(unittest.TestCase):
             tensor_parallel_degree=2,
             expert_parallel_degree=2,
             enable_sequence_parallel=True,
+            spmd_backend="partial_dtensor",
         )
         model_config = trainer_config.model_spec.model
         self.assertIsInstance(model_config, Glm5Model.Config)

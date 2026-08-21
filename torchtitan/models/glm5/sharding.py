@@ -62,7 +62,8 @@ def validate_glm5_parallelism(
 
     - CP load balancing: the correctness-first DSA path requires contiguous
       sequence shards so gathered keys retain global token order.
-    - Any non-``default`` SPMD backend.
+    - The ``spmd_types`` backend. GLM-5's DSA local-map path currently uses
+      DTensor-specific CP wrappers.
 
     ``parallel_dims`` is kept for signature parity with the runtime call site;
     once resolved, ``ParallelDims._validate`` has already enforced
@@ -76,7 +77,7 @@ def validate_glm5_parallelism(
         unsupported.append(
             "CP load balancing " f"({parallelism.context_parallel_load_balancer})"
         )
-    if parallelism.spmd_backend != "default":
+    if parallelism.spmd_backend != "partial_dtensor":
         unsupported.append(f"SPMD backend ({parallelism.spmd_backend})")
 
     if unsupported:
@@ -130,7 +131,7 @@ def _set_glm5_layer_sharding(
     attn_x_layout = (
         dense_sequence_parallel_placement()
         if enable_sp
-        else dense_activation_placement(tp=spmd.I)
+        else dense_activation_placement(tp=spmd.I, cp=spmd.S(0))
     )
 
     set_glm5_attention_sharding(attention, enable_sp=enable_sp)
@@ -175,7 +176,7 @@ def set_glm5_attention_sharding(
             "x_BLD": (
                 dense_sequence_parallel_placement()
                 if enable_sp
-                else dense_activation_placement(tp=spmd.I)
+                else dense_activation_placement(tp=spmd.I, cp=spmd.S(0))
             ),
             "attention_masks": _dsa_mask_layout(),
         },

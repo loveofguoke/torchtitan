@@ -119,14 +119,14 @@ The current flavor explicitly does not support:
 - cross-layer top-k sharing / shared indexers;
 - MTP layers or an auxiliary indexer training objective;
 - CP load balancing or a communication-overlapped production DSA kernel;
-- the `full_dtensor` or `spmd_types` backend.
+- the `spmd_types` backend.
 
 The correctness-first CP path gathers positions inside the GLM forward wrapper
 and builds a local-query/global-key dense mask without changing the shared
 Trainer. It then gathers the indexer's key projection before global top-k and
 gathers attention K/V before sparse attention. This preserves GLM DSA semantics
 but does not yet reduce global-key communication or storage. The runtime accepts
-DDP/HSDP/FSDP, CP, TP, PP, and EP on the default backend and rejects the
+DDP/HSDP/FSDP, CP, TP, PP, and EP on the `partial_dtensor` backend and rejects the
 unsupported layouts above. The indexer runs under `torch.no_grad()` by design,
 so language-model loss does not train its parameters. Its pretrained parameters
 are explicitly frozen and excluded from optimizer state, while remaining part
@@ -141,7 +141,7 @@ and is currently pending because this host has no CUDA device.
 After the single-device correctness milestone, later work may add:
 
 1. A communication-overlapped, index-aware DSA or Flash-MLA CP kernel.
-2. Validation and enablement of the `full_dtensor` and `spmd_types` backends.
+2. Validation and enablement of the `spmd_types` backend.
 3. KV cache and incremental decoding.
 4. Cross-layer IndexCache and shared-indexer patterns.
 5. MTP layers and released-checkpoint coverage.

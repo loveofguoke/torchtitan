@@ -23,7 +23,6 @@ from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
 from torchtitan.distributed.compile import apply_compile
 from torchtitan.distributed.fsdp import apply_fsdp_to_decoder
-from torchtitan.distributed.tensor_parallel import maybe_enable_async_tp
 from torchtitan.models.glm5.model import Glm5Model
 from torchtitan.tools.logging import logger
 
@@ -39,13 +38,15 @@ __all__ = [
 def _all_gather_sequence_no_grad(
     tensor: torch.Tensor,
     cp_mesh: DeviceMesh,
+    *,
+    sequence_dim: int,
 ) -> torch.Tensor:
     """Gather a sequence-sharded tensor in CP rank order without autograd."""
 
     local_tensor = tensor.contiguous()
     gathered = [torch.empty_like(local_tensor) for _ in range(cp_mesh.size())]
     dist.all_gather(gathered, local_tensor, group=cp_mesh.get_group())
-    return torch.cat(gathered, dim=1)
+    return torch.cat(gathered, dim=sequence_dim)
 
 
 def apply_glm5_cp_to_forward(model: Glm5Model, cp_mesh: DeviceMesh) -> None:
@@ -80,10 +81,14 @@ def apply_glm5_cp_to_forward(model: Glm5Model, cp_mesh: DeviceMesh) -> None:
         # There is no attention computation on such a stage, so neither the
         # global positions nor a dense attention mask is needed.
         if attention_masks is None and len(model.layers) > 0:
-            global_positions = _all_gather_sequence_no_grad(positions, cp_mesh)
+            global_positions = _all_gather_sequence_no_grad(
+                positions,
+                cp_mesh,
+                sequence_dim=0 if positions.ndim == 1 else 1,
+            )
             global_mask = model.get_attention_masks(global_positions)
             assert global_mask is not None
-            local_query_len = positions.shape[1]
+            local_query_len = positions.shape[-1]
             query_start = cp_mesh.get_local_rank() * local_query_len
             attention_masks = global_mask[
                 :,
@@ -108,7 +113,11 @@ def apply_glm5_cp_to_forward(model: Glm5Model, cp_mesh: DeviceMesh) -> None:
             *,
             _forward=original_topk_forward,
         ):
-            global_k_BKH = _all_gather_sequence_no_grad(k_BKH, cp_mesh)
+            global_k_BKH = _all_gather_sequence_no_grad(
+                k_BKH,
+                cp_mesh,
+                sequence_dim=1,
+            )
             return _forward(
                 q_BQNH,
                 global_k_BKH,
@@ -164,9 +173,9 @@ def parallelize_glm5(
 ) -> Glm5Model:
     """Apply CP/TP/EP, optional model transforms, and the FSDP wrap.
 
-    GLM-5 only runs on the ``default`` SPMD backend (validate_glm5_parallelism
+    GLM-5 only runs on the ``partial_dtensor`` SPMD backend (validate_glm5_parallelism
     rejects the rest). TP/EP use declarative sharding; CP follows TorchTitan's
-    default-backend wrapper model and gathers global DSA keys for local queries.
+    partial-DTensor wrapper model and gathers global DSA keys for local queries.
     """
     validate_glm5_parallelism(parallelism, parallel_dims)
 
@@ -176,13 +185,14 @@ def parallelize_glm5(
     if parallel_dims.tp_enabled or parallel_dims.ep_enabled:
         model.parallelize(parallel_dims)
 
-    if parallel_dims.tp_enabled:
-        maybe_enable_async_tp(parallelism, compile_config, parallel_dims.get_mesh("tp"))
-
     if ac_config is not None:
         ac_config.build(dump_folder=dump_folder).apply(model)
     if compile_config.enable and "model" in compile_config.components:
-        apply_compile(model, compile_config)
+        apply_compile(
+            model,
+            compile_config=compile_config,
+            parallel_dims=parallel_dims,
+        )
 
     # Data parallelism: DDP/HSDP when dp_replicate is active (mesh [dp_replicate,
     # fsdp]), otherwise FSDP over the shard-only mesh. With EP, expert params

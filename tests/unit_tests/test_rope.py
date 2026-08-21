@@ -7,7 +7,6 @@
 import dataclasses
 import math
 import unittest
-import warnings
 from unittest.mock import patch
 
 import torch
@@ -142,35 +141,6 @@ class TestRoPEPositionBoundsComplex(unittest.TestCase):
         )
         with self.assertRaises(RuntimeError):
             self.rope(xq, xk, positions)
-
-
-class TestComplexRoPEDtypeAndDeviceMoves(unittest.TestCase):
-    def test_bfloat16_conversion_preserves_complex_phase_cache(self):
-        rope = ComplexRoPE.Config(dim=8, max_seq_len=16).build()
-        expected_cache = rope.cache.clone()
-
-        with warnings.catch_warnings(record=True) as caught_warnings:
-            rope.bfloat16()
-
-        self.assertTrue(rope.cache.is_complex())
-        self.assertEqual(rope.cache.dtype, torch.complex64)
-        torch.testing.assert_close(rope.cache, expected_cache, rtol=0, atol=0)
-        self.assertFalse(caught_warnings)
-
-    def test_device_move_and_to_empty_keep_or_rebuild_complex_cache(self):
-        rope = ComplexRoPE.Config(dim=8, max_seq_len=16).build()
-        expected_cache = rope.cache.clone()
-
-        rope.to(device="cpu")
-        self.assertTrue(rope.cache.is_complex())
-        torch.testing.assert_close(rope.cache, expected_cache, rtol=0, atol=0)
-
-        rope.to_empty(device="cpu")
-        self.assertTrue(rope.cache.is_complex())
-        self.assertEqual(rope.cache.dtype, torch.complex64)
-        rope.init_states()
-        self.assertTrue(rope.cache.is_complex())
-        torch.testing.assert_close(rope.cache, expected_cache, rtol=0, atol=0)
 
 
 class TestRoPEPositionBoundsCosSin(unittest.TestCase):

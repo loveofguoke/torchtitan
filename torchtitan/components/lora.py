@@ -71,10 +71,6 @@ def _get_lora_cls(parent_cls: type) -> type:
     parent_config_cls = parent_cls.Config  # pyrefly: ignore [missing-attribute]
 
     class LoRALinear(parent_cls):  # type: ignore[valid-type, misc]
-        supports_compute_dtype = parent_cls.__dict__.get(
-            "supports_compute_dtype", False
-        )
-
         @dataclass(kw_only=True, slots=True)
         class Config(parent_config_cls):  # type: ignore[misc]
             rank: int
@@ -105,26 +101,9 @@ def _get_lora_cls(parent_cls: type) -> type:
                 param_init={"weight": nn.init.zeros_},
             ).build()
 
-        def forward(
-            self,
-            input: torch.Tensor,
-            *,
-            compute_dtype: torch.dtype | None = None,
-        ) -> torch.Tensor:
-            if compute_dtype is None:
-                base_out = super().forward(input)
-                lora_out = self.lora_b(self.lora_a(input))
-                return base_out + self._lora_scaling * lora_out
-
-            if not self.supports_compute_dtype:
-                raise ValueError(
-                    f"{parent_cls.__name__} does not support explicit compute_dtype; "
-                    "use a router gate implementation that declares and implements "
-                    "supports_compute_dtype"
-                )
-            base_out = super().forward(input, compute_dtype=compute_dtype)
-            lora_hidden = self.lora_a(input, compute_dtype=compute_dtype)
-            lora_out = self.lora_b(lora_hidden, compute_dtype=compute_dtype)
+        def forward(self, input: torch.Tensor) -> torch.Tensor:
+            base_out = super().forward(input)
+            lora_out = self.lora_b(self.lora_a(input))
             return base_out + self._lora_scaling * lora_out
 
     LoRALinear.__name__ = f"LoRA{parent_cls.__name__}"
