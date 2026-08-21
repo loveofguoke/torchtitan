@@ -11,16 +11,16 @@ import spmd_types as spmd
 import torch
 from torch import nn
 
-from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.models.common.attention import (
     AttentionMasksType,
     BaseAttention,
     FlexAttention,
 )
-from torchtitan.models.common.decoder import Decoder, TransformerBlock
+from torchtitan.models.common.decoder import TransformerBlock
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import RoPE
+from torchtitan.models.deepseek_v3.mtp import MTPDecoder
 from torchtitan.models.utils import get_moe_model_nparams_and_flops
 from torchtitan.protocols.module import Module
 
@@ -83,7 +83,7 @@ class Attention(BaseAttention):
         self.wo = config.wo.build()
         self.softmax_scale = self.qk_head_dim**-0.5
 
-        if config.rope.max_seq_len > config.rope.original_seq_len:
+        if config.rope.scaling == "yarn" and config.rope.rope_factor > 1.0:
             mscale = 0.1 * config.mscale * math.log(config.rope.rope_factor) + 1.0
             self.softmax_scale = self.softmax_scale * mscale * mscale
 
@@ -96,7 +96,7 @@ class Attention(BaseAttention):
         attention_masks: AttentionMasksType,
         positions: torch.Tensor | None = None,
     ):
-        bsz, seqlen, _ = x.size()
+        num_tokens = x.shape[0]
 
         # Query projection
         if self.q_lora_rank == 0:
@@ -105,13 +105,14 @@ class Attention(BaseAttention):
             q = self.wq_a(x)
             q = self.wq_b(self.q_norm(q))
 
-        # TODO(pianpwk): same QKV:S(2) unflatten case handled by even sharding
+        # TODO(pianpwk): same QKV:S(1) unflatten case handled by even sharding
         with spmd.local():
-            q = q.view(bsz, seqlen, -1, self.qk_head_dim)
-            if get_spmd_backend() == "spmd_types":
+            q = q.view(num_tokens, -1, self.qk_head_dim)
+            if spmd.is_type_checking():
                 spmd.assert_type(
                     q,
-                    {"dp": spmd.S(0), "cp": spmd.S(1), "tp": spmd.S(2)},
+                    spmd.V,
+                    spmd.PartitionSpec(("dp", "cp"), "tp", None),
                 )
 
         q_nope, q_pe = torch.split(
@@ -122,28 +123,31 @@ class Attention(BaseAttention):
         kv = self.wkv_a(x)
         kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
 
-        q_pe, k_pe = self.rope(q_pe, k_pe.unsqueeze(2), positions)
+        q_pe, k_pe = self.rope(q_pe, k_pe.unsqueeze(1), positions)
         q = torch.cat([q_nope, q_pe], dim=-1)
 
         kv = self.wkv_b(self.kv_norm(kv))
 
-        with spmd.local():  # QKV even shard unflatten, but the expand is truly local SPMD
-            kv = kv.view(bsz, seqlen, -1, self.qk_nope_head_dim + self.v_head_dim)
+        with (
+            spmd.local()
+        ):  # QKV even shard unflatten, but the expand is truly local SPMD
+            kv = kv.view(num_tokens, -1, self.qk_nope_head_dim + self.v_head_dim)
             k_nope, v = torch.split(
                 kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
             )
-            k = torch.cat([k_nope, k_pe.expand(-1, -1, k_nope.size(2), -1)], dim=-1)
-            if get_spmd_backend() == "spmd_types" and not torch.compiler.is_compiling():
+            k = torch.cat([k_nope, k_pe.expand(-1, k_nope.size(1), -1)], dim=-1)
+            if spmd.is_type_checking() and not torch.compiler.is_compiling():
                 for t in [k, v]:
                     spmd.assert_type(
                         t,
-                        {"dp": spmd.S(0), "cp": spmd.S(1), "tp": spmd.S(2)},
+                        spmd.V,
+                        spmd.PartitionSpec(("dp", "cp"), "tp", None),
                     )
 
         output = self.inner_attention(
             q, k, v, attention_masks=attention_masks, scale=self.softmax_scale
         ).contiguous()
-        output = output.view(bsz, seqlen, -1)
+        output = output.view(num_tokens, -1)
         return self.wo(output)
 
 
@@ -184,13 +188,13 @@ class DeepSeekV3TransformerBlock(TransformerBlock):
         return x
 
 
-class DeepSeekV3Model(Decoder):
+class DeepSeekV3Model(MTPDecoder):
     """
     DeepSeek-V3 Transformer model with attention and feed-forward layers.
     """
 
     @dataclass(kw_only=True, slots=True)
-    class Config(Decoder.Config):
+    class Config(MTPDecoder.Config):
         dim: int = 2048
         vocab_size: int = 102400
 
@@ -200,13 +204,13 @@ class DeepSeekV3Model(Decoder):
             config,
             **kwargs,
         ) -> None:
-            Decoder.Config.update_from_config(self, config=config, **kwargs)
-            parallelism = config.parallelism
+            MTPDecoder.Config.update_from_config(self, config=config, **kwargs)
 
             from torchtitan.models.deepseek_v3.sharding import (
                 set_deepseek_v3_sharding_config,
             )
 
+            parallelism = config.parallelism
             set_deepseek_v3_sharding_config(
                 self,
                 enable_sp=parallelism.enable_sequence_parallel,

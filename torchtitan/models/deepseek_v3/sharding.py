@@ -14,6 +14,7 @@ from torchtitan.models.common.decoder_sharding import (
     dense_param_placement,
     dense_sequence_parallel_placement,
     norm_config,
+    pre_lm_head_norm_config,
     rowwise_config,
     set_decoder_sharding_config,
     set_dense_ffn_sharding,
@@ -60,6 +61,12 @@ def set_deepseek_v3_sharding_config(
         _set_deepseek_v3_layer_sharding(
             layer_cfg, enable_sp=enable_sp, enable_ep=enable_ep
         )
+    if len(config.mtp_layers) > 0:
+        _set_deepseek_v3_mtp_sharding(
+            config,
+            enable_sp=enable_sp,
+            enable_ep=enable_ep,
+        )
 
 
 def _set_deepseek_v3_layer_sharding(
@@ -83,7 +90,7 @@ def _set_deepseek_v3_layer_sharding(
     attn_x_layout = (
         dense_sequence_parallel_placement()
         if enable_sp
-        else dense_activation_placement(tp=spmd.I)
+        else dense_activation_placement(tp=spmd.I, cp=spmd.S(0))
     )
 
     # MLA attention input: x is gathered to Replicate. RoPE is read from the
@@ -93,7 +100,7 @@ def _set_deepseek_v3_layer_sharding(
             "x": attn_x_layout,
         },
         in_dst_shardings={
-            "x": dense_activation_placement(tp=spmd.R),
+            "x": dense_activation_placement(tp=spmd.R, cp=spmd.S(0)),
         },
     )
     attention.rope.sharding_config = ShardingConfig(
@@ -140,4 +147,48 @@ def _set_deepseek_v3_layer_sharding(
             enable_ep=enable_ep,
             enable_sp=enable_sp,
             expert_param_layout=_GROUPED_EXPERTS_PARAM_LAYOUT,
+        )
+
+
+def _set_deepseek_v3_mtp_sharding(
+    config,
+    *,
+    enable_sp: bool,
+    enable_ep: bool,
+) -> None:
+    activation = (
+        dense_sequence_parallel_placement()
+        if enable_sp
+        else dense_activation_placement(tp=spmd.I, cp=spmd.S(0))
+    )
+    norm = norm_config(enable_sp=enable_sp)
+
+    for mtp_layer_cfg in config.mtp_layers:
+        _set_deepseek_v3_layer_sharding(
+            mtp_layer_cfg,
+            enable_sp=enable_sp,
+            enable_ep=enable_ep,
+        )
+        if enable_sp:
+            mtp_layer_cfg.sharding_config = ShardingConfig(
+                in_src_shardings={
+                    "mtp_input_valid_mask": dense_activation_placement(
+                        tp=spmd.R, cp=spmd.S(0)
+                    ),
+                },
+                in_dst_shardings={
+                    "mtp_input_valid_mask": activation,
+                },
+            )
+        mtp_layer_cfg.enorm.sharding_config = norm
+        mtp_layer_cfg.hnorm.sharding_config = norm
+        mtp_layer_cfg.mtp_norm.sharding_config = pre_lm_head_norm_config(
+            enable_sp=enable_sp
+        )
+        mtp_layer_cfg.eh_proj.sharding_config = ShardingConfig(
+            state_shardings={
+                "weight": dense_param_placement(tp=spmd.R),
+            },
+            in_src_shardings={"input": activation},
+            out_src_shardings=activation,
         )

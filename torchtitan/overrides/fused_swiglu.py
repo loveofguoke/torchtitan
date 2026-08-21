@@ -410,12 +410,13 @@ def _fused_silu_and_mul(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
 def _silu_and_mul_2d(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     # TODO(pianpwk): Migrate this local_map workaround to a custom op SPMD
     # propagation rule registration system.
+    activation_type = (
+        {"dp": spmd.V, "cp": spmd.V, "tp": spmd.V},
+        spmd.PartitionSpec(("dp", "cp"), "tp"),
+    )
     return spmd.local_map(
-        in_types=(
-            {"dp": spmd.S(0), "cp": spmd.S(1), "tp": spmd.S(2)},  # gate_BLF
-            {"dp": spmd.S(0), "cp": spmd.S(1), "tp": spmd.S(2)},  # up_BLF
-        ),
-        out_types={"dp": spmd.S(0), "cp": spmd.S(1), "tp": spmd.S(2)},
+        in_types=(activation_type, activation_type),
+        out_types=activation_type,
     )(
         lambda gate, up: silu_and_mul_op(
             gate.reshape(-1, gate.shape[-1]),
@@ -555,11 +556,13 @@ class FusedGroupedExperts(GroupedExperts):
         offsets_E = torch.cumsum(num_tokens_per_expert_E, dim=0, dtype=torch.int32)
 
         w13_E_D_2F = w13.bfloat16().reshape(E, F * 2, D).transpose(-2, -1)
-        gate_up_R2F = torch._grouped_mm(x_RD.bfloat16(), w13_E_D_2F, offs=offsets_E)
+        gate_up_R2F = self._grouped_mm(
+            A=x_RD.bfloat16(), B_t=w13_E_D_2F, offs=offsets_E
+        )
         gate_RF, up_RF = gate_up_R2F.reshape(-1, F, 2).unbind(-1)
         h_RF = silu_and_mul_op(gate_RF, up_RF, offsets_E)
-        return torch._grouped_mm(
-            h_RF, w2_EDF.bfloat16().transpose(-2, -1), offs=offsets_E
+        return self._grouped_mm(
+            A=h_RF, B_t=w2_EDF.bfloat16().transpose(-2, -1), offs=offsets_E
         ).type_as(x_RD)
 
     @staticmethod

@@ -7,11 +7,9 @@
 from torchtitan.config import ParallelismConfig, TrainingConfig
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
-from torchtitan.distributed.tensor_parallel import maybe_enable_async_tp
 from torchtitan.experiments.graph_trainer.common_utils import (
     annotate_module_fqns,
     annotate_moe_ep_regions,
-    apply_cp_to_attention,
     apply_simple_fsdp,
 )
 from torchtitan.experiments.graph_trainer.compile import apply_compile
@@ -56,22 +54,17 @@ def parallelize_qwen3(
     the model must fit on GPU or CPU memory.
     """
     assert (
-        training.seq_len % parallel_dims.seq_len_divisor == 0
+        training.num_tokens_per_microbatch_per_dp_rank % parallel_dims.seq_len_divisor
+        == 0
     ), f"""
-        Sequence length {training.seq_len} must be divisible by the product of TP degree
+        Token count {training.num_tokens_per_microbatch_per_dp_rank} must be divisible by the product of TP degree
         ({parallel_dims.tp}) and 2 * CP degree ({parallel_dims.cp}), i.e. {parallel_dims.seq_len_divisor}.
         """
-
-    if parallel_dims.cp_enabled:
-        apply_cp_to_attention(model, parallel_dims)
 
     annotate_qwen3(model)
 
     if parallel_dims.tp_enabled or parallel_dims.ep_enabled:
         model.parallelize(parallel_dims)
-
-    if parallel_dims.tp_enabled:
-        maybe_enable_async_tp(parallelism, compile_config, parallel_dims.get_mesh("tp"))
 
     # Apply simple_fsdp unconditionally. The `fsdp` mesh always exists with a
     # real backend (see ParallelDims._mesh_exist), even at degree 1, so that

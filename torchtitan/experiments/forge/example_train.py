@@ -13,7 +13,7 @@ from typing import Any
 import torch
 from torch.distributed.elastic.multiprocessing.errors import record
 
-from torchtitan.components.dataloader import BaseDataLoader, DataloaderExhaustedError
+from torchtitan.components.data.loader import BaseDataLoader, DataloaderExhaustedError
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
@@ -54,17 +54,13 @@ class Trainer(ForgeEngine):
         )
 
         # build dataloader
-        dataloader_batch_size = (
-            config.parallelism.pipeline_parallel_microbatch_size
-            if self.parallel_dims.pp_enabled
-            else config.training.local_batch_size
-        )
+        num_tokens_per_batch = config.training.num_tokens_per_microbatch_per_dp_rank
         self.dataloader = config.dataloader.build(
             dp_world_size=self.dp_degree,
             dp_rank=self.dp_rank,
             tokenizer=self.tokenizer,
-            seq_len=config.training.seq_len,
-            local_batch_size=dataloader_batch_size,
+            max_context_length=config.training.max_context_length,
+            num_tokens_per_batch=num_tokens_per_batch,
         )
 
         model_args = self.model_config
@@ -126,8 +122,8 @@ class Trainer(ForgeEngine):
                 loss_fn=self.loss_fn,
                 validation_context=self.train_context,
                 metrics_processor=self.metrics_processor,
-                seq_len=config.training.seq_len,
-                local_batch_size=config.training.local_batch_size,
+                seq_len=config.training.max_context_length,
+                num_tokens_per_batch=num_tokens_per_batch,
                 pp_schedule=pp_schedule,
                 pp_has_first_stage=pp_has_first_stage,
                 pp_has_last_stage=pp_has_last_stage,
@@ -137,10 +133,11 @@ class Trainer(ForgeEngine):
 
         logger.info(
             "Trainer is initialized with "
-            f"local batch size {config.training.local_batch_size}, "
-            f"global batch size {self.global_batch_size}, "
+            f"{config.training.num_tokens_per_microbatch_per_dp_rank * self.num_pp_microbatches} "
+            "tokens per DP rank, "
+            f"{self.num_tokens_per_train_step} tokens per train step, "
             f"gradient accumulation steps {self.gradient_accumulation_steps}, "
-            f"sequence length {config.training.seq_len}, "
+            f"maximum context length {config.training.max_context_length}, "
             f"total steps {config.training.steps} "
             f"(warmup {config.lr_scheduler.warmup_steps})."
         )
@@ -207,7 +204,7 @@ class Trainer(ForgeEngine):
         *,
         input_dict: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]],
         labels: torch.Tensor | list[torch.Tensor],
-        global_valid_tokens: float,
+        global_valid_tokens: torch.Tensor,
     ) -> torch.Tensor:
         model_parts = self.model_parts
         parallel_dims = self.parallel_dims
@@ -240,7 +237,7 @@ class Trainer(ForgeEngine):
         *,
         input_dict_mbs: list[dict[str, torch.Tensor]],
         label_mbs: list[torch.Tensor],
-        global_valid_tokens: float,
+        global_valid_tokens: torch.Tensor,
     ) -> torch.Tensor:
         arg_mbs: list[tuple[torch.Tensor, ...]] = []
         kwarg_mbs: list[dict[str, Any]] = []
@@ -255,6 +252,7 @@ class Trainer(ForgeEngine):
             if target_mbs is not None:
                 target_mbs.append(labels)
 
+        loss_kwargs = {"global_valid_tokens": global_valid_tokens}
         with self.train_context():
             losses = [] if self.pp_has_last_stage else None
             self.pp_schedule.step(
@@ -262,14 +260,14 @@ class Trainer(ForgeEngine):
                 kwarg_mbs=kwarg_mbs,
                 target_mbs=target_mbs,
                 losses=losses,
+                loss_kwargs=loss_kwargs,
+                return_outputs=False,
             )
 
         # TODO: PP+FSDP unexpectedly puts the loss back to the CPU.
         if self.pp_has_last_stage:
             assert losses is not None
-            return (torch.sum(torch.stack(losses)) / global_valid_tokens).to(
-                self.device
-            )
+            return torch.sum(torch.stack(losses)).to(self.device)
         return torch.tensor([-1.0], device=self.device)
 
     def train_step(
@@ -285,21 +283,20 @@ class Trainer(ForgeEngine):
         local_valid_tokens = torch.tensor(0, dtype=torch.int64)
         for _ in range(self.gradient_accumulation_steps):
             microbatches = []
-            for _ in range(self.num_pipeline_parallel_microbatches):
+            for _ in range(self.num_pp_microbatches):
                 input_dict, labels = next(data_iterator)
                 local_valid_tokens += (labels != IGNORE_INDEX).sum()
                 microbatches.append((input_dict, labels))
             microbatch_groups.append(microbatches)
 
-        # All-reduce to get global token count across DP ranks
-        # Move to GPU for distributed communication
+        # Keep the global token count on device so loss normalization does not
+        # introduce a CPU synchronization in the training path.
+        global_valid_tokens = local_valid_tokens.to(self.device)
         if parallel_dims.dp_enabled:
             batch_mesh = parallel_dims.get_mesh("batch")
-            global_valid_tokens = dist_utils.dist_sum(
-                local_valid_tokens.to(self.device), batch_mesh
+            global_valid_tokens = dist_utils.dist_sum_tensor(
+                global_valid_tokens, batch_mesh
             )
-        else:
-            global_valid_tokens = float(local_valid_tokens.item())
 
         accumulated_losses = []
         for microbatches in microbatch_groups:

@@ -35,6 +35,8 @@ def build_rl_test_list() -> list[OverrideDefinitions]:
                 [
                     "--module alphabet_sort",
                     "--config rl_grpo_qwen3_0_6b_varlen",
+                    "--trainer.parallelism.spmd_backend spmd_types",
+                    "--generator.parallelism.spmd_backend spmd_types",
                     "--async-loop.num-training-steps 5",
                     # trainer FSDP=2 (dp_shard=2, tp=1) + 3 generators TP=2 = 8 GPUs.
                     "--trainer.parallelism.data_parallel_shard_degree 2",
@@ -61,6 +63,8 @@ def build_rl_test_list() -> list[OverrideDefinitions]:
                 [
                     "--module alphabet_sort",
                     "--config rl_grpo_qwen3_0_6b_varlen",
+                    "--trainer.parallelism.spmd_backend spmd_types",
+                    "--generator.parallelism.spmd_backend spmd_types",
                     "--async-loop.num-training-steps 5",
                     # trainer FSDP=2 (dp_shard=2, tp=1) + 3 generators TP=2 = 8 GPUs.
                     "--trainer.parallelism.data_parallel_shard_degree 2",
@@ -85,6 +89,8 @@ def build_rl_test_list() -> list[OverrideDefinitions]:
                 [
                     "--module alphabet_sort",
                     "--config rl_grpo_gpt_oss_debug_varlen",
+                    "--trainer.parallelism.spmd_backend spmd_types",
+                    "--generator.parallelism.spmd_backend spmd_types",
                     "--async-loop.num-training-steps 5",
                     "--hf_assets_path tests/assets/tokenizer",
                     "--trainer.parallelism.tensor_parallel_degree 4",
@@ -126,6 +132,8 @@ def build_rl_test_list() -> list[OverrideDefinitions]:
                 [
                     "--module alphabet_sort",
                     "--config rl_grpo_qwen3_0_6b_varlen",
+                    "--trainer.parallelism.spmd_backend spmd_types",
+                    "--generator.parallelism.spmd_backend spmd_types",
                     "--async-loop.num-training-steps 2",
                     "--num_generators 2",
                     "--trainer.parallelism.data_parallel_shard_degree 2",
@@ -144,6 +152,8 @@ def build_rl_test_list() -> list[OverrideDefinitions]:
                 [
                     "--module alphabet_sort",
                     "--config rl_grpo_qwen3_0_6b_varlen",
+                    "--trainer.parallelism.spmd_backend spmd_types",
+                    "--generator.parallelism.spmd_backend spmd_types",
                     "--async-loop.num-training-steps 4",
                     "--num_generators 1",
                     "--trainer.parallelism.data_parallel_shard_degree 1",
@@ -169,6 +179,8 @@ def build_rl_test_list() -> list[OverrideDefinitions]:
                 [
                     "--module alphabet_sort",
                     "--config rl_grpo_qwen3_0_6b_varlen_batch_invariant",
+                    "--trainer.parallelism.spmd_backend spmd_types",
+                    "--generator.parallelism.spmd_backend spmd_types",
                     "--async-loop.num-training-steps 3",
                     # The config defaults to trainer TP=2 + 3 generators TP=2. Override
                     # to trainer TP=4 + 1 generator TP=4 so batch-invariant mode fits
@@ -195,6 +207,8 @@ def build_rl_test_list() -> list[OverrideDefinitions]:
                 [
                     "--module alphabet_sort",
                     "--config rl_grpo_qwen3_moe_debug_varlen_batch_invariant",
+                    "--trainer.parallelism.spmd_backend spmd_types",
+                    "--generator.parallelism.spmd_backend spmd_types",
                     "--async-loop.num-training-steps 5",
                     "--hf_assets_path tests/assets/tokenizer",
                     "--async-loop.num-samples-per-prompt 2",
@@ -208,6 +222,32 @@ def build_rl_test_list() -> list[OverrideDefinitions]:
             ],
             "RL GRPO MoE TP=4 EP=4 batch-invariant",
             "rl_grpo_moe_debug_tp4_ep4_batch_invariant",
+            ngpu=8,
+        ),
+        OverrideDefinitions(
+            [
+                [
+                    "--module alphabet_sort",
+                    "--config rl_grpo_qwen3_5_debug_varlen_batch_invariant",
+                    "--async-loop.num-training-steps 3",
+                    "--hf_assets_path tests/assets/tokenizer",
+                    # The debug model has two GDN key heads, so TP cannot exceed 2.
+                    "--trainer.parallelism.data_parallel_shard_degree 2",
+                    "--trainer.parallelism.tensor_parallel_degree 2",
+                    "--generator.parallelism.tensor_parallel_degree 2",
+                    "--num_generators 2",
+                    "--async-loop.target-offpolicy-steps 0",
+                    "--async-loop.num-samples-per-prompt 2",
+                    "--async-loop.batcher.batch.seq-len 1024",
+                    "--renderer.enable-thinking False",
+                    "--generator.sampling.max_tokens 128",
+                    "--trainer.checkpoint.no-enable",  # random-init weights
+                    "--generator.checkpoint.no-enable",
+                    "--metrics.no-enable-wandb",
+                ],
+            ],
+            "RL GRPO Qwen3.5 hybrid GDN TP=2 batch-invariant",
+            "rl_grpo_qwen3_5_debug_tp2_batch_invariant",
             ngpu=8,
         ),
     ]

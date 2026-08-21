@@ -125,9 +125,11 @@ class GptOssGroupedExperts(GroupedExperts):
             mlp2_weight_EDF = self.mlp2_weight_EDF
             mlp2_bias_ED = self.mlp2_bias_ED
 
-        # Determine tp_degree from device mesh if available
+        # Determine tp_degree from the active backend's device mesh.
         tp_degree = 1
-        if isinstance(self.mlp1_weight_EGD, DTensor):
+        if get_spmd_backend() == "spmd_types":
+            tp_degree = spmd_mesh_size("tp")
+        elif isinstance(self.mlp1_weight_EGD, DTensor):
             mesh_dim_names = self.mlp1_weight_EGD.device_mesh.mesh_dim_names
             # pyrefly: ignore[not-iterable]
             if "tp" in mesh_dim_names:
@@ -158,9 +160,9 @@ class GptOssGroupedExperts(GroupedExperts):
         ).long()
 
         # G = gate+up dimension (2*F)
-        h_RG = torch._grouped_mm(
-            x_RD.bfloat16(),
-            mlp1_weight_EGD.transpose(-2, -1).bfloat16(),
+        h_RG = self._grouped_mm(
+            A=x_RD.bfloat16(),
+            B_t=mlp1_weight_EGD.transpose(-2, -1).bfloat16(),
             offs=offsets_E,
         )
 
@@ -173,8 +175,8 @@ class GptOssGroupedExperts(GroupedExperts):
         h_RG = h_RG + b1_RG.to(h_RG.dtype)
 
         h_RF = swiglu(h_RG, limit=self.swiglu_limit)
-        h_RD = torch._grouped_mm(
-            h_RF, mlp2_weight_EDF.transpose(-2, -1).bfloat16(), offs=offsets_E
+        h_RD = self._grouped_mm(
+            A=h_RF, B_t=mlp2_weight_EDF.transpose(-2, -1).bfloat16(), offs=offsets_E
         )
 
         # Apply custom autograd function to scale bias in forward but not in backward

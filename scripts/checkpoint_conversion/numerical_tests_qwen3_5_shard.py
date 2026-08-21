@@ -31,6 +31,7 @@ from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.models.qwen3_5 import Qwen35Model, qwen3_5_configs
 from torchtitan.models.qwen3_5.parallelize import parallelize_qwen3_5
+from torchtitan.tools import utils
 
 CONFIGS = [
     {"ngpu": 1, "tp": 1, "ep": 1, "label": "no_parallel"},
@@ -45,7 +46,7 @@ def run_worker(args):
     dist.init_process_group("nccl")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    torch.cuda.set_device(rank)
+    torch.cuda.set_device(utils.get_local_device())
 
     dp_shard = world_size // args.tp
 
@@ -75,8 +76,8 @@ def run_worker(args):
         expert_parallel_degree=args.ep,
     )
     training = TrainingConfig(
-        local_batch_size=1,
-        seq_len=128,
+        num_tokens_per_microbatch_per_dp_rank=1 * 128,
+        max_context_length=128,
         steps=1,
         mixed_precision_param="bfloat16",
         mixed_precision_reduce="float32",
