@@ -50,7 +50,7 @@ def _indexer_config() -> Glm5DsaIndexer.Config:
         wk=Linear.Config(in_features=16, out_features=8),
         k_norm=LayerNorm.Config(normalized_shape=8),
         weights_proj=Linear.Config(in_features=16, out_features=2),
-        rope=ComplexRoPE.Config(dim=4, max_seq_len=8, theta=1_000_000),
+        rope=ComplexRoPE.Config(dim=4, max_context_length=8, theta=1_000_000),
         topk=DSAIndexerTopK.Config(index_topk=3, softmax_scale=8**-0.5),
     )
 
@@ -71,7 +71,7 @@ def _attention_config() -> Glm5Attention.Config:
         kv_norm=RMSNorm.Config(normalized_shape=4),
         wkv_b=Linear.Config(in_features=4, out_features=16),
         wo=Linear.Config(in_features=8, out_features=16),
-        rope=ComplexRoPE.Config(dim=4, max_seq_len=8, theta=1_000_000),
+        rope=ComplexRoPE.Config(dim=4, max_context_length=8, theta=1_000_000),
         indexer=_indexer_config(),
         inner_attention=DSAInnerAttention.Config(attention_dropout=0.0),
     )
@@ -616,7 +616,7 @@ class TestGlm5Model(unittest.TestCase):
         self.assertEqual(config.vocab_size, 2048)
         self.assertEqual(config.dim, 256)
         self.assertEqual(len(config.layers), 8)
-        self.assertEqual(config.max_seq_len, 128)
+        self.assertEqual(config.max_context_length, 128)
         self.assertEqual(config.norm.eps, 1e-5)
         for layer_id, layer_config in enumerate(config.layers):
             self.assertIsInstance(layer_config, Glm5TransformerBlock.Config)
@@ -629,7 +629,7 @@ class TestGlm5Model(unittest.TestCase):
             self.assertEqual(attention.v_head_dim, 64)
             self.assertIsInstance(attention.inner_attention, DSAInnerAttention.Config)
             self.assertEqual(attention.inner_attention.attention_dropout, 0.0)
-            self.assertEqual(attention.rope.max_seq_len, 128)
+            self.assertEqual(attention.rope.max_context_length, 128)
             self.assertEqual(attention.rope.theta, 1_000_000)
             self.assertEqual(attention.rope.scaling, "none")
             self.assertEqual(attention.q_norm.eps, 1e-6)

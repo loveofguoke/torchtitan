@@ -304,7 +304,7 @@ def _debugmodel() -> Glm5Model.Config:
     vocab_size = 2048
     rope = ComplexRoPE.Config(
         dim=32,
-        max_seq_len=128,
+        max_context_length=128,
         theta=1_000_000,
         scaling="none",
     )

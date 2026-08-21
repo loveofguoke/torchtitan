@@ -17,6 +17,25 @@ from torchtitan.models.utils import get_moe_model_nparams_and_flops
 from torchtitan.protocols.module import Module
 
 
+def _apply_batched_rope(
+    rope: ComplexRoPE,
+    query_BLNH: torch.Tensor,
+    key_BLMH: torch.Tensor,
+    positions_BL: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply token-first common RoPE while GLM retains document batches."""
+
+    B, L = query_BLNH.shape[:2]
+    query_TNH = query_BLNH.reshape(B * L, *query_BLNH.shape[2:])
+    key_TMH = key_BLMH.reshape(B * L, *key_BLMH.shape[2:])
+    positions_T = positions_BL.reshape(B * L)
+    query_TNH, key_TMH = rope(query_TNH, key_TMH, positions_T)
+    return (
+        query_TNH.reshape(B, L, *query_TNH.shape[1:]),
+        key_TMH.reshape(B, L, *key_TMH.shape[1:]),
+    )
+
+
 class DSAIndexerTopK(Module):
     """Compute local-query top-k indices against a global key sequence."""
 
@@ -143,7 +162,12 @@ class Glm5DsaIndexer(Module):
             [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim],
             dim=-1,
         )
-        q_rot_BLNR, k_rot_BL1R = self.rope(q_rot_BLNR, k_rot_BL1R, positions_BL)
+        q_rot_BLNR, k_rot_BL1R = _apply_batched_rope(
+            self.rope,
+            q_rot_BLNR,
+            k_rot_BL1R,
+            positions_BL,
+        )
         q_BLNH = torch.cat((q_rot_BLNR, q_pass_BLNP), dim=-1)
         k_BLH = torch.cat((k_rot_BL1R, k_pass_BL1P), dim=-1).squeeze(2)
 
@@ -389,7 +413,12 @@ class Glm5Attention(BaseAttention):
         )
         kv_BLR = self.kv_norm(kv_BLR)
         k_rope_BL1R = k_rope_BL1R.unsqueeze(2)
-        q_rope_BLNR, k_rope_BL1R = self.rope(q_rope_BLNR, k_rope_BL1R, positions_BL)
+        q_rope_BLNR, k_rope_BL1R = _apply_batched_rope(
+            self.rope,
+            q_rope_BLNR,
+            k_rope_BL1R,
+            positions_BL,
+        )
         q_BLNH = torch.cat((q_nope_BLNP, q_rope_BLNR), dim=-1)
         kv_BLNX = self.wkv_b(kv_BLR).view(
             B, L, self.n_heads, self.qk_nope_head_dim + self.v_head_dim
