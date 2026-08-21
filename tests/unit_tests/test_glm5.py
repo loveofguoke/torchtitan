@@ -119,14 +119,14 @@ def _debug_layer_kwargs() -> dict:
 
 
 def _dense_causal_mask(
-    positions_BL: torch.Tensor,
+    positions_T: torch.Tensor,
     *,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    B, L = positions_BL.shape
-    key_positions_11L = torch.arange(L, device=positions_BL.device)[None, None, :]
-    return torch.zeros(B, 1, L, L, dtype=dtype, device=positions_BL.device).masked_fill(
-        key_positions_11L > positions_BL.unsqueeze(-1).unsqueeze(1),
+    T = positions_T.shape[0]
+    key_positions_K = torch.arange(T, device=positions_T.device)
+    return torch.zeros(1, T, T, dtype=dtype, device=positions_T.device).masked_fill(
+        key_positions_K > positions_T.unsqueeze(-1).unsqueeze(0),
         float("-inf"),
     )
 
@@ -138,6 +138,12 @@ def _reference_sparse_attention(
     positions_BL: torch.Tensor,
     topk_indices_BLK: torch.Tensor,
 ) -> torch.Tensor:
+    input_was_token_first = x_BLD.ndim == 2
+    if input_was_token_first:
+        x_BLD = x_BLD.unsqueeze(0)
+        attention_masks_B1LL = attention_masks_B1LL.unsqueeze(0)
+        positions_BL = positions_BL.unsqueeze(0)
+        topk_indices_BLK = topk_indices_BLK.unsqueeze(0)
     B, L, _ = x_BLD.shape
     q_resid_BLR = _reference_rms_norm(
         F.linear(x_BLD, attention.wq_a.weight, attention.wq_a.bias),
@@ -203,9 +209,10 @@ def _reference_sparse_attention(
     scores_BNLL = scores_BNLL + sparse_mask_B1LL
     probs_BNLL = F.softmax(scores_BNLL, dim=-1, dtype=torch.float32).to(q_BLNH.dtype)
     output_BLNV = torch.matmul(probs_BNLL, v_BLNV.transpose(1, 2)).transpose(1, 2)
-    return F.linear(
+    output = F.linear(
         output_BLNV.contiguous().view(B, L, -1), attention.wo.weight, attention.wo.bias
     )
+    return output.squeeze(0) if input_was_token_first else output
 
 
 def _reference_rms_norm(x_BLD: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
@@ -224,6 +231,13 @@ def _reference_indexer_topk(
     positions_BL: torch.Tensor,
     attention_mask_BLL: torch.Tensor | None,
 ) -> torch.Tensor:
+    input_was_token_first = hidden_states_BLD.ndim == 2
+    if input_was_token_first:
+        hidden_states_BLD = hidden_states_BLD.unsqueeze(0)
+        q_resid_BLR = q_resid_BLR.unsqueeze(0)
+        positions_BL = positions_BL.unsqueeze(0)
+        if attention_mask_BLL is not None:
+            attention_mask_BLL = attention_mask_BLL.unsqueeze(0)
     B, L, _ = hidden_states_BLD.shape
     q_BLNH = F.linear(
         q_resid_BLR,
@@ -292,18 +306,19 @@ def _reference_indexer_topk(
             key_positions_11L > positions_BL.unsqueeze(-1), float("-inf")
         )
     topk = min(indexer.index_topk, index_scores_BLL.shape[-1])
-    return index_scores_BLL.topk(topk, dim=-1).indices.to(torch.int32)
+    output = index_scores_BLL.topk(topk, dim=-1).indices.to(torch.int32)
+    return output.squeeze(0) if input_was_token_first else output
 
 
 # DSA Indexer模块测试
 class TestGlm5DsaIndexer(unittest.TestCase):
     def test_topk_supports_local_queries_against_global_keys(self):
         topk = DSAIndexerTopK.Config(index_topk=2, softmax_scale=0.5).build()
-        q_BQNH = torch.randn(1, 2, 3, 4)
-        k_BKH = torch.randn(1, 5, 4)
-        weights_BQN = torch.randn(1, 2, 3)
-        attention_mask_BQK = torch.zeros(1, 2, 5)
-        attention_mask_BQK[:, 0, 4] = float("-inf")
+        q_BQNH = torch.randn(2, 3, 4)
+        k_BKH = torch.randn(5, 4)
+        weights_BQN = torch.randn(2, 3)
+        attention_mask_BQK = torch.zeros(2, 5)
+        attention_mask_BQK[0, 4] = float("-inf")
 
         actual_BQK = topk(
             q_BQNH,
@@ -312,22 +327,18 @@ class TestGlm5DsaIndexer(unittest.TestCase):
             attention_mask_BQK,
         )
         scores_BNQK = F.relu(
-            torch.matmul(
-                q_BQNH.float().transpose(1, 2),
-                k_BKH.float().transpose(1, 2).unsqueeze(1),
-            )
-            * 0.5
+            torch.matmul(q_BQNH.float().transpose(0, 1), k_BKH.float().T) * 0.5
         )
         expected_scores_BQK = (
             torch.matmul(
                 weights_BQN.unsqueeze(-2),
-                scores_BNQK.transpose(1, 2),
+                scores_BNQK.transpose(0, 1),
             ).squeeze(-2)
             + attention_mask_BQK
         )
         expected_BQK = expected_scores_BQK.topk(2, dim=-1).indices.to(torch.int32)
 
-        self.assertEqual(actual_BQK.shape, (1, 2, 2))
+        self.assertEqual(actual_BQK.shape, (2, 2))
         self.assertTrue(torch.equal(actual_BQK, expected_BQK))
 
     # 测试torchtitan indexer自身的基本契约
@@ -335,12 +346,12 @@ class TestGlm5DsaIndexer(unittest.TestCase):
         indexer = _indexer_config().build()
         indexer.init_states()
         # 构造输入数据, 完全随机, 只测试indexer的行为
-        hidden_states_BLD = torch.randn(2, 5, 16)
-        q_resid_BLR = torch.randn(2, 5, 8)
-        positions_BL = torch.arange(5).expand(2, -1)
-        attention_mask_BLL = torch.full((2, 5, 5), float("-inf"))
+        hidden_states_BLD = torch.randn(10, 16)
+        q_resid_BLR = torch.randn(10, 8)
+        positions_BL = torch.arange(5).repeat(2)
+        attention_mask_BLL = torch.full((10, 10), float("-inf"))
         attention_mask_BLL.masked_fill_(
-            torch.ones(5, 5, dtype=torch.bool).tril().unsqueeze(0), 0.0
+            torch.block_diag(*[torch.ones(5, 5, dtype=torch.bool).tril()] * 2), 0.0
         )
 
         topk_indices_BLK = indexer(
@@ -353,7 +364,7 @@ class TestGlm5DsaIndexer(unittest.TestCase):
         # 输出 dtype 是 torch.int32
         self.assertEqual(topk_indices_BLK.dtype, torch.int32)
         # 输出 shape 是 [B, S, topk]
-        self.assertEqual(topk_indices_BLK.shape, (2, 5, 3))
+        self.assertEqual(topk_indices_BLK.shape, (10, 3))
         # top-k 不超过配置的 index_topk
         full_topk_queries_B = positions_BL >= topk_indices_BLK.shape[-1] - 1
         self.assertTrue(
@@ -366,7 +377,7 @@ class TestGlm5DsaIndexer(unittest.TestCase):
         self.assertTrue(
             torch.all(
                 torch.any(
-                    topk_indices_BLK[:, 0] > positions_BL[:, 0].unsqueeze(-1),
+                    topk_indices_BLK[positions_BL == 0] > 0,
                     dim=-1,
                 )
             )
@@ -378,11 +389,11 @@ class TestGlm5DsaIndexer(unittest.TestCase):
         indexer = _indexer_config().build()
         indexer.init_states()
         # 构造输入数据, 完全随机, 只测试indexer的行为
-        hidden_states_BLD = torch.randn(1, 4, 16)
-        q_resid_BLR = torch.randn(1, 4, 8)
-        positions_BL = torch.arange(4).unsqueeze(0)
-        attention_mask_BLL = torch.zeros(1, 4, 4).masked_fill(
-            ~torch.ones(4, 4, dtype=torch.bool).tril().unsqueeze(0),
+        hidden_states_BLD = torch.randn(4, 16)
+        q_resid_BLR = torch.randn(4, 8)
+        positions_BL = torch.arange(4)
+        attention_mask_BLL = torch.zeros(4, 4).masked_fill(
+            ~torch.ones(4, 4, dtype=torch.bool).tril(),
             float("-inf"),
         )
 
@@ -415,10 +426,10 @@ class TestGlm5DsaIndexer(unittest.TestCase):
         # 测试 BF16 转换后 weights_proj.weight 仍是 FP32
         self.assertEqual(indexer.weights_proj.weight.dtype, torch.float32)
         out_BLK = indexer(
-            torch.randn(1, 4, 16, dtype=torch.bfloat16),
-            torch.randn(1, 4, 8, dtype=torch.bfloat16),
-            torch.arange(4).unsqueeze(0),
-            torch.zeros(1, 4, 4, dtype=torch.bfloat16),
+            torch.randn(4, 16, dtype=torch.bfloat16),
+            torch.randn(4, 8, dtype=torch.bfloat16),
+            torch.arange(4),
+            torch.zeros(4, 4, dtype=torch.bfloat16),
         )
         # 测试 indexer 输出不需要梯度
         self.assertFalse(out_BLK.requires_grad)
@@ -432,11 +443,11 @@ class TestGlm5Attention(unittest.TestCase):
 
     def test_dsa_inner_attention_supports_local_queries_and_global_kv(self):
         inner_attention = DSAInnerAttention.Config(attention_dropout=0.0).build()
-        q_BQNH = torch.randn(1, 2, 2, 4)
-        k_BKNH = torch.randn(1, 5, 2, 4)
-        v_BKNV = torch.randn(1, 5, 2, 3)
-        attention_mask_B1QK = torch.zeros(1, 1, 2, 5)
-        topk_indices_BQT = torch.tensor([[[0, 3], [1, 4]]], dtype=torch.int32)
+        q_BQNH = torch.randn(2, 2, 4)
+        k_BKNH = torch.randn(5, 2, 4)
+        v_BKNV = torch.randn(5, 2, 3)
+        attention_mask_B1QK = torch.zeros(1, 2, 5)
+        topk_indices_BQT = torch.tensor([[0, 3], [1, 4]], dtype=torch.int32)
 
         actual_BQNV = inner_attention(
             q_BQNH,
@@ -446,19 +457,19 @@ class TestGlm5Attention(unittest.TestCase):
             topk_indices_BQT,
             scale=0.5,
         )
-        selected_BQK = torch.zeros(1, 2, 5, dtype=torch.bool).scatter(
+        selected_BQK = torch.zeros(2, 5, dtype=torch.bool).scatter(
             -1,
             topk_indices_BQT.long(),
             True,
         )
         sparse_mask_B1QK = attention_mask_B1QK.masked_fill(
-            ~selected_BQK.unsqueeze(1),
+            ~selected_BQK.unsqueeze(0),
             torch.finfo(q_BQNH.dtype).min,
         )
         scores_BNQK = (
             torch.matmul(
-                q_BQNH.transpose(1, 2),
-                k_BKNH.transpose(1, 2).transpose(-1, -2),
+                q_BQNH.transpose(0, 1),
+                k_BKNH.transpose(0, 1).transpose(-1, -2),
             )
             * 0.5
             + sparse_mask_B1QK
@@ -466,10 +477,10 @@ class TestGlm5Attention(unittest.TestCase):
         probs_BNQK = F.softmax(scores_BNQK, dim=-1, dtype=torch.float32)
         expected_BQNV = torch.matmul(
             probs_BNQK,
-            v_BKNV.transpose(1, 2),
-        ).transpose(1, 2)
+            v_BKNV.transpose(0, 1),
+        ).transpose(0, 1)
 
-        self.assertEqual(actual_BQNV.shape, (1, 2, 2, 3))
+        self.assertEqual(actual_BQNV.shape, (2, 2, 3))
         torch.testing.assert_close(actual_BQNV, expected_BQNV)
 
     def test_attention_allows_independent_index_head_dimension(self):
@@ -501,11 +512,11 @@ class TestGlm5Attention(unittest.TestCase):
     def test_attention_topk_cannot_reopen_causal_mask(self):
         attention = _attention_config().build()
         attention.init_states()
-        x_BLD = torch.randn(1, 4, 16)
-        positions_BL = torch.arange(4).unsqueeze(0)
+        x_BLD = torch.randn(4, 16)
+        positions_BL = torch.arange(4)
         base_mask_B1LL = _dense_causal_mask(positions_BL, dtype=x_BLD.dtype)
         future_selecting_topk_BLK = torch.tensor(
-            [[[3, 2], [3, 2], [3, 2], [3, 2]]], dtype=torch.int32
+            [[3, 2], [3, 2], [3, 2], [3, 2]], dtype=torch.int32
         )
         with mock.patch.object(
             attention.indexer,
@@ -525,8 +536,8 @@ class TestGlm5Attention(unittest.TestCase):
     def test_attention_output_shape_and_backward(self):
         attention = _attention_config().build()
         attention.init_states()
-        x_BLD = torch.randn(2, 5, 16, requires_grad=True)
-        positions_BL = torch.arange(5).expand(2, -1)
+        x_BLD = torch.randn(10, 16, requires_grad=True)
+        positions_BL = torch.arange(5).repeat(2)
         mask_B1LL = _dense_causal_mask(positions_BL, dtype=x_BLD.dtype)
         output_BLD = attention(x_BLD, mask_B1LL, positions_BL)
         self.assertEqual(output_BLD.shape, x_BLD.shape)
@@ -540,16 +551,15 @@ class TestGlm5Attention(unittest.TestCase):
     def test_attention_rejects_malformed_additive_masks(self):
         attention = _attention_config().build()
         attention.init_states()
-        x_BLD = torch.randn(2, 4, 16)
-        positions_BL = torch.arange(4).expand(2, -1)
+        x_BLD = torch.randn(8, 16)
+        positions_BL = torch.arange(4).repeat(2)
         mask_B1LL = _dense_causal_mask(positions_BL, dtype=x_BLD.dtype)
         invalid_masks = {
-            "rank": mask_B1LL[:, 0],
-            "channels": torch.zeros(2, 2, 4, 4),
-            "batch": torch.zeros(1, 1, 4, 4),
-            "length": torch.zeros(2, 1, 4, 3),
-            "dtype": torch.zeros(2, 1, 4, 4, dtype=torch.int32),
-            "device": torch.zeros(2, 1, 4, 4, device="meta"),
+            "rank": mask_B1LL[0],
+            "channels": torch.zeros(2, 8, 8),
+            "length": torch.zeros(1, 8, 7),
+            "dtype": torch.zeros(1, 8, 8, dtype=torch.int32),
+            "device": torch.zeros(1, 8, 8, device="meta"),
         }
         for case, invalid_mask_B1LL in invalid_masks.items():
             with self.subTest(case=case):
@@ -660,23 +670,23 @@ class TestGlm5Model(unittest.TestCase):
 
     def test_dense_mask_enforces_causality_and_document_boundaries(self):
         model = _build_debug_model()
-        positions_BL = torch.tensor([[0, 1, 2, 0, 1]], dtype=torch.long)
+        positions_BL = torch.tensor([0, 1, 2, 0, 1], dtype=torch.long)
 
         mask_B1LL = model.get_attention_masks(positions_BL)
 
         min_value = torch.finfo(mask_B1LL.dtype).min
-        self.assertEqual(mask_B1LL.shape, (1, 1, 5, 5))
-        self.assertEqual(mask_B1LL[0, 0, 4, 3].item(), 0.0)
-        self.assertEqual(mask_B1LL[0, 0, 4, 1].item(), min_value)
-        self.assertEqual(mask_B1LL[0, 0, 1, 2].item(), min_value)
+        self.assertEqual(mask_B1LL.shape, (1, 5, 5))
+        self.assertEqual(mask_B1LL[0, 4, 3].item(), 0.0)
+        self.assertEqual(mask_B1LL[0, 4, 1].item(), min_value)
+        self.assertEqual(mask_B1LL[0, 1, 2].item(), min_value)
 
     def test_dense_mask_accepts_decoder_positions_keyword(self):
         model = _build_debug_model()
-        positions_BL = torch.arange(4).unsqueeze(0)
+        positions_BL = torch.arange(4)
 
         mask_B1LL = model.get_attention_masks(positions=positions_BL)
 
-        self.assertEqual(mask_B1LL.shape, (1, 1, 4, 4))
+        self.assertEqual(mask_B1LL.shape, (1, 4, 4))
 
     def test_non_first_pp_stage_builds_dense_mask_without_embeddings(self):
         # Every PP stage containing attention builds its own mask. A non-first
@@ -690,9 +700,9 @@ class TestGlm5Model(unittest.TestCase):
         stage = _split_module(model, fqn_per_stage[1])
         self.assertIsNone(stage.tok_embeddings)
 
-        mask_B1LL = stage.get_attention_masks(torch.arange(5).unsqueeze(0))
+        mask_B1LL = stage.get_attention_masks(torch.arange(5))
 
-        self.assertEqual(mask_B1LL.shape, (1, 1, 5, 5))
+        self.assertEqual(mask_B1LL.shape, (1, 5, 5))
         self.assertTrue(torch.isfinite(mask_B1LL).all())
 
     def test_output_only_pp_stage_does_not_build_attention_mask(self):
@@ -708,21 +718,24 @@ class TestGlm5Model(unittest.TestCase):
         self.assertIsNotNone(stage.norm)
         self.assertIsNotNone(stage.lm_head)
 
-        positions_BL = torch.arange(5).unsqueeze(0)
+        positions_BL = torch.arange(5)
         self.assertIsNone(stage.get_attention_masks(positions_BL))
 
-        hidden_BLD = torch.randn(1, 5, config.dim)
+        hidden_BLD = torch.randn(5, config.dim)
         logits_BLV = stage(hidden_BLD, positions=positions_BL)
-        self.assertEqual(logits_BLV.shape, (1, 5, config.vocab_size))
+        self.assertEqual(logits_BLV.shape, (5, config.vocab_size))
 
     def test_debug_model_forward_shape(self):
         model = _build_debug_model()
-        tokens_BL = torch.randint(0, 2048, (2, 12))
-        positions_BL = torch.arange(12).expand(2, -1)
+        tokens_BL = torch.randint(0, 2048, (24,))
+        positions_BL = torch.arange(12).repeat(2)
+        attention_masks = model.get_attention_masks(positions_BL)
 
-        logits_BLV = model(tokens_BL, positions=positions_BL)
+        logits_BLV = model(
+            tokens_BL, positions=positions_BL, attention_masks=attention_masks
+        )
 
-        self.assertEqual(logits_BLV.shape, (2, 12, 2048))
+        self.assertEqual(logits_BLV.shape, (24, 2048))
 
     def test_debug_model_cpu_forward_loss_backward(self):
         torch.manual_seed(29)
@@ -730,11 +743,14 @@ class TestGlm5Model(unittest.TestCase):
         model = config.build()
         model.init_states()
         model.train()
-        tokens_BL = torch.randint(0, config.vocab_size, (2, 16))
-        positions_BL = torch.arange(16).expand(2, -1)
-        labels_BL = torch.randint(0, config.vocab_size, (2, 16))
-        logits_BLV = model(tokens_BL, positions=positions_BL)
-        loss = F.cross_entropy(logits_BLV.float().flatten(0, 1), labels_BL.flatten())
+        tokens_BL = torch.randint(0, config.vocab_size, (32,))
+        positions_BL = torch.arange(16).repeat(2)
+        labels_BL = torch.randint(0, config.vocab_size, (32,))
+        attention_masks = model.get_attention_masks(positions_BL)
+        logits_BLV = model(
+            tokens_BL, positions=positions_BL, attention_masks=attention_masks
+        )
+        loss = F.cross_entropy(logits_BLV.float(), labels_BL)
         loss.backward()
 
         self.assertTrue(torch.isfinite(loss))
@@ -1066,7 +1082,7 @@ class TestGlm5Registration(unittest.TestCase):
         self.assertIsNotNone(attention.sharding_config)
         sequence_layout = dense_sequence_parallel_placement()
         self.assertEqual(
-            attention.sharding_config.in_src_shardings["x_BLD"], sequence_layout
+            attention.sharding_config.in_src_shardings["x_TD"], sequence_layout
         )
         self.assertEqual(
             attention.wo.sharding_config.out_dst_shardings,
@@ -1145,15 +1161,16 @@ class TestGlm5ContextParallel(unittest.TestCase):
             observed["attention_masks"] = attention_masks
             return tokens
 
+        get_attention_masks = mock.Mock()
         model = SimpleNamespace(
             layers={},
             forward=model_forward,
-            get_attention_masks=mock.Mock(),
+            get_attention_masks=get_attention_masks,
         )
         cp_mesh = mock.Mock()
         cp_mesh.get_group.return_value = object()
-        tokens_BLD = torch.randn(1, 4, 8)
-        positions_BL = torch.arange(4).unsqueeze(0)
+        tokens_BLD = torch.randn(4, 8)
+        positions_BL = torch.arange(4)
 
         with (
             mock.patch(
@@ -1170,7 +1187,7 @@ class TestGlm5ContextParallel(unittest.TestCase):
         self.assertIs(output, tokens_BLD)
         self.assertIs(observed["positions"], positions_BL)
         self.assertIsNone(observed["attention_masks"])
-        model.get_attention_masks.assert_not_called()
+        get_attention_masks.assert_not_called()
         all_gather.assert_not_called()
 
     def test_cp_wrapper_builds_mask_and_gathers_indexer_keys_and_attention_kv(self):
@@ -1184,7 +1201,7 @@ class TestGlm5ContextParallel(unittest.TestCase):
 
         def get_attention_masks(global_positions):
             observed["global_positions"] = global_positions
-            return torch.arange(16, dtype=torch.float32).reshape(1, 1, 4, 4)
+            return torch.arange(16, dtype=torch.float32).reshape(1, 4, 4)
 
         model = SimpleNamespace(
             layers={"0": SimpleNamespace(attention=attention)},
@@ -1199,7 +1216,7 @@ class TestGlm5ContextParallel(unittest.TestCase):
 
         def topk_forward(q, k, weights, attention_mask):
             observed["indexer_k"] = k
-            return torch.zeros(q.shape[:2] + (2,), dtype=torch.int32)
+            return torch.zeros(q.shape[:1] + (2,), dtype=torch.int32)
 
         def inner_forward(q, k, v, attention_mask, topk_indices, *, scale):
             observed["attention_k"] = k
@@ -1215,9 +1232,9 @@ class TestGlm5ContextParallel(unittest.TestCase):
             outputs[1].copy_(local_tensor + 10)
 
         def fake_flex_allgather(k, v, sequence_dim, process_group_name):
-            self.assertEqual(sequence_dim, 1)
+            self.assertEqual(sequence_dim, 0)
             self.assertEqual(process_group_name, "cp_group")
-            return torch.cat((k, k + 10), dim=1), torch.cat((v, v + 20), dim=1)
+            return torch.cat((k, k + 10), dim=0), torch.cat((v, v + 20), dim=0)
 
         with (
             mock.patch(
@@ -1234,41 +1251,41 @@ class TestGlm5ContextParallel(unittest.TestCase):
             ),
         ):
             apply_glm5_cp_to_forward(model, cp_mesh)
-            local_positions = torch.tensor([[2, 3]])
-            local_tokens = torch.tensor([[7, 8]])
+            local_positions = torch.tensor([2, 3])
+            local_tokens = torch.tensor([7, 8])
             model.forward(local_tokens, local_positions)
 
-            q_BQNH = torch.randn(1, 2, 2, 4)
-            k_BKH = torch.randn(1, 2, 4)
-            weights_BQN = torch.randn(1, 2, 2)
-            mask_BQK = torch.zeros(1, 2, 4)
+            q_BQNH = torch.randn(2, 2, 4)
+            k_BKH = torch.randn(2, 4)
+            weights_BQN = torch.randn(2, 2)
+            mask_BQK = torch.zeros(2, 4)
             attention.indexer.topk(q_BQNH, k_BKH, weights_BQN, mask_BQK)
 
-            k_BLNH = torch.randn(1, 2, 2, 4)
-            v_BLNH = torch.randn(1, 2, 2, 3)
+            k_BLNH = torch.randn(2, 2, 4)
+            v_BLNH = torch.randn(2, 2, 3)
             attention.inner_attention(
                 q_BQNH,
                 k_BLNH,
                 v_BLNH,
-                torch.zeros(1, 1, 2, 4),
-                torch.zeros(1, 2, 2, dtype=torch.int32),
+                torch.zeros(1, 2, 4),
+                torch.zeros(2, 2, dtype=torch.int32),
                 scale=0.5,
             )
 
         self.assertTrue(
-            torch.equal(observed["global_positions"], torch.tensor([[2, 3, 12, 13]]))
+            torch.equal(observed["global_positions"], torch.tensor([2, 3, 12, 13]))
         )
         self.assertIs(observed["model_positions"], local_positions)
         self.assertTrue(
             torch.equal(
                 observed["attention_masks"],
-                torch.arange(16, dtype=torch.float32).reshape(1, 1, 4, 4)[:, :, 2:4, :],
+                torch.arange(16, dtype=torch.float32).reshape(1, 4, 4)[:, 2:4, :],
             )
         )
-        self.assertEqual(observed["indexer_k"].shape[1], 4)
-        self.assertTrue(torch.equal(observed["indexer_k"][:, 2:], k_BKH + 10))
-        self.assertEqual(observed["attention_k"].shape[1], 4)
-        self.assertEqual(observed["attention_v"].shape[1], 4)
+        self.assertEqual(observed["indexer_k"].shape[0], 4)
+        self.assertTrue(torch.equal(observed["indexer_k"][2:], k_BKH + 10))
+        self.assertEqual(observed["attention_k"].shape[0], 4)
+        self.assertEqual(observed["attention_v"].shape[0], 4)
 
 
 class TestGlm5StateDictAdapter(unittest.TestCase):

@@ -16,24 +16,9 @@ from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.models.utils import get_moe_model_nparams_and_flops
 from torchtitan.protocols.module import Module
 
-
-def _apply_batched_rope(
-    rope: ComplexRoPE,
-    query_BLNH: torch.Tensor,
-    key_BLMH: torch.Tensor,
-    positions_BL: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply token-first common RoPE while GLM retains document batches."""
-
-    B, L = query_BLNH.shape[:2]
-    query_TNH = query_BLNH.reshape(B * L, *query_BLNH.shape[2:])
-    key_TMH = key_BLMH.reshape(B * L, *key_BLMH.shape[2:])
-    positions_T = positions_BL.reshape(B * L)
-    query_TNH, key_TMH = rope(query_TNH, key_TMH, positions_T)
-    return (
-        query_TNH.reshape(B, L, *query_TNH.shape[1:]),
-        key_TMH.reshape(B, L, *key_TMH.shape[1:]),
-    )
+# Tensor dimensions used in this file:
+# T/Q/K: token, query-token, and key-token dimensions.
+# D/N/H/R/P/V: model, head-count, head, RoPE, pass-through, and value dimensions.
 
 
 class DSAIndexerTopK(Module):
@@ -57,35 +42,31 @@ class DSAIndexerTopK(Module):
 
     def forward(
         self,
-        q_BQNH: torch.Tensor,
-        k_BKH: torch.Tensor,
-        weights_BQN: torch.Tensor,
-        attention_mask_BQK: torch.Tensor,
+        q_QNH: torch.Tensor,
+        k_KH: torch.Tensor,
+        weights_QN: torch.Tensor,
+        attention_mask_QK: torch.Tensor,
     ) -> torch.Tensor:
-        if q_BQNH.ndim != 4 or k_BKH.ndim != 3:
-            raise ValueError("DSA indexer q and k must have rank 4 and 3.")
-        B, Q, N, H = q_BQNH.shape
-        K = k_BKH.shape[1]
-        if k_BKH.shape != (B, K, H):
-            raise ValueError("DSA indexer k must have shape [B, K, H].")
-        if weights_BQN.shape != (B, Q, N):
-            raise ValueError("DSA indexer weights must have shape [B, Q, N].")
-        if attention_mask_BQK.shape != (B, Q, K):
-            raise ValueError("DSA indexer attention_masks must have shape [B, Q, K].")
-        scores_BNQK = (
-            torch.matmul(
-                q_BQNH.float().transpose(1, 2),
-                k_BKH.float().transpose(1, 2).unsqueeze(1),
-            )
-            * self.softmax_scale
-        )
-        scores_BNQK = F.relu(scores_BNQK)
-        index_scores_BQK = torch.matmul(
-            weights_BQN.unsqueeze(-2), scores_BNQK.transpose(1, 2)
-        ).squeeze(-2)
-        index_scores_BQK = index_scores_BQK + attention_mask_BQK.float()
-        topk = min(self.index_topk, index_scores_BQK.shape[-1])
-        return index_scores_BQK.topk(topk, dim=-1).indices.to(torch.int32)
+        if q_QNH.ndim != 3 or k_KH.ndim != 2:
+            raise ValueError("DSA indexer q and k must have rank 3 and 2.")
+        Q, N, H = q_QNH.shape
+        K = k_KH.shape[0]
+        if k_KH.shape != (K, H):
+            raise ValueError("DSA indexer k must have shape [K, H].")
+        if weights_QN.shape != (Q, N):
+            raise ValueError("DSA indexer weights must have shape [Q, N].")
+        if attention_mask_QK.shape != (Q, K):
+            raise ValueError("DSA indexer attention mask must have shape [Q, K].")
+        scores_NQK = torch.matmul(
+            q_QNH.float().transpose(0, 1), k_KH.float().transpose(0, 1)
+        ) * self.softmax_scale
+        scores_NQK = F.relu(scores_NQK)
+        index_scores_QK = torch.matmul(
+            weights_QN.unsqueeze(1), scores_NQK.transpose(0, 1)
+        ).squeeze(1)
+        index_scores_QK = index_scores_QK + attention_mask_QK.float()
+        topk = min(self.index_topk, index_scores_QK.shape[-1])
+        return index_scores_QK.topk(topk, dim=-1).indices.to(torch.int32)
 
 
 class Glm5DsaIndexer(Module):
@@ -144,48 +125,40 @@ class Glm5DsaIndexer(Module):
     @torch.no_grad()
     def forward(
         self,
-        hidden_states_BLD: torch.Tensor,
-        q_resid_BLR: torch.Tensor,
-        positions_BL: torch.Tensor,
-        attention_mask_BLL: torch.Tensor | None,
+        hidden_states_TD: torch.Tensor,
+        q_resid_TR: torch.Tensor,
+        positions_T: torch.Tensor,
+        attention_mask_TK: torch.Tensor | None,
     ) -> torch.Tensor:
-        B, L, _ = hidden_states_BLD.shape
-        q_BLNH = self.wq_b(q_resid_BLR).view(B, L, self.n_heads, self.head_dim)
-        q_rot_BLNR, q_pass_BLNP = torch.split(
-            q_BLNH,
+        T = hidden_states_TD.shape[0]
+        q_TNH = self.wq_b(q_resid_TR).view(T, self.n_heads, self.head_dim)
+        q_rot_TNR, q_pass_TNP = torch.split(
+            q_TNH,
             [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim],
             dim=-1,
         )
-        k_BL1H = self.k_norm(self.wk(hidden_states_BLD)).unsqueeze(2)
-        k_rot_BL1R, k_pass_BL1P = torch.split(
-            k_BL1H,
+        k_T1H = self.k_norm(self.wk(hidden_states_TD)).unsqueeze(1)
+        k_rot_T1R, k_pass_T1P = torch.split(
+            k_T1H,
             [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim],
             dim=-1,
         )
-        q_rot_BLNR, k_rot_BL1R = _apply_batched_rope(
-            self.rope,
-            q_rot_BLNR,
-            k_rot_BL1R,
-            positions_BL,
-        )
-        q_BLNH = torch.cat((q_rot_BLNR, q_pass_BLNP), dim=-1)
-        k_BLH = torch.cat((k_rot_BL1R, k_pass_BL1P), dim=-1).squeeze(2)
+        q_rot_TNR, k_rot_T1R = self.rope(q_rot_TNR, k_rot_T1R, positions_T)
+        q_TNH = torch.cat((q_rot_TNR, q_pass_TNP), dim=-1)
+        k_TH = torch.cat((k_rot_T1R, k_pass_T1P), dim=-1).squeeze(1)
 
-        weights_BLN = self.weights_proj(
-            hidden_states_BLD.to(self.weights_proj.weight.dtype)
+        weights_TN = self.weights_proj(
+            hidden_states_TD.to(self.weights_proj.weight.dtype)
         ).float() * (self.n_heads**-0.5)
-        if attention_mask_BLL is None:
-            key_positions_11L = torch.arange(L, device=positions_BL.device)[
-                None, None, :
-            ]
-            attention_mask_BLL = torch.zeros(
-                B,
-                L,
-                L,
+        if attention_mask_TK is None:
+            key_positions_K = torch.arange(T, device=positions_T.device)
+            attention_mask_TK = torch.zeros(
+                T,
+                T,
                 dtype=torch.float32,
-                device=positions_BL.device,
-            ).masked_fill(key_positions_11L > positions_BL.unsqueeze(-1), float("-inf"))
-        return self.topk(q_BLNH, k_BLH, weights_BLN, attention_mask_BLL)
+                device=positions_T.device,
+            ).masked_fill(key_positions_K > positions_T.unsqueeze(-1), float("-inf"))
+        return self.topk(q_TNH, k_TH, weights_TN, attention_mask_TK)
 
 
 class DSAInnerAttention(Module):
@@ -210,56 +183,50 @@ class DSAInnerAttention(Module):
 
     def forward(
         self,
-        q_BQNH: torch.Tensor,
-        k_BKNH: torch.Tensor,
-        v_BKNV: torch.Tensor,
-        attention_masks_B1QK: torch.Tensor,
-        topk_indices_BQT: torch.Tensor,
+        q_QNH: torch.Tensor,
+        k_KNH: torch.Tensor,
+        v_KNV: torch.Tensor,
+        attention_masks_1QK: torch.Tensor,
+        topk_indices_QS: torch.Tensor,
         *,
         scale: float,
     ) -> torch.Tensor:
-        if q_BQNH.ndim != 4 or k_BKNH.ndim != 4 or v_BKNV.ndim != 4:
-            raise ValueError("GLM-5 DSA q, k, and v must have rank 4.")
-        B, Q, N, H = q_BQNH.shape
-        K = k_BKNH.shape[1]
-        if k_BKNH.shape != (B, K, N, H):
-            raise ValueError("GLM-5 DSA k must have shape [B, K, N, H].")
-        if v_BKNV.shape[:3] != (B, K, N):
-            raise ValueError("GLM-5 DSA v must have shape [B, K, N, V].")
-        if topk_indices_BQT.shape[:2] != (B, Q):
-            raise ValueError("GLM-5 DSA top-k indices must have shape [B, Q, T].")
-        if attention_masks_B1QK.layout != torch.strided:
+        if q_QNH.ndim != 3 or k_KNH.ndim != 3 or v_KNV.ndim != 3:
+            raise ValueError("GLM-5 DSA q, k, and v must have rank 3.")
+        Q, N, H = q_QNH.shape
+        K = k_KNH.shape[0]
+        if k_KNH.shape != (K, N, H):
+            raise ValueError("GLM-5 DSA k must have shape [K, N, H].")
+        if v_KNV.shape[:2] != (K, N):
+            raise ValueError("GLM-5 DSA v must have shape [K, N, V].")
+        if topk_indices_QS.shape[0] != Q:
+            raise ValueError("GLM-5 DSA top-k indices must have shape [Q, S].")
+        if attention_masks_1QK.layout != torch.strided:
             raise ValueError("GLM-5 DSA requires dense attention_masks.")
-        if attention_masks_B1QK.shape != (B, 1, Q, K):
-            raise ValueError(
-                "attention_masks must have shape [B, 1, query_len, key_len]."
-            )
-        if attention_masks_B1QK.device != q_BQNH.device:
+        if attention_masks_1QK.shape != (1, Q, K):
+            raise ValueError("attention_masks must have shape [1, Q, K].")
+        if attention_masks_1QK.device != q_QNH.device:
             raise ValueError("attention_masks must be on the same device as q.")
-        if not attention_masks_B1QK.is_floating_point():
+        if not attention_masks_1QK.is_floating_point():
             raise ValueError("attention_masks must use a floating additive dtype.")
 
-        selected_BQK = torch.zeros_like(
-            attention_masks_B1QK[:, 0], dtype=torch.bool
-        ).scatter(-1, topk_indices_BQT.long(), True)
-        sparse_mask_B1QK = attention_masks_B1QK.masked_fill(
-            ~selected_BQK.unsqueeze(1), torch.finfo(q_BQNH.dtype).min
+        selected_QK = torch.zeros_like(
+            attention_masks_1QK[0], dtype=torch.bool
+        ).scatter(-1, topk_indices_QS.long(), True)
+        sparse_mask_1QK = attention_masks_1QK.masked_fill(
+            ~selected_QK.unsqueeze(0), torch.finfo(q_QNH.dtype).min
         )
-        scores_BNQK = (
-            torch.matmul(
-                q_BQNH.transpose(1, 2),
-                k_BKNH.transpose(1, 2).transpose(-1, -2),
-            )
-            * scale
+        scores_NQK = torch.matmul(
+            q_QNH.transpose(0, 1), k_KNH.transpose(0, 1).transpose(-1, -2)
+        ) * scale
+        scores_NQK = scores_NQK + sparse_mask_1QK
+        probs_NQK = F.softmax(scores_NQK, dim=-1, dtype=torch.float32).to(
+            q_QNH.dtype
         )
-        scores_BNQK = scores_BNQK + sparse_mask_B1QK
-        probs_BNQK = F.softmax(scores_BNQK, dim=-1, dtype=torch.float32).to(
-            q_BQNH.dtype
+        probs_NQK = F.dropout(
+            probs_NQK, p=self.attention_dropout, training=self.training
         )
-        probs_BNQK = F.dropout(
-            probs_BNQK, p=self.attention_dropout, training=self.training
-        )
-        return torch.matmul(probs_BNQK, v_BKNV.transpose(1, 2)).transpose(1, 2)
+        return torch.matmul(probs_NQK, v_KNV.transpose(0, 1)).transpose(0, 1)
 
 
 class Glm5Attention(BaseAttention):
@@ -372,79 +339,70 @@ class Glm5Attention(BaseAttention):
 
     def forward(
         self,
-        x_BLD: torch.Tensor,
+        x_TD: torch.Tensor,
         attention_masks: torch.Tensor,
-        positions_BL: torch.Tensor | None = None,
+        positions_T: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if not isinstance(attention_masks, torch.Tensor):
             raise ValueError("GLM-5 DSA requires dense attention_masks.")
 
-        B, L, _ = x_BLD.shape
+        T = x_TD.shape[0]
         if attention_masks.layout != torch.strided:
             raise ValueError("GLM-5 DSA requires dense attention_masks.")
         if (
-            attention_masks.ndim != 4
-            or attention_masks.shape[0] != B
-            or attention_masks.shape[1] != 1
-            or attention_masks.shape[2] != L
+            attention_masks.ndim != 3
+            or attention_masks.shape[0] != 1
+            or attention_masks.shape[1] != T
         ):
-            raise ValueError(
-                "attention_masks must have shape [B, 1, query_len, key_len]."
-            )
-        if attention_masks.device != x_BLD.device:
-            raise ValueError("attention_masks must be on the same device as x_BLD.")
+            raise ValueError("attention_masks must have shape [1, query_len, key_len].")
+        if attention_masks.device != x_TD.device:
+            raise ValueError("attention_masks must be on the same device as x_TD.")
         if not attention_masks.is_floating_point():
             raise ValueError("attention_masks must use a floating additive dtype.")
-        if positions_BL is None:
-            positions_BL = (
-                torch.arange(L, device=x_BLD.device).unsqueeze(0).expand(B, -1)
-            )
+        if positions_T is None:
+            positions_T = torch.arange(T, device=x_TD.device)
 
-        q_resid_BLR = self.q_norm(self.wq_a(x_BLD))
-        q_BLNH = self.wq_b(q_resid_BLR).view(B, L, self.n_heads, self.qk_head_dim)
-        q_nope_BLNP, q_rope_BLNR = torch.split(
-            q_BLNH, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+        q_resid_TR = self.q_norm(self.wq_a(x_TD))
+        q_TNH = self.wq_b(q_resid_TR).view(T, self.n_heads, self.qk_head_dim)
+        q_nope_TNP, q_rope_TNR = torch.split(
+            q_TNH, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
         )
-        compressed_kv_BLC = self.wkv_a(x_BLD)
-        kv_BLR, k_rope_BL1R = torch.split(
-            compressed_kv_BLC,
+        compressed_kv_TC = self.wkv_a(x_TD)
+        kv_TR, k_rope_TR = torch.split(
+            compressed_kv_TC,
             [self.kv_lora_rank, self.qk_rope_head_dim],
             dim=-1,
         )
-        kv_BLR = self.kv_norm(kv_BLR)
-        k_rope_BL1R = k_rope_BL1R.unsqueeze(2)
-        q_rope_BLNR, k_rope_BL1R = _apply_batched_rope(
-            self.rope,
-            q_rope_BLNR,
-            k_rope_BL1R,
-            positions_BL,
+        kv_TR = self.kv_norm(kv_TR)
+        q_rope_TNR, k_rope_T1R = self.rope(
+            q_rope_TNR, k_rope_TR.unsqueeze(1), positions_T
         )
-        q_BLNH = torch.cat((q_nope_BLNP, q_rope_BLNR), dim=-1)
-        kv_BLNX = self.wkv_b(kv_BLR).view(
-            B, L, self.n_heads, self.qk_nope_head_dim + self.v_head_dim
+        q_TNH = torch.cat((q_nope_TNP, q_rope_TNR), dim=-1)
+        kv_TNX = self.wkv_b(kv_TR).view(
+            T, self.n_heads, self.qk_nope_head_dim + self.v_head_dim
         )
-        k_nope_BLNP, v_BLNV = torch.split(
-            kv_BLNX, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+        k_nope_TNP, v_TNV = torch.split(
+            kv_TNX, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
         )
-        k_BLNH = torch.cat(
-            (k_nope_BLNP, k_rope_BL1R.expand(-1, -1, self.n_heads, -1)),
+        k_TNH = torch.cat(
+            (k_nope_TNP, k_rope_T1R.expand(-1, self.n_heads, -1)),
             dim=-1,
         )
-        topk_indices_BLK = self.indexer(
-            x_BLD,
-            q_resid_BLR,
-            positions_BL,
-            attention_masks[:, 0],
+        topk_indices_TS = self.indexer(
+            x_TD,
+            q_resid_TR,
+            positions_T,
+            attention_masks[0],
         )
-        output_BLNV = self.inner_attention(
-            q_BLNH,
-            k_BLNH,
-            v_BLNV,
+        output_TNV = self.inner_attention(
+            q_TNH,
+            k_TNH,
+            v_TNV,
             attention_masks,
-            topk_indices_BLK,
+            topk_indices_TS,
             scale=self.softmax_scale,
         )
-        return self.wo(output_BLNV.contiguous().view(B, L, -1))
+        return self.wo(output_TNV.contiguous().view(T, -1))
 
 
 class Glm5TransformerBlock(TransformerBlock):
@@ -469,22 +427,19 @@ class Glm5TransformerBlock(TransformerBlock):
 
     def forward(
         self,
-        x_BLD: torch.Tensor,
+        x_TD: torch.Tensor,
         attention_masks: torch.Tensor,
         positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        x_BLD = x_BLD + self.attention(
-            self.attention_norm(x_BLD), attention_masks, positions
+        x_TD = x_TD + self.attention(
+            self.attention_norm(x_TD), attention_masks, positions
         )
-        normalized_BLD = self.ffn_norm(x_BLD)
+        normalized_TD = self.ffn_norm(x_TD)
         if self.moe_enabled:
-            B, L, D = normalized_BLD.shape
-            ffn_output_BLD = self.moe(normalized_BLD.reshape(B * L, D)).reshape(
-                B, L, D
-            )
+            ffn_output_TD = self.moe(normalized_TD)
         else:
-            ffn_output_BLD = self.feed_forward(normalized_BLD)
-        return x_BLD + ffn_output_BLD
+            ffn_output_TD = self.feed_forward(normalized_TD)
+        return x_TD + ffn_output_TD
 
 
 class Glm5Model(Decoder):
@@ -554,8 +509,9 @@ class Glm5Model(Decoder):
         if len(self.layers) == 0:
             return None
 
-        positions_BL = positions.unsqueeze(0) if positions.ndim == 1 else positions
-        B, L = positions_BL.shape
+        if positions.ndim != 1:
+            raise ValueError("GLM-5 positions must have shape [T].")
+        T = positions.shape[0]
         # Non-first pipeline stages have tok_embeddings pruned away, but each
         # PP stage containing attention builds its own mask. Every stage
         # receives the same positions, so any float parameter dtype gives the
@@ -567,36 +523,11 @@ class Glm5Model(Decoder):
             token_dtype = self.tok_embeddings.weight.dtype
         else:
             token_dtype = next(iter(self.layers.values())).attention_norm.weight.dtype
-        document_ids_BL = (positions_BL == 0).cumsum(dim=1)
-        sequence_indices_L = torch.arange(L, device=positions_BL.device)
-        causal_BLL = (
-            sequence_indices_L[None, :, None] >= sequence_indices_L[None, None, :]
-        )
-        same_document_BLL = document_ids_BL.unsqueeze(-1) == document_ids_BL.unsqueeze(
-            -2
-        )
-        allowed_BLL = causal_BLL & same_document_BLL
+        document_ids_T = (positions == 0).cumsum(dim=0)
+        sequence_indices_T = torch.arange(T, device=positions.device)
+        causal_TT = sequence_indices_T[:, None] >= sequence_indices_T[None, :]
+        same_document_TT = document_ids_T[:, None] == document_ids_T[None, :]
+        allowed_TT = causal_TT & same_document_TT
         return torch.zeros(
-            B, 1, L, L, dtype=token_dtype, device=positions_BL.device
-        ).masked_fill(~allowed_BLL.unsqueeze(1), torch.finfo(token_dtype).min)
-
-    def forward(
-        self,
-        tokens_BL: torch.Tensor,
-        positions: torch.Tensor | None = None,
-        attention_masks: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        input_was_flat = tokens_BL.ndim == 1
-        if input_was_flat:
-            tokens_BL = tokens_BL.unsqueeze(0)
-        B, L = tokens_BL.shape[:2]
-        if positions is None:
-            positions = torch.arange(
-                tokens_BL.shape[1], device=tokens_BL.device
-            ).expand(B, -1)
-        elif positions.ndim == 1:
-            positions = positions.unsqueeze(0)
-        if attention_masks is None:
-            attention_masks = self.get_attention_masks(positions)
-        output = super().forward(tokens_BL, positions, attention_masks)
-        return output.squeeze(0) if input_was_flat else output
+            1, T, T, dtype=token_dtype, device=positions.device
+        ).masked_fill(~allowed_TT.unsqueeze(0), torch.finfo(token_dtype).min)

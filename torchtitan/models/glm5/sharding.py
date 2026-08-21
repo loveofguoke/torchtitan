@@ -20,6 +20,7 @@ from torchtitan.models.common.decoder_sharding import (
     rowwise_config,
     set_decoder_sharding_config,
     set_dense_ffn_sharding,
+    token_id_placement,
 )
 from torchtitan.models.common.moe_sharding import set_moe_sharding_config
 from torchtitan.models.glm5.model import Glm5Attention, Glm5DsaIndexer
@@ -38,14 +39,15 @@ _GROUPED_EXPERTS_PARAM_LAYOUT: dict[str, spmd.PerMeshAxisSpmdType] = {
 
 
 def _dsa_mask_layout() -> SpmdLayout:
-    """Describe dense ``[B, 1, query, key]`` mask placement."""
+    """Describe dense ``[1, query, key]`` mask placement."""
 
     return SpmdLayout(
         {
-            MeshAxisName.DP: spmd.S(0),
-            MeshAxisName.CP: spmd.S(2),
+            MeshAxisName.DP: spmd.V,
+            MeshAxisName.CP: spmd.V,
             MeshAxisName.TP: spmd.R,
-        }
+        },
+        partition_spec=(None, (MeshAxisName.DP, MeshAxisName.CP), None),
     )
 
 
@@ -173,7 +175,7 @@ def set_glm5_attention_sharding(
     # input stays plain.
     attention.sharding_config = ShardingConfig(
         in_src_shardings={
-            "x_BLD": (
+            "x_TD": (
                 dense_sequence_parallel_placement()
                 if enable_sp
                 else dense_activation_placement(tp=spmd.I, cp=spmd.S(0))
@@ -181,7 +183,7 @@ def set_glm5_attention_sharding(
             "attention_masks": _dsa_mask_layout(),
         },
         in_dst_shardings={
-            "x_BLD": dense_activation_placement(tp=spmd.R),
+            "x_TD": dense_activation_placement(tp=spmd.R, cp=spmd.S(0)),
             "attention_masks": _dsa_mask_layout(),
         },
     )
@@ -216,26 +218,26 @@ def set_glm5_dsa_inner_attention_sharding(inner_attention) -> None:
     backend, CP K/V gathering is installed separately by
     ``apply_glm5_cp_to_forward`` before this local-map boundary is captured.
     """
-    q_layout = dense_activation_placement(tp=spmd.S(2))
-    kv_src_layout = dense_activation_placement(tp=spmd.S(2))
-    kv_dst_layout = dense_activation_placement(tp=spmd.S(2), cp=spmd.R)
-    kv_grad_layout = dense_activation_placement(tp=spmd.S(2), cp=spmd.P)
+    q_layout = dense_activation_placement(tp=spmd.S(1), cp=spmd.S(0))
+    kv_src_layout = dense_activation_placement(tp=spmd.S(1), cp=spmd.S(0))
+    kv_dst_layout = dense_activation_placement(tp=spmd.S(1), cp=spmd.R)
+    kv_grad_layout = dense_activation_placement(tp=spmd.S(1), cp=spmd.P)
     mask_layout = _dsa_mask_layout()
-    topk_layout = dense_activation_placement(tp=spmd.R)
+    topk_layout = dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
     inner_attention.sharding_config = ShardingConfig(
         in_src_shardings={
-            "q_BQNH": q_layout,
-            "k_BKNH": kv_src_layout,
-            "v_BKNV": kv_src_layout,
-            "attention_masks_B1QK": mask_layout,
-            "topk_indices_BQT": topk_layout,
+            "q_QNH": q_layout,
+            "k_KNH": kv_src_layout,
+            "v_KNV": kv_src_layout,
+            "attention_masks_1QK": mask_layout,
+            "topk_indices_QS": topk_layout,
         },
         in_dst_shardings={
-            "q_BQNH": q_layout,
-            "k_BKNH": kv_dst_layout,
-            "v_BKNV": kv_dst_layout,
-            "attention_masks_B1QK": mask_layout,
-            "topk_indices_BQT": topk_layout,
+            "q_QNH": q_layout,
+            "k_KNH": kv_dst_layout,
+            "v_KNV": kv_dst_layout,
+            "attention_masks_1QK": mask_layout,
+            "topk_indices_QS": topk_layout,
         },
         out_src_shardings=q_layout,
         local_map=LocalMapConfig(
@@ -257,7 +259,7 @@ def set_glm5_indexer_sharding(indexer: Glm5DsaIndexer.Config) -> None:
     """DSA indexer sharding: fully Replicate on TP (correctness first).
 
     ``Glm5DsaIndexer.forward`` sums per-index-head scores into a
-    ``[B, L, L]`` tensor and then runs ``topk`` on it. The declarative
+    ``[T, T]`` tensor and then runs ``topk`` on it. The declarative
     ``sharding_config`` redistributes module *outputs* after ``forward``
     returns, so sharding the index heads (Colwise) would leave ``topk``
     running on a partial (per-rank head-shard) score tensor -- incorrect.
@@ -285,21 +287,21 @@ def set_glm5_indexer_sharding(indexer: Glm5DsaIndexer.Config) -> None:
         state_shardings={"cache": dense_param_placement(tp=spmd.R)},
     )
 
-    query_layout = dense_activation_placement(tp=spmd.R)
-    key_src_layout = dense_activation_placement(tp=spmd.R)
+    query_layout = dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
+    key_src_layout = dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
     key_dst_layout = dense_activation_placement(tp=spmd.R, cp=spmd.R)
     indexer.topk.sharding_config = ShardingConfig(
         in_src_shardings={
-            "q_BQNH": query_layout,
-            "k_BKH": key_src_layout,
-            "weights_BQN": query_layout,
-            "attention_mask_BQK": query_layout,
+            "q_QNH": query_layout,
+            "k_KH": key_src_layout,
+            "weights_QN": query_layout,
+            "attention_mask_QK": query_layout,
         },
         in_dst_shardings={
-            "q_BQNH": query_layout,
-            "k_BKH": key_dst_layout,
-            "weights_BQN": query_layout,
-            "attention_mask_BQK": query_layout,
+            "q_QNH": query_layout,
+            "k_KH": key_dst_layout,
+            "weights_QN": query_layout,
+            "attention_mask_QK": query_layout,
         },
         out_src_shardings=query_layout,
         local_map=LocalMapConfig(in_grad_placements=None),
@@ -309,17 +311,17 @@ def set_glm5_indexer_sharding(indexer: Glm5DsaIndexer.Config) -> None:
     # Replicate DTensors end to end.
     indexer.sharding_config = ShardingConfig(
         in_src_shardings={
-            "hidden_states_BLD": dense_activation_placement(tp=spmd.R),
-            "q_resid_BLR": dense_activation_placement(tp=spmd.R),
-            "positions_BL": dense_activation_placement(tp=spmd.R),
-            "attention_mask_BLL": dense_activation_placement(tp=spmd.R),
+            "hidden_states_TD": dense_activation_placement(tp=spmd.R, cp=spmd.S(0)),
+            "q_resid_TR": dense_activation_placement(tp=spmd.R, cp=spmd.S(0)),
+            "positions_T": token_id_placement(),
+            "attention_mask_TK": query_layout,
         },
         in_dst_shardings={
-            "hidden_states_BLD": dense_activation_placement(tp=spmd.R),
-            "q_resid_BLR": dense_activation_placement(tp=spmd.R),
-            "positions_BL": dense_activation_placement(tp=spmd.R),
-            "attention_mask_BLL": dense_activation_placement(tp=spmd.R),
+            "hidden_states_TD": dense_activation_placement(tp=spmd.R, cp=spmd.S(0)),
+            "q_resid_TR": dense_activation_placement(tp=spmd.R, cp=spmd.S(0)),
+            "positions_T": token_id_placement(),
+            "attention_mask_TK": query_layout,
         },
-        out_src_shardings=dense_activation_placement(tp=spmd.R),
-        out_dst_shardings=dense_activation_placement(tp=spmd.R),
+        out_src_shardings=dense_activation_placement(tp=spmd.R, cp=spmd.S(0)),
+        out_dst_shardings=dense_activation_placement(tp=spmd.R, cp=spmd.S(0)),
     )

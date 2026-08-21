@@ -66,10 +66,16 @@ def apply_glm5_cp_to_forward(model: Glm5Model, cp_mesh: DeviceMesh) -> None:
 
     process_group_name = dist._get_process_group_name(cp_mesh.get_group())
     original_model_forward = model.forward
+    original_get_attention_masks = model.get_attention_masks
+
+    def defer_attention_mask_to_cp_forward(positions):
+        return None
+
+    model.get_attention_masks = defer_attention_mask_to_cp_forward
 
     @wraps(original_model_forward)
     def cp_model_forward(
-        tokens_BL,
+        tokens,
         positions=None,
         attention_masks=None,
         *,
@@ -84,19 +90,16 @@ def apply_glm5_cp_to_forward(model: Glm5Model, cp_mesh: DeviceMesh) -> None:
             global_positions = _all_gather_sequence_no_grad(
                 positions,
                 cp_mesh,
-                sequence_dim=0 if positions.ndim == 1 else 1,
+                sequence_dim=0,
             )
-            global_mask = model.get_attention_masks(global_positions)
+            global_mask = original_get_attention_masks(global_positions)
             assert global_mask is not None
             local_query_len = positions.shape[-1]
             query_start = cp_mesh.get_local_rank() * local_query_len
             attention_masks = global_mask[
-                :,
-                :,
-                query_start : query_start + local_query_len,
-                :,
+                :, query_start : query_start + local_query_len, :
             ]
-        return _forward(tokens_BL, positions, attention_masks)
+        return _forward(tokens, positions, attention_masks)
 
     model.forward = cp_model_forward
 
@@ -106,23 +109,23 @@ def apply_glm5_cp_to_forward(model: Glm5Model, cp_mesh: DeviceMesh) -> None:
 
         @wraps(original_topk_forward)
         def cp_topk_forward(
-            q_BQNH,
-            k_BKH,
-            weights_BQN,
-            attention_mask_BQK,
+            q_QNH,
+            k_KH,
+            weights_QN,
+            attention_mask_QK,
             *,
             _forward=original_topk_forward,
         ):
-            global_k_BKH = _all_gather_sequence_no_grad(
-                k_BKH,
+            global_k_KH = _all_gather_sequence_no_grad(
+                k_KH,
                 cp_mesh,
-                sequence_dim=1,
+                sequence_dim=0,
             )
             return _forward(
-                q_BQNH,
-                global_k_BKH,
-                weights_BQN,
-                attention_mask_BQK,
+                q_QNH,
+                global_k_KH,
+                weights_QN,
+                attention_mask_QK,
             )
 
         topk.forward = cp_topk_forward
@@ -132,27 +135,27 @@ def apply_glm5_cp_to_forward(model: Glm5Model, cp_mesh: DeviceMesh) -> None:
 
         @wraps(original_inner_forward)
         def cp_inner_forward(
-            q_BQNH,
-            k_BKNH,
-            v_BKNV,
-            attention_masks_B1QK,
-            topk_indices_BQT,
+            q_QNH,
+            k_KNH,
+            v_KNV,
+            attention_masks_1QK,
+            topk_indices_QS,
             *,
             scale,
             _forward=original_inner_forward,
         ):
-            global_k_BKNH, global_v_BKNV = flex_cp_allgather(
-                k_BKNH.contiguous(),
-                v_BKNV.contiguous(),
-                1,
+            global_k_KNH, global_v_KNV = flex_cp_allgather(
+                k_KNH.contiguous(),
+                v_KNV.contiguous(),
+                0,
                 process_group_name,
             )
             return _forward(
-                q_BQNH,
-                global_k_BKNH,
-                global_v_BKNV,
-                attention_masks_B1QK,
-                topk_indices_BQT,
+                q_QNH,
+                global_k_KNH,
+                global_v_KNV,
+                attention_masks_1QK,
+                topk_indices_QS,
                 scale=scale,
             )
 
