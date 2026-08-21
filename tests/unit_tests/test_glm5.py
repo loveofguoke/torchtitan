@@ -729,11 +729,8 @@ class TestGlm5Model(unittest.TestCase):
         model = _build_debug_model()
         tokens_BL = torch.randint(0, 2048, (24,))
         positions_BL = torch.arange(12).repeat(2)
-        attention_masks = model.get_attention_masks(positions_BL)
 
-        logits_BLV = model(
-            tokens_BL, positions=positions_BL, attention_masks=attention_masks
-        )
+        logits_BLV = model(tokens_BL, positions=positions_BL)
 
         self.assertEqual(logits_BLV.shape, (24, 2048))
 
@@ -746,10 +743,7 @@ class TestGlm5Model(unittest.TestCase):
         tokens_BL = torch.randint(0, config.vocab_size, (32,))
         positions_BL = torch.arange(16).repeat(2)
         labels_BL = torch.randint(0, config.vocab_size, (32,))
-        attention_masks = model.get_attention_masks(positions_BL)
-        logits_BLV = model(
-            tokens_BL, positions=positions_BL, attention_masks=attention_masks
-        )
+        logits_BLV = model(tokens_BL, positions=positions_BL)
         loss = F.cross_entropy(logits_BLV.float(), labels_BL)
         loss.backward()
 

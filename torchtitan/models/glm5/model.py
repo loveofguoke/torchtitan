@@ -21,6 +21,22 @@ from torchtitan.protocols.module import Module
 # D/N/H/R/P/V: model, head-count, head, RoPE, pass-through, and value dimensions.
 
 
+def _create_dense_dsa_mask(
+    positions_T: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    T = positions_T.shape[0]
+    token_indices_T = torch.arange(T, device=positions_T.device)
+    document_ids_T = (positions_T == 0).cumsum(0)
+    allowed_TT = (token_indices_T[:, None] >= token_indices_T[None, :]) & (
+        document_ids_T[:, None] == document_ids_T[None, :]
+    )
+    return torch.zeros(
+        1, T, T, dtype=dtype, device=positions_T.device
+    ).masked_fill(~allowed_TT.unsqueeze(0), torch.finfo(dtype).min)
+
+
 class DSAIndexerTopK(Module):
     """Compute local-query top-k indices against a global key sequence."""
 
@@ -151,13 +167,9 @@ class Glm5DsaIndexer(Module):
             hidden_states_TD.to(self.weights_proj.weight.dtype)
         ).float() * (self.n_heads**-0.5)
         if attention_mask_TK is None:
-            key_positions_K = torch.arange(T, device=positions_T.device)
-            attention_mask_TK = torch.zeros(
-                T,
-                T,
-                dtype=torch.float32,
-                device=positions_T.device,
-            ).masked_fill(key_positions_K > positions_T.unsqueeze(-1), float("-inf"))
+            attention_mask_TK = _create_dense_dsa_mask(
+                positions_T, dtype=torch.float32
+            )[0]
         return self.topk(q_TNH, k_TH, weights_TN, attention_mask_TK)
 
 
@@ -511,7 +523,6 @@ class Glm5Model(Decoder):
 
         if positions.ndim != 1:
             raise ValueError("GLM-5 positions must have shape [T].")
-        T = positions.shape[0]
         # Non-first pipeline stages have tok_embeddings pruned away, but each
         # PP stage containing attention builds its own mask. Every stage
         # receives the same positions, so any float parameter dtype gives the
@@ -523,11 +534,16 @@ class Glm5Model(Decoder):
             token_dtype = self.tok_embeddings.weight.dtype
         else:
             token_dtype = next(iter(self.layers.values())).attention_norm.weight.dtype
-        document_ids_T = (positions == 0).cumsum(dim=0)
-        sequence_indices_T = torch.arange(T, device=positions.device)
-        causal_TT = sequence_indices_T[:, None] >= sequence_indices_T[None, :]
-        same_document_TT = document_ids_T[:, None] == document_ids_T[None, :]
-        allowed_TT = causal_TT & same_document_TT
-        return torch.zeros(
-            1, T, T, dtype=token_dtype, device=positions.device
-        ).masked_fill(~allowed_TT.unsqueeze(0), torch.finfo(token_dtype).min)
+        return _create_dense_dsa_mask(positions, dtype=token_dtype)
+
+    def forward(
+        self,
+        tokens_T: torch.Tensor,
+        positions: torch.Tensor | None = None,
+        attention_masks: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if positions is None:
+            positions = torch.arange(tokens_T.shape[0], device=tokens_T.device)
+        if attention_masks is None:
+            attention_masks = self.get_attention_masks(positions)
+        return super().forward(tokens_T, positions, attention_masks)
