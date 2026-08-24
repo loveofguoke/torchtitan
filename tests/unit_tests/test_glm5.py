@@ -8,6 +8,7 @@
 # NOTE: 保证所有行为合理，遵循自我规范
 
 import dataclasses
+import inspect
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -25,6 +26,7 @@ from torchtitan.distributed.pipeline_parallel import (
     pipeline_llm,
 )
 from torchtitan.models.common import ComplexRoPE, LayerNorm, Linear, RMSNorm
+from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.glm5 import build_glm5_layers, glm5_configs, Glm5StateDictAdapter
 from torchtitan.models.glm5.config_registry import glm5_debugmodel
 from torchtitan.models.glm5.model import (
@@ -605,6 +607,12 @@ class TestGlm5Attention(unittest.TestCase):
 
 
 class TestGlm5Model(unittest.TestCase):
+    def test_forward_signature_matches_decoder_contract(self):
+        self.assertEqual(
+            tuple(inspect.signature(Glm5Model.forward).parameters),
+            tuple(inspect.signature(Decoder.forward).parameters),
+        )
+
     def test_layer_builder_rejects_infeasible_grouped_routing(self):
         kwargs = _debug_layer_kwargs()
         invalid_groupings = (

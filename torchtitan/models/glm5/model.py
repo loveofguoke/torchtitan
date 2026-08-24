@@ -538,12 +538,12 @@ class Glm5Model(Decoder):
 
     def forward(
         self,
-        tokens_T: torch.Tensor,
+        tokens: torch.Tensor,
         positions: torch.Tensor | None = None,
         attention_masks: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if positions is None:
-            positions = torch.arange(tokens_T.shape[0], device=tokens_T.device)
+            positions = torch.arange(tokens.shape[0], device=tokens.device)
         if attention_masks is None:
             attention_masks = self.get_attention_masks(positions)
-        return super().forward(tokens_T, positions, attention_masks)
+        return super().forward(tokens, positions, attention_masks)
