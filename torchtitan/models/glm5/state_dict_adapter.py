@@ -4,12 +4,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Strict single-device GLM-5 checkpoint conversion.
+"""GLM-5 checkpoint conversion for local and distributed model states.
 
 Transformers stores a routed-expert gate and up projection in one tensor,
 whereas TorchTitan's ``GroupedExperts`` owns three explicit grouped tensors.
-This adapter deliberately keeps that conversion local and refuses keys outside
-the supported debug-model checkpoint surface.
+The conversion preserves DTensor placements so TorchTitan's distributed
+checkpoint writer can save and load HuggingFace safetensors directly.
 """
 
 import re
@@ -17,6 +17,8 @@ import warnings
 from typing import Any
 
 import torch
+from torch.distributed.tensor import DTensor, Replicate
+from torch.distributed.tensor.placement_types import _StridedShard, Shard
 
 from torchtitan.models.common.rope import ComplexRoPE
 from torchtitan.models.utils import MoEStateDictAdapter
@@ -197,6 +199,90 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
         titan_key = f"layers.{layer_index}.{self._TITAN_DOWN}"
         self._validate_tensor_shape(titan_key, value)
 
+    @staticmethod
+    def _replicate_dtensor_dim(
+        value: DTensor,
+        dim: int,
+    ) -> tuple[DTensor, tuple[Any, ...]]:
+        """Temporarily replicate one logical tensor dimension.
+
+        TP shards GLM's grouped gate and up projections on their hidden
+        dimension. HuggingFace concatenates the *complete* gate before the
+        complete up projection, so concatenating TP-local shards would produce
+        ``gate_rank0, up_rank0, gate_rank1, up_rank1, ...`` instead. Replicate
+        only the affected dimension while retaining EP/FSDP placements on the
+        other dimensions; callers restore the original placements after the
+        shape transform.
+        """
+
+        original_placements = tuple(value.placements)
+        transform_placements = tuple(
+            Replicate()
+            if isinstance(placement, (Shard, _StridedShard))
+            and placement.dim == dim
+            else placement
+            for placement in original_placements
+        )
+        if transform_placements == original_placements:
+            return value, original_placements
+        return (
+            value.redistribute(
+                device_mesh=value.device_mesh,
+                placements=transform_placements,
+            ),
+            original_placements,
+        )
+
+    @classmethod
+    def _fuse_gate_up(cls, gate: Any, up: Any) -> Any:
+        """Fuse grouped gate/up weights without corrupting TP shard order."""
+
+        gate_is_dtensor = isinstance(gate, DTensor)
+        up_is_dtensor = isinstance(up, DTensor)
+        if gate_is_dtensor != up_is_dtensor:
+            raise ValueError(
+                "routed expert gate and up weights must both be DTensors or "
+                "both be local tensors"
+            )
+        if not gate_is_dtensor:
+            return torch.cat((gate, up), dim=1)
+
+        if gate.device_mesh != up.device_mesh or gate.placements != up.placements:
+            raise ValueError(
+                "routed expert gate and up DTensors must use the same device "
+                "mesh and placements"
+            )
+
+        gate_for_fusion, original_placements = cls._replicate_dtensor_dim(gate, 1)
+        up_for_fusion, _ = cls._replicate_dtensor_dim(up, 1)
+        fused = torch.cat((gate_for_fusion, up_for_fusion), dim=1)
+        if tuple(fused.placements) != original_placements:
+            fused = fused.redistribute(
+                device_mesh=gate.device_mesh,
+                placements=original_placements,
+            )
+        return fused
+
+    @classmethod
+    def _split_gate_up(cls, fused: Any) -> tuple[Any, Any]:
+        """Undo HuggingFace gate/up fusion and restore TP placements."""
+
+        if not isinstance(fused, DTensor):
+            return fused.chunk(2, dim=1)
+
+        fused_for_split, original_placements = cls._replicate_dtensor_dim(fused, 1)
+        gate, up = fused_for_split.chunk(2, dim=1)
+        if tuple(gate.placements) != original_placements:
+            gate = gate.redistribute(
+                device_mesh=fused.device_mesh,
+                placements=original_placements,
+            )
+            up = up.redistribute(
+                device_mesh=fused.device_mesh,
+                placements=original_placements,
+            )
+        return gate, up
+
     def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
         self._validate_hf_rope_config(ComplexRoPE.Config)
         state_dict: dict[str, Any] = {}
@@ -227,7 +313,7 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
 
             if suffix == self._FUSED_GATE_UP:
                 self._validate_fused_experts(layer_index, value)
-                gate, up = value.chunk(2, dim=1)
+                gate, up = self._split_gate_up(value)
                 gate_key = f"layers.{layer_index}.{self._TITAN_GATE}"
                 up_key = f"layers.{layer_index}.{self._TITAN_UP}"
                 state_dict[gate_key] = gate
@@ -286,7 +372,9 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
                 )
             hf_state_dict[
                 f"model.layers.{layer_index}.{self._FUSED_GATE_UP}"
-            ] = torch.cat((weights[self._TITAN_GATE], weights[self._TITAN_UP]), dim=1)
+            ] = self._fuse_gate_up(
+                weights[self._TITAN_GATE], weights[self._TITAN_UP]
+            )
             hf_state_dict[f"model.layers.{layer_index}.{self._FUSED_DOWN}"] = weights[
                 self._TITAN_DOWN
             ]
