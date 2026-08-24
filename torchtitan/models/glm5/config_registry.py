@@ -44,6 +44,7 @@ def glm5_debugmodel() -> Trainer.Config:
             num_tokens_per_microbatch_per_dp_rank=2 * 128,
             max_context_length=128,
             steps=10,
+            disable_cuda_graphs=True,
             # Data parallel (DDP/FSDP) wraps the model via apply_fsdp_to_decoder;
             # fp32 preserves the DSA indexer's pinned fp32 semantics. A user can
             # opt into bf16 explicitly as a documented precision change.

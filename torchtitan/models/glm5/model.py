@@ -365,8 +365,12 @@ class Glm5Attention(BaseAttention):
             attention_masks.ndim != 3
             or attention_masks.shape[0] != 1
             or attention_masks.shape[1] != T
+            or attention_masks.shape[2] < T
         ):
-            raise ValueError("attention_masks must have shape [1, query_len, key_len].")
+            raise ValueError(
+                "attention_masks must have shape [1, query_len, key_len] with "
+                "key_len >= query_len."
+            )
         if attention_masks.device != x_TD.device:
             raise ValueError("attention_masks must be on the same device as x_TD.")
         if not attention_masks.is_floating_point():

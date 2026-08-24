@@ -368,20 +368,27 @@ class TestGlm5DsaIndexer(unittest.TestCase):
         # 输出 shape 是 [B, S, topk]
         self.assertEqual(topk_indices_BLK.shape, (10, 3))
         # top-k 不超过配置的 index_topk
-        full_topk_queries_B = positions_BL >= topk_indices_BLK.shape[-1] - 1
-        self.assertTrue(
-            torch.all(
-                topk_indices_BLK[full_topk_queries_B]
-                <= positions_BL[full_topk_queries_B].unsqueeze(-1)
-            )
+        self.assertLessEqual(topk_indices_BLK.shape[-1], indexer.index_topk)
+        allowed_BLL = attention_mask_BLL == 0
+        selected_BLL = torch.zeros_like(allowed_BLL).scatter(
+            -1, topk_indices_BLK.to(torch.int64), True
+        )
+        full_topk_queries_B = (
+            allowed_BLL.sum(dim=-1) >= topk_indices_BLK.shape[-1]
         )
         # causal 条件下不能选择未来 token
         self.assertTrue(
             torch.all(
-                torch.any(
-                    topk_indices_BLK[positions_BL == 0] > 0,
-                    dim=-1,
-                )
+                allowed_BLL.gather(-1, topk_indices_BLK.to(torch.int64))[
+                    full_topk_queries_B
+                ]
+            )
+        )
+        # Masked entries only fill top-k when fewer than k tokens are valid.
+        self.assertTrue(
+            torch.all(
+                selected_BLL[~full_topk_queries_B]
+                | ~allowed_BLL[~full_topk_queries_B]
             )
         )
 
@@ -816,16 +823,17 @@ class TestGlm5Registration(unittest.TestCase):
         self.assertEqual(config.hf_assets_path, "./tests/assets/tokenizer")
         self.assertEqual(config.optimizer.param_groups[0].optimizer_kwargs["lr"], 8e-4)
         self.assertFalse(config.compile.enable)
+        self.assertTrue(config.training.disable_cuda_graphs)
         self.assertIsNone(config.activation_checkpoint)
-        self.assertEqual(
-            config.parallelism,
-            ParallelismConfig(
-                enable_sequence_parallel=True,
-                context_parallel_load_balancer=None,
-                pipeline_parallel_last_stage_less_layers=0,
-                spmd_backend="partial_dtensor",
-            ),
-        )
+        self.assertTrue(config.parallelism.enable_sequence_parallel)
+        self.assertIsNone(config.parallelism.context_parallel_load_balancer)
+        self.assertEqual(config.parallelism.spmd_backend, "partial_dtensor")
+        self.assertEqual(config.parallelism.data_parallel_replicate_degree, 1)
+        self.assertEqual(config.parallelism.data_parallel_shard_degree, -1)
+        self.assertEqual(config.parallelism.context_parallel_degree, 1)
+        self.assertEqual(config.parallelism.tensor_parallel_degree, 1)
+        self.assertEqual(config.parallelism.pipeline_parallel_degree, 1)
+        self.assertEqual(config.parallelism.expert_parallel_degree, 1)
 
     def test_parallelism_allows_only_one_unresolved_single_device_layout(self):
         validate = glm5.validate_glm5_parallelism
