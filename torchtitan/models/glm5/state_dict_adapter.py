@@ -17,13 +17,21 @@ import warnings
 from typing import Any
 
 import torch
-from torch.distributed.tensor import DTensor, Replicate
+import torch.distributed as dist
+from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import _StridedShard, Shard
 
 from torchtitan.models.common.rope import ComplexRoPE
 from torchtitan.models.utils import MoEStateDictAdapter
 
 from .model import Glm5Model
+
+
+def _contiguous_stride(shape: torch.Size) -> tuple[int, ...]:
+    stride = [1] * len(shape)
+    for dim in range(len(shape) - 2, -1, -1):
+        stride[dim] = stride[dim + 1] * shape[dim + 1]
+    return tuple(stride)
 
 
 class Glm5StateDictAdapter(MoEStateDictAdapter):
@@ -200,38 +208,157 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
         self._validate_tensor_shape(titan_key, value)
 
     @staticmethod
-    def _replicate_dtensor_dim(
-        value: DTensor,
-        dim: int,
-    ) -> tuple[DTensor, tuple[Any, ...]]:
-        """Temporarily replicate one logical tensor dimension.
-
-        TP shards GLM's grouped gate and up projections on their hidden
-        dimension. HuggingFace concatenates the *complete* gate before the
-        complete up projection, so concatenating TP-local shards would produce
-        ``gate_rank0, up_rank0, gate_rank1, up_rank1, ...`` instead. Replicate
-        only the affected dimension while retaining EP/FSDP placements on the
-        other dimensions; callers restore the original placements after the
-        shape transform.
-        """
-
-        original_placements = tuple(value.placements)
-        transform_placements = tuple(
-            Replicate()
-            if isinstance(placement, (Shard, _StridedShard))
-            and placement.dim == dim
-            else placement
-            for placement in original_placements
+    def _is_sharded_on_dim(value: DTensor, dim: int) -> bool:
+        return any(
+            isinstance(placement, (Shard, _StridedShard)) and placement.dim == dim
+            for placement in value.placements
         )
-        if transform_placements == original_placements:
-            return value, original_placements
-        return (
-            value.redistribute(
-                device_mesh=value.device_mesh,
-                placements=transform_placements,
-            ),
-            original_placements,
+
+    @staticmethod
+    def _tp_axis_for_fusion(value: DTensor) -> int:
+        mesh_axes = [
+            mesh_axis
+            for mesh_axis, placement in enumerate(value.placements)
+            if isinstance(placement, (Shard, _StridedShard)) and placement.dim == 1
+        ]
+        if len(mesh_axes) != 1:
+            raise NotImplementedError(
+                "GLM-5 fused gate/up conversion requires exactly one mesh axis "
+                "sharding tensor dimension 1"
+            )
+        mesh_axis = mesh_axes[0]
+        placement = value.placements[mesh_axis]
+        if isinstance(placement, _StridedShard):
+            raise NotImplementedError(
+                "GLM-5 fused gate/up conversion does not support a "
+                "_StridedShard placement on tensor dimension 1"
+            )
+        return mesh_axis
+
+    @classmethod
+    def _all_to_all_fuse_gate_up(cls, gate: DTensor, up: DTensor) -> DTensor:
+        mesh_axis = cls._tp_axis_for_fusion(gate)
+        tp_size = gate.device_mesh.size(mesh_axis)
+        if tp_size == 1:
+            fused = torch.cat((gate, up), dim=1)
+            assert isinstance(fused, DTensor)
+            return fused
+        if tp_size % 2 != 0:
+            raise NotImplementedError(
+                "GLM-5 fused gate/up conversion requires an even TP size"
+            )
+        tp_rank = gate.device_mesh.get_local_rank(mesh_axis)
+        group = gate.device_mesh.get_group(mesh_axis)
+
+        local_gate = gate._local_tensor
+        local_up = up._local_tensor
+        if local_up.shape != local_gate.shape:
+            raise ValueError(
+                "routed expert gate and up DTensors must have matching local shapes"
+            )
+        num_local_experts, shard_width, dim = local_gate.shape
+
+        packed = torch.cat((local_gate, local_up), dim=0)
+        output = torch.empty_like(packed)
+        half_tp = tp_size // 2
+        input_split_sizes = [0] * tp_size
+        input_split_sizes[tp_rank // 2] = num_local_experts
+        input_split_sizes[half_tp + tp_rank // 2] = num_local_experts
+        output_split_sizes = [0] * tp_size
+        source_start = 2 * (tp_rank % half_tp)
+        output_split_sizes[source_start] = num_local_experts
+        output_split_sizes[source_start + 1] = num_local_experts
+        dist.all_to_all_single(
+            output,
+            packed,
+            output_split_sizes=output_split_sizes,
+            input_split_sizes=input_split_sizes,
+            group=group,
         )
+
+        local_fused = (
+            output.view(2, num_local_experts, shard_width, dim)
+            .movedim(0, 1)
+            .reshape(num_local_experts, 2 * shard_width, dim)
+        )
+        fused_shape = list(gate.shape)
+        fused_shape[1] += up.shape[1]
+        global_shape = torch.Size(fused_shape)
+        return DTensor.from_local(
+            local_fused,
+            device_mesh=gate.device_mesh,
+            placements=gate.placements,
+            run_check=False,
+            shape=global_shape,
+            stride=_contiguous_stride(global_shape),
+        )
+
+    @classmethod
+    def _all_to_all_split_gate_up(cls, fused: DTensor) -> tuple[DTensor, DTensor]:
+        mesh_axis = cls._tp_axis_for_fusion(fused)
+        tp_size = fused.device_mesh.size(mesh_axis)
+        if tp_size == 1:
+            gate, up = fused.chunk(2, dim=1)
+            assert isinstance(gate, DTensor) and isinstance(up, DTensor)
+            return gate, up
+        if tp_size % 2 != 0:
+            raise NotImplementedError(
+                "GLM-5 fused gate/up conversion requires an even TP size"
+            )
+        tp_rank = fused.device_mesh.get_local_rank(mesh_axis)
+        group = fused.device_mesh.get_group(mesh_axis)
+
+        local_fused = fused._local_tensor
+        if local_fused.shape[1] % 2 != 0:
+            raise ValueError("local fused gate/up dimension must be even")
+        num_local_experts, fused_width, dim = local_fused.shape
+        shard_width = fused_width // 2
+        packed = (
+            local_fused.view(num_local_experts, 2, shard_width, dim)
+            .movedim(1, 0)
+            .reshape(2 * num_local_experts, shard_width, dim)
+            .contiguous()
+        )
+        output = torch.empty_like(packed)
+        half_tp = tp_size // 2
+        input_split_sizes = [0] * tp_size
+        target_start = 2 * (tp_rank % half_tp)
+        input_split_sizes[target_start] = num_local_experts
+        input_split_sizes[target_start + 1] = num_local_experts
+        output_split_sizes = [0] * tp_size
+        output_split_sizes[tp_rank // 2] = num_local_experts
+        output_split_sizes[half_tp + tp_rank // 2] = num_local_experts
+        dist.all_to_all_single(
+            output,
+            packed,
+            output_split_sizes=output_split_sizes,
+            input_split_sizes=input_split_sizes,
+            group=group,
+        )
+
+        local_gate = output[:num_local_experts]
+        local_up = output[num_local_experts:]
+        source_shape = list(fused.shape)
+        source_shape[1] //= 2
+        global_shape = torch.Size(source_shape)
+        stride = _contiguous_stride(global_shape)
+        gate = DTensor.from_local(
+            local_gate,
+            device_mesh=fused.device_mesh,
+            placements=fused.placements,
+            run_check=False,
+            shape=global_shape,
+            stride=stride,
+        )
+        up = DTensor.from_local(
+            local_up,
+            device_mesh=fused.device_mesh,
+            placements=fused.placements,
+            run_check=False,
+            shape=global_shape,
+            stride=stride,
+        )
+        return gate, up
 
     @classmethod
     def _fuse_gate_up(cls, gate: Any, up: Any) -> Any:
@@ -253,15 +380,9 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
                 "mesh and placements"
             )
 
-        gate_for_fusion, original_placements = cls._replicate_dtensor_dim(gate, 1)
-        up_for_fusion, _ = cls._replicate_dtensor_dim(up, 1)
-        fused = torch.cat((gate_for_fusion, up_for_fusion), dim=1)
-        if tuple(fused.placements) != original_placements:
-            fused = fused.redistribute(
-                device_mesh=gate.device_mesh,
-                placements=original_placements,
-            )
-        return fused
+        if cls._is_sharded_on_dim(gate, 1):
+            return cls._all_to_all_fuse_gate_up(gate, up)
+        return torch.cat((gate, up), dim=1)
 
     @classmethod
     def _split_gate_up(cls, fused: Any) -> tuple[Any, Any]:
@@ -270,17 +391,9 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
         if not isinstance(fused, DTensor):
             return fused.chunk(2, dim=1)
 
-        fused_for_split, original_placements = cls._replicate_dtensor_dim(fused, 1)
-        gate, up = fused_for_split.chunk(2, dim=1)
-        if tuple(gate.placements) != original_placements:
-            gate = gate.redistribute(
-                device_mesh=fused.device_mesh,
-                placements=original_placements,
-            )
-            up = up.redistribute(
-                device_mesh=fused.device_mesh,
-                placements=original_placements,
-            )
+        if cls._is_sharded_on_dim(fused, 1):
+            return cls._all_to_all_split_gate_up(fused)
+        gate, up = fused.chunk(2, dim=1)
         return gate, up
 
     def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
@@ -372,9 +485,7 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
                 )
             hf_state_dict[
                 f"model.layers.{layer_index}.{self._FUSED_GATE_UP}"
-            ] = self._fuse_gate_up(
-                weights[self._TITAN_GATE], weights[self._TITAN_UP]
-            )
+            ] = self._fuse_gate_up(weights[self._TITAN_GATE], weights[self._TITAN_UP])
             hf_state_dict[f"model.layers.{layer_index}.{self._FUSED_DOWN}"] = weights[
                 self._TITAN_DOWN
             ]
