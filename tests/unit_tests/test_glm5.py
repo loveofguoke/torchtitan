@@ -1145,7 +1145,14 @@ class TestGlm5Registration(unittest.TestCase):
         # grouped-experts param layout names.
         moe = moe_layer.moe
         self.assertIsNotNone(moe.sharding_config)
-        self.assertTrue(moe.seq_dim_tp_sharded)
+        self.assertEqual(
+            moe.sharding_config.in_src_shardings["x_TD"],
+            dense_sequence_parallel_placement(),
+        )
+        self.assertEqual(
+            moe.sharding_config.out_dst_shardings,
+            dense_sequence_parallel_placement(),
+        )
         self.assertIsNotNone(moe.router.gate.sharding_config)
         self.assertIsNotNone(moe.shared_experts.sharding_config)
         self.assertIsNotNone(moe.routed_experts.inner_experts.sharding_config)
