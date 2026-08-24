@@ -6,20 +6,98 @@
 
 import tempfile
 import unittest
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import distribute_tensor, DTensor, Replicate, Shard
-from torch.testing._internal.distributed._tensor.common_dtensor import (
-    DTensorTestBase,
-    with_comms,
-)
 
 from torchtitan.models.deepseek_v3 import deepseekv3_configs
 from torchtitan.models.deepseek_v3.state_dict_adapter import DeepSeekV3StateDictAdapter
 from torchtitan.models.glm5 import glm5_configs
 from torchtitan.models.glm5.state_dict_adapter import Glm5StateDictAdapter
+
+
+def _run_glm5_tp_sharded_fused_experts_roundtrip(
+    rank: int,
+    world_size: int,
+    rendezvous_uri: str,
+) -> None:
+    dist.init_process_group(
+        backend="gloo",
+        init_method=rendezvous_uri,
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        config = glm5_configs["debugmodel"]()
+        adapter = Glm5StateDictAdapter(config, hf_assets_path=None)
+        mesh = init_device_mesh(
+            "cpu",
+            (world_size,),
+            mesh_dim_names=("tp",),
+        )
+        num_experts, hidden_dim, dim = 8, 256, 256
+        gate = torch.arange(
+            num_experts * hidden_dim * dim,
+            dtype=torch.float32,
+        ).reshape(num_experts, hidden_dim, dim)
+        up = gate + gate.numel()
+        down = torch.arange(
+            num_experts * dim * hidden_dim,
+            dtype=torch.float32,
+        ).reshape(num_experts, dim, hidden_dim)
+        gate_dtensor = distribute_tensor(gate, mesh, (Shard(1),))
+        up_dtensor = distribute_tensor(up, mesh, (Shard(1),))
+        down_dtensor = distribute_tensor(down, mesh, (Shard(2),))
+
+        hf_state = adapter.to_hf(
+            {
+                "layers.1.moe.routed_experts.inner_experts.w1_EFD": gate_dtensor,
+                "layers.1.moe.routed_experts.inner_experts.w3_EFD": up_dtensor,
+                "layers.1.moe.routed_experts.inner_experts.w2_EDF": down_dtensor,
+            }
+        )
+
+        fused = hf_state["model.layers.1.mlp.experts.gate_up_proj"]
+        if not isinstance(fused, DTensor):
+            raise AssertionError(f"expected DTensor, got {type(fused)}")
+        if fused.placements != (Shard(1),):
+            raise AssertionError(f"unexpected fused placements: {fused.placements}")
+        torch.testing.assert_close(
+            fused.full_tensor(),
+            torch.cat((gate, up), dim=1),
+        )
+
+        restored = adapter.from_hf(hf_state)
+        for key, expected, expected_placement in (
+            (
+                "layers.1.moe.routed_experts.inner_experts.w1_EFD",
+                gate,
+                Shard(1),
+            ),
+            (
+                "layers.1.moe.routed_experts.inner_experts.w3_EFD",
+                up,
+                Shard(1),
+            ),
+            (
+                "layers.1.moe.routed_experts.inner_experts.w2_EDF",
+                down,
+                Shard(2),
+            ),
+        ):
+            value = restored[key]
+            if not isinstance(value, DTensor):
+                raise AssertionError(f"expected DTensor for {key}, got {type(value)}")
+            if value.placements != (expected_placement,):
+                raise AssertionError(
+                    f"unexpected placements for {key}: {value.placements}"
+                )
+            torch.testing.assert_close(value.full_tensor(), expected)
+    finally:
+        dist.destroy_process_group()
 
 
 class DeepSeekV3StateDictAdapterTest(unittest.TestCase):
@@ -78,72 +156,16 @@ class DeepSeekV3StateDictAdapterTest(unittest.TestCase):
             )
 
 
-class Glm5DistributedStateDictAdapterTest(DTensorTestBase):
-    @property
-    def world_size(self) -> int:
-        return 2
-
-    @with_comms
+class Glm5DistributedStateDictAdapterTest(unittest.TestCase):
     def test_tp_sharded_fused_experts_roundtrip(self) -> None:
         """HF gate/up fusion must preserve global order across TP shards."""
 
-        config = glm5_configs["debugmodel"]()
-        adapter = Glm5StateDictAdapter(config, hf_assets_path=None)
-        mesh = init_device_mesh(
-            self.device_type,
-            (self.world_size,),
-            mesh_dim_names=("tp",),
-        )
-        num_experts, hidden_dim, dim = 8, 256, 256
-        gate = torch.arange(
-            num_experts * hidden_dim * dim,
-            dtype=torch.float32,
-            device=self.device_type,
-        ).reshape(num_experts, hidden_dim, dim)
-        up = gate + gate.numel()
-        down = torch.arange(
-            num_experts * dim * hidden_dim,
-            dtype=torch.float32,
-            device=self.device_type,
-        ).reshape(num_experts, dim, hidden_dim)
-        gate_dtensor = distribute_tensor(gate, mesh, (Shard(1),))
-        up_dtensor = distribute_tensor(up, mesh, (Shard(1),))
-        down_dtensor = distribute_tensor(down, mesh, (Shard(2),))
-
-        hf_state = adapter.to_hf(
-            {
-                "layers.1.moe.routed_experts.inner_experts.w1_EFD": gate_dtensor,
-                "layers.1.moe.routed_experts.inner_experts.w3_EFD": up_dtensor,
-                "layers.1.moe.routed_experts.inner_experts.w2_EDF": down_dtensor,
-            }
-        )
-
-        fused = hf_state["model.layers.1.mlp.experts.gate_up_proj"]
-        self.assertIsInstance(fused, DTensor)
-        self.assertEqual(fused.placements, (Shard(1),))
-        torch.testing.assert_close(
-            fused.full_tensor(),
-            torch.cat((gate, up), dim=1),
-        )
-
-        restored = adapter.from_hf(hf_state)
-        for key, expected, expected_placement in (
-            (
-                "layers.1.moe.routed_experts.inner_experts.w1_EFD",
-                gate,
-                Shard(1),
-            ),
-            (
-                "layers.1.moe.routed_experts.inner_experts.w3_EFD",
-                up,
-                Shard(1),
-            ),
-            (
-                "layers.1.moe.routed_experts.inner_experts.w2_EDF",
-                down,
-                Shard(2),
-            ),
-        ):
-            self.assertIsInstance(restored[key], DTensor)
-            self.assertEqual(restored[key].placements, (expected_placement,))
-            torch.testing.assert_close(restored[key].full_tensor(), expected)
+        world_size = 2
+        with tempfile.TemporaryDirectory() as temp_dir:
+            rendezvous_uri = (Path(temp_dir) / "glm5_tp_rendezvous").as_uri()
+            torch.multiprocessing.spawn(
+                _run_glm5_tp_sharded_fused_experts_roundtrip,
+                args=(world_size, rendezvous_uri),
+                nprocs=world_size,
+                join=True,
+            )
