@@ -36,6 +36,7 @@ from .model import (
     Glm5DsaIndexer,
     Glm5Model,
     Glm5TransformerBlock,
+    SparseMLA,
 )
 from .parallelize import parallelize_glm5
 from .sharding import validate_glm5_parallelism
@@ -49,6 +50,7 @@ __all__ = [
     "Glm5Model",
     "Glm5StateDictAdapter",
     "Glm5TransformerBlock",
+    "SparseMLA",
     "build_glm5_layers",
     "glm5_configs",
     "make_glm5_attention_config",
@@ -103,12 +105,15 @@ def make_glm5_attention_config(
     index_n_heads: int,
     index_head_dim: int,
     index_topk: int,
+    index_source_layer: int,
     attention_dropout: float,
     rope: ComplexRoPE.Config,
 ) -> Glm5Attention.Config:
     """Build a fully specified GLM-5 MLA plus DSA attention config."""
     qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
     return Glm5Attention.Config(
+        layer_id=layer_id,
+        index_source_layer=index_source_layer,
         dim=dim,
         n_heads=n_heads,
         q_lora_rank=q_lora_rank,
@@ -146,38 +151,44 @@ def make_glm5_attention_config(
             param_init=_depth_init(layer_id),
         ),
         rope=dataclasses.replace(rope),
-        indexer=Glm5DsaIndexer.Config(
-            dim=dim,
-            q_lora_rank=q_lora_rank,
-            n_heads=index_n_heads,
-            head_dim=index_head_dim,
-            qk_rope_head_dim=qk_rope_head_dim,
-            index_topk=index_topk,
-            wq_b=Linear.Config(
-                in_features=q_lora_rank,
-                out_features=index_n_heads * index_head_dim,
-                param_init=_LINEAR_INIT,
-            ),
-            wk=Linear.Config(
-                in_features=dim,
-                out_features=index_head_dim,
-                param_init=_LINEAR_INIT,
-            ),
-            k_norm=LayerNorm.Config(
-                normalized_shape=index_head_dim,
-                eps=1e-6,
-                param_init=_LAYER_NORM_INIT,
-            ),
-            weights_proj=Linear.Config(
-                in_features=dim, out_features=index_n_heads, param_init=_LINEAR_INIT
-            ),
-            rope=dataclasses.replace(rope),
-            topk=DSAIndexerTopK.Config(
+        indexer=(
+            Glm5DsaIndexer.Config(
+                dim=dim,
+                q_lora_rank=q_lora_rank,
+                n_heads=index_n_heads,
+                head_dim=index_head_dim,
+                qk_rope_head_dim=qk_rope_head_dim,
                 index_topk=index_topk,
-                softmax_scale=index_head_dim**-0.5,
-            ),
+                wq_b=Linear.Config(
+                    in_features=q_lora_rank,
+                    out_features=index_n_heads * index_head_dim,
+                    param_init=_LINEAR_INIT,
+                ),
+                wk=Linear.Config(
+                    in_features=dim,
+                    out_features=index_head_dim,
+                    param_init=_LINEAR_INIT,
+                ),
+                k_norm=LayerNorm.Config(
+                    normalized_shape=index_head_dim,
+                    eps=1e-6,
+                    param_init=_LAYER_NORM_INIT,
+                ),
+                weights_proj=Linear.Config(
+                    in_features=dim,
+                    out_features=index_n_heads,
+                    param_init=_LINEAR_INIT,
+                ),
+                rope=dataclasses.replace(rope),
+                topk=DSAIndexerTopK.Config(
+                    index_topk=index_topk,
+                    softmax_scale=index_head_dim**-0.5,
+                ),
+            )
+            if index_source_layer == layer_id
+            else None
         ),
-        inner_attention=DSAInnerAttention.Config(
+        inner_attention=SparseMLA.Config(
             attention_dropout=attention_dropout,
         ),
     )
@@ -207,6 +218,9 @@ def build_glm5_layers(
     index_topk: int,
     attention_dropout: float,
     rope: ComplexRoPE.Config,
+    index_topk_freq: int = 1,
+    index_skip_topk_offset: int = 2,
+    index_topk_pattern: str | None = None,
 ) -> list[TransformerBlock.Config]:
     """Build GLM-5 dense and MoE block configurations for every layer."""
     if not 0 <= n_dense_layers <= n_layers:
@@ -226,6 +240,34 @@ def build_glm5_layers(
         raise ValueError("router_top_k must be in [1, num_experts].")
     if router_top_k > experts_per_group * router_num_limited_groups:
         raise ValueError("router_top_k exceeds the experts in limited groups.")
+    if index_topk_freq <= 0:
+        raise ValueError("index_topk_freq must be > 0.")
+    if index_skip_topk_offset < 0:
+        raise ValueError("index_skip_topk_offset must be >= 0.")
+    if index_topk_pattern is not None:
+        if len(index_topk_pattern) != n_layers:
+            raise ValueError("index_topk_pattern must have one entry per layer.")
+        invalid = set(index_topk_pattern).difference({"F", "S"})
+        if invalid:
+            raise ValueError("index_topk_pattern entries must be 'F' or 'S'.")
+
+    index_sources: list[int] = []
+    latest_full_layer: int | None = None
+    for layer_id in range(n_layers):
+        is_full = (
+            index_topk_pattern[layer_id] == "F"
+            if index_topk_pattern is not None
+            else (
+                max(layer_id - index_skip_topk_offset + 1, 0)
+                % index_topk_freq
+                == 0
+            )
+        )
+        if is_full:
+            latest_full_layer = layer_id
+        if latest_full_layer is None:
+            raise ValueError("the first DSA layer must own a full indexer.")
+        index_sources.append(latest_full_layer)
 
     layers: list[TransformerBlock.Config] = []
     for layer_id in range(n_layers):
@@ -241,6 +283,7 @@ def build_glm5_layers(
             index_n_heads=index_n_heads,
             index_head_dim=index_head_dim,
             index_topk=index_topk,
+            index_source_layer=index_sources[layer_id],
             attention_dropout=attention_dropout,
             rope=rope,
         )
@@ -299,7 +342,12 @@ def build_glm5_layers(
     return layers
 
 
-def _debugmodel() -> Glm5Model.Config:
+def _debugmodel(
+    *,
+    index_topk_freq: int = 1,
+    index_skip_topk_offset: int = 2,
+    index_topk_pattern: str | None = None,
+) -> Glm5Model.Config:
     dim = 256
     vocab_size = 2048
     rope = ComplexRoPE.Config(
@@ -345,11 +393,84 @@ def _debugmodel() -> Glm5Model.Config:
             index_topk=8,
             attention_dropout=0.0,
             rope=rope,
+            index_topk_freq=index_topk_freq,
+            index_skip_topk_offset=index_skip_topk_offset,
+            index_topk_pattern=index_topk_pattern,
         ),
     )
 
 
-glm5_configs = {"debugmodel": _debugmodel}
+def _shared_index_debugmodel() -> Glm5Model.Config:
+    return _debugmodel(index_topk_pattern="FFSSFSSF")
+
+
+def _full_dsa_debugmodel() -> Glm5Model.Config:
+    """Debug-size model with the released cross-layer index schedule."""
+    return _debugmodel(
+        index_topk_freq=4,
+        index_skip_topk_offset=3,
+    )
+
+
+def _glm5_2() -> Glm5Model.Config:
+    """Define the released GLM-5.2 base decoder without quantization or MTP."""
+    dim = 6144
+    vocab_size = 154880
+    rope = ComplexRoPE.Config(
+        dim=64,
+        max_context_length=1_048_576,
+        theta=8_000_000,
+        scaling="none",
+    )
+    return Glm5Model.Config(
+        vocab_size=vocab_size,
+        dim=dim,
+        tok_embeddings=Embedding.Config(
+            num_embeddings=vocab_size,
+            embedding_dim=dim,
+            param_init=_EMBEDDING_INIT,
+        ),
+        norm=RMSNorm.Config(normalized_shape=dim, param_init=_RMS_NORM_INIT),
+        lm_head=Linear.Config(
+            in_features=dim,
+            out_features=vocab_size,
+            param_init=_output_linear_init(dim),
+        ),
+        layers=build_glm5_layers(
+            n_layers=78,
+            n_dense_layers=3,
+            dim=dim,
+            n_heads=64,
+            q_lora_rank=2048,
+            kv_lora_rank=512,
+            qk_nope_head_dim=192,
+            qk_rope_head_dim=64,
+            v_head_dim=256,
+            dense_hidden_dim=12288,
+            moe_hidden_dim=2048,
+            num_experts=256,
+            num_shared_experts=1,
+            router_top_k=8,
+            router_num_expert_groups=1,
+            router_num_limited_groups=1,
+            router_route_scale=2.5,
+            index_n_heads=32,
+            index_head_dim=128,
+            index_topk=2048,
+            attention_dropout=0.0,
+            rope=rope,
+            index_topk_freq=4,
+            index_skip_topk_offset=3,
+        ),
+    )
+
+
+glm5_configs = {
+    "debugmodel": _debugmodel,
+    "shared_index_debugmodel": _shared_index_debugmodel,
+    "full_dsa_debugmodel": _full_dsa_debugmodel,
+    "GLM-5.2": _glm5_2,
+}
 
 
 def model_registry(flavor: str = "debugmodel") -> ModelSpec:

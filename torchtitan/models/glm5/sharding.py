@@ -206,36 +206,35 @@ def set_glm5_attention_sharding(
     attention.wo.sharding_config = rowwise_config(output_sp=enable_sp)
     set_glm5_dsa_inner_attention_sharding(attention.inner_attention)
 
-    set_glm5_indexer_sharding(attention.indexer)
+    if attention.indexer is not None:
+        set_glm5_indexer_sharding(attention.indexer)
 
 
 def set_glm5_dsa_inner_attention_sharding(inner_attention) -> None:
-    """Run dense DSA score computation on TP-local tensors.
+    """Run SparseMLA score computation on TP-local tensors.
 
-    Q/K/V are TP-sharded on the head dimension. The dense mask and DSA top-k
-    indices are replicated on TP. Keeping this boundary in ``local_map`` avoids
-    mixing DTensors with the local dense attention kernel. On the default
+    Q is TP-sharded on the head dimension while compressed KV is replicated.
+    The dense mask and DSA top-k indices are replicated on TP. Keeping this
+    boundary in ``local_map`` avoids mixing DTensors with the local sparse
+    attention kernel. On the default
     backend, CP K/V gathering is installed separately by
     ``apply_glm5_cp_to_forward`` before this local-map boundary is captured.
     """
     q_layout = dense_activation_placement(tp=spmd.S(1), cp=spmd.S(0))
-    kv_src_layout = dense_activation_placement(tp=spmd.S(1), cp=spmd.S(0))
-    kv_dst_layout = dense_activation_placement(tp=spmd.S(1), cp=spmd.R)
-    kv_grad_layout = dense_activation_placement(tp=spmd.S(1), cp=spmd.P)
+    kv_layout = dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
+    kv_grad_layout = dense_activation_placement(tp=spmd.P, cp=spmd.S(0))
     mask_layout = _dsa_mask_layout()
     topk_layout = dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
     inner_attention.sharding_config = ShardingConfig(
         in_src_shardings={
             "q_QNH": q_layout,
-            "k_KNH": kv_src_layout,
-            "v_KNV": kv_src_layout,
+            "kv_K1H": kv_layout,
             "attention_masks_1QK": mask_layout,
             "topk_indices_QS": topk_layout,
         },
         in_dst_shardings={
             "q_QNH": q_layout,
-            "k_KNH": kv_dst_layout,
-            "v_KNV": kv_dst_layout,
+            "kv_K1H": kv_layout,
             "attention_masks_1QK": mask_layout,
             "topk_indices_QS": topk_layout,
         },
@@ -243,7 +242,6 @@ def set_glm5_dsa_inner_attention_sharding(inner_attention) -> None:
         local_map=LocalMapConfig(
             in_grad_placements=(
                 q_layout,
-                kv_grad_layout,
                 kv_grad_layout,
                 # Mask and top-k indices are non-differentiable metadata, but
                 # they are still DTensor inputs and local_map requires their
@@ -289,7 +287,6 @@ def set_glm5_indexer_sharding(indexer: Glm5DsaIndexer.Config) -> None:
 
     query_layout = dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
     key_src_layout = dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
-    key_dst_layout = dense_activation_placement(tp=spmd.R, cp=spmd.R)
     indexer.topk.sharding_config = ShardingConfig(
         in_src_shardings={
             "q_QNH": query_layout,
@@ -299,7 +296,7 @@ def set_glm5_indexer_sharding(indexer: Glm5DsaIndexer.Config) -> None:
         },
         in_dst_shardings={
             "q_QNH": query_layout,
-            "k_KH": key_dst_layout,
+            "k_KH": key_src_layout,
             "weights_QN": query_layout,
             "attention_mask_QK": query_layout,
         },

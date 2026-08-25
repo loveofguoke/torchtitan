@@ -28,7 +28,11 @@ from torchtitan.distributed.pipeline_parallel import (
 from torchtitan.models.common import ComplexRoPE, LayerNorm, Linear, RMSNorm
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.glm5 import build_glm5_layers, glm5_configs, Glm5StateDictAdapter
-from torchtitan.models.glm5.config_registry import glm5_debugmodel
+from torchtitan.models.glm5.config_registry import (
+    glm5_debugmodel,
+    glm5_full_dsa_debugmodel,
+    glm5_shared_index_debugmodel,
+)
 from torchtitan.models.glm5.model import (
     DSAIndexerTopK,
     DSAInnerAttention,
@@ -37,7 +41,16 @@ from torchtitan.models.glm5.model import (
     Glm5Model,
     Glm5TransformerBlock,
 )
-from torchtitan.models.glm5.parallelize import apply_glm5_cp_to_forward
+from torchtitan.models.glm5.parallelize import (
+    _validate_glm5_pp_index_stage,
+    apply_glm5_cp_to_forward,
+)
+from torchtitan.models.glm5.ops.tilelang import (
+    TileLangDSAIndexerTopK,
+    TileLangSparseMLA,
+    tilelang_dsa_indexer,
+    tilelang_sparse_mla,
+)
 
 
 def _indexer_config() -> Glm5DsaIndexer.Config:
@@ -59,6 +72,8 @@ def _indexer_config() -> Glm5DsaIndexer.Config:
 
 def _attention_config() -> Glm5Attention.Config:
     return Glm5Attention.Config(
+        layer_id=0,
+        index_source_layer=0,
         dim=16,
         n_heads=2,
         q_lora_rank=8,
@@ -89,6 +104,7 @@ def _build_debug_model() -> Glm5Model:
 def _debug_layer_kwargs() -> dict:
     config = glm5_configs["debugmodel"]()
     attention = config.layers[0].attention
+    assert attention.indexer is not None
     moe = config.layers[1].moe
     assert moe is not None
     return {
@@ -450,44 +466,48 @@ class TestGlm5Attention(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "attention_dropout"):
             DSAInnerAttention.Config(attention_dropout=1.0)
 
+    def test_tilelang_kernel_overrides_preserve_component_contracts(self):
+        sparse_config = tilelang_sparse_mla(
+            DSAInnerAttention.Config(attention_dropout=0.0)
+        )
+        indexer_config = tilelang_dsa_indexer(
+            DSAIndexerTopK.Config(index_topk=64, softmax_scale=0.125)
+        )
+
+        self.assertIsInstance(sparse_config, TileLangSparseMLA.Config)
+        self.assertIsInstance(indexer_config, TileLangDSAIndexerTopK.Config)
+        self.assertEqual(indexer_config.index_topk, 64)
+        with self.assertRaisesRegex(RuntimeError, "CUDA-only"):
+            sparse_config.build()(
+                torch.randn(1, 1, 576),
+                torch.randn(1, 1, 576),
+                torch.zeros(1, 1, 1),
+                torch.zeros(1, 64, dtype=torch.int32),
+                scale=576**-0.5,
+                latent_dim=512,
+            )
+
     def test_dsa_inner_attention_supports_local_queries_and_global_kv(self):
         inner_attention = DSAInnerAttention.Config(attention_dropout=0.0).build()
         q_BQNH = torch.randn(2, 2, 4)
-        k_BKNH = torch.randn(5, 2, 4)
-        v_BKNV = torch.randn(5, 2, 3)
+        kv_BK1H = torch.randn(5, 1, 4)
         attention_mask_B1QK = torch.zeros(1, 2, 5)
         topk_indices_BQT = torch.tensor([[0, 3], [1, 4]], dtype=torch.int32)
 
         actual_BQNV = inner_attention(
             q_BQNH,
-            k_BKNH,
-            v_BKNV,
+            kv_BK1H,
             attention_mask_B1QK,
             topk_indices_BQT,
             scale=0.5,
+            latent_dim=3,
         )
-        selected_BQK = torch.zeros(2, 5, dtype=torch.bool).scatter(
-            -1,
-            topk_indices_BQT.long(),
-            True,
+        selected_BQTH = kv_BK1H[:, 0][topk_indices_BQT.long()]
+        scores_BQNT = torch.einsum("qnh,qth->qnt", q_BQNH, selected_BQTH) * 0.5
+        probs_BQNT = F.softmax(scores_BQNT, dim=-1, dtype=torch.float32)
+        expected_BQNV = torch.einsum(
+            "qnt,qtv->qnv", probs_BQNT, selected_BQTH[..., :3]
         )
-        sparse_mask_B1QK = attention_mask_B1QK.masked_fill(
-            ~selected_BQK.unsqueeze(0),
-            torch.finfo(q_BQNH.dtype).min,
-        )
-        scores_BNQK = (
-            torch.matmul(
-                q_BQNH.transpose(0, 1),
-                k_BKNH.transpose(0, 1).transpose(-1, -2),
-            )
-            * 0.5
-            + sparse_mask_B1QK
-        )
-        probs_BNQK = F.softmax(scores_BNQK, dim=-1, dtype=torch.float32)
-        expected_BQNV = torch.matmul(
-            probs_BNQK,
-            v_BKNV.transpose(0, 1),
-        ).transpose(0, 1)
 
         self.assertEqual(actual_BQNV.shape, (2, 2, 3))
         torch.testing.assert_close(actual_BQNV, expected_BQNV)
@@ -525,14 +545,14 @@ class TestGlm5Attention(unittest.TestCase):
         positions_BL = torch.arange(4)
         base_mask_B1LL = _dense_causal_mask(positions_BL, dtype=x_BLD.dtype)
         future_selecting_topk_BLK = torch.tensor(
-            [[3, 2], [3, 2], [3, 2], [3, 2]], dtype=torch.int32
+            [[0, 3], [0, 3], [1, 3], [2, 3]], dtype=torch.int32
         )
         with mock.patch.object(
             attention.indexer,
             "forward",
             return_value=future_selecting_topk_BLK,
         ):
-            actual_BLD = attention(x_BLD, base_mask_B1LL, positions_BL)
+            actual_BLD, _ = attention(x_BLD, base_mask_B1LL, positions_BL)
         expected_BLD = _reference_sparse_attention(
             attention,
             x_BLD,
@@ -548,8 +568,9 @@ class TestGlm5Attention(unittest.TestCase):
         x_BLD = torch.randn(10, 16, requires_grad=True)
         positions_BL = torch.arange(5).repeat(2)
         mask_B1LL = _dense_causal_mask(positions_BL, dtype=x_BLD.dtype)
-        output_BLD = attention(x_BLD, mask_B1LL, positions_BL)
+        output_BLD, topk_indices_BLK = attention(x_BLD, mask_B1LL, positions_BL)
         self.assertEqual(output_BLD.shape, x_BLD.shape)
+        self.assertEqual(topk_indices_BLK.shape, (10, 3))
         output_BLD.square().mean().backward()
         self.assertIsNotNone(attention.wq_a.weight.grad)
         self.assertIsNotNone(attention.wo.weight.grad)
@@ -635,6 +656,84 @@ class TestGlm5Model(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "experts_per_group|top_k"):
                     build_glm5_layers(**(kwargs | overrides))
 
+    def test_layer_builder_supports_frequency_and_explicit_index_sharing(self):
+        kwargs = _debug_layer_kwargs()
+        frequency_layers = build_glm5_layers(
+            **(kwargs | {"index_topk_freq": 3, "index_skip_topk_offset": 2})
+        )
+        self.assertEqual(
+            [layer.attention.index_source_layer for layer in frequency_layers],
+            [0, 1, 1, 1, 4, 4, 4, 7],
+        )
+        self.assertEqual(
+            [layer.attention.indexer is not None for layer in frequency_layers],
+            [True, True, False, False, True, False, False, True],
+        )
+
+        pattern_layers = build_glm5_layers(
+            **(kwargs | {"index_topk_pattern": "FSSFFSSF"})
+        )
+        self.assertEqual(
+            [layer.attention.index_source_layer for layer in pattern_layers],
+            [0, 0, 0, 3, 4, 4, 4, 7],
+        )
+
+    def test_layer_builder_rejects_shared_first_index_layer(self):
+        with self.assertRaisesRegex(ValueError, "first DSA layer"):
+            build_glm5_layers(
+                **(_debug_layer_kwargs() | {"index_topk_pattern": "SFFFFFFF"})
+            )
+
+    def test_shared_attention_reuses_previous_layer_indices(self):
+        full_attention = _attention_config().build()
+        shared_attention = dataclasses.replace(
+            _attention_config(),
+            layer_id=1,
+            index_source_layer=0,
+            indexer=None,
+        ).build()
+        full_attention.init_states()
+        shared_attention.init_states()
+        x_TD = torch.randn(4, 16)
+        positions_T = torch.arange(4)
+        mask_1TK = _dense_causal_mask(positions_T, dtype=x_TD.dtype)
+        fixed_indices_TS = torch.tensor(
+            [[0, -1, -1], [1, 0, -1], [2, 1, 0], [3, 2, 1]],
+            dtype=torch.int32,
+        )
+        assert full_attention.indexer is not None
+        with mock.patch.object(
+            full_attention.indexer, "forward", return_value=fixed_indices_TS
+        ):
+            _, produced_indices_TS = full_attention(x_TD, mask_1TK, positions_T)
+        _, reused_indices_TS = shared_attention(
+            x_TD,
+            mask_1TK,
+            positions_T,
+            produced_indices_TS,
+        )
+
+        self.assertIs(produced_indices_TS, fixed_indices_TS)
+        self.assertIs(reused_indices_TS, fixed_indices_TS)
+        self.assertIsNone(shared_attention.indexer)
+
+    def test_shared_attention_requires_source_indices(self):
+        shared_attention = dataclasses.replace(
+            _attention_config(),
+            layer_id=1,
+            index_source_layer=0,
+            indexer=None,
+        ).build()
+        shared_attention.init_states()
+        positions_T = torch.arange(4)
+        x_TD = torch.randn(4, 16)
+        with self.assertRaisesRegex(ValueError, "requires indices from layer 0"):
+            shared_attention(
+                x_TD,
+                _dense_causal_mask(positions_T, dtype=x_TD.dtype),
+                positions_T,
+            )
+
     def test_debug_model_config_has_approved_architecture(self):
         config = glm5_configs["debugmodel"]()
 
@@ -659,11 +758,12 @@ class TestGlm5Model(unittest.TestCase):
             self.assertEqual(attention.rope.scaling, "none")
             self.assertEqual(attention.q_norm.eps, 1e-6)
             self.assertEqual(attention.kv_norm.eps, 1e-6)
+            self.assertIsNotNone(attention.indexer)
+            assert attention.indexer is not None
             self.assertEqual(attention.indexer.n_heads, 4)
             self.assertEqual(attention.indexer.head_dim, 64)
             self.assertEqual(attention.indexer.index_topk, 8)
             self.assertEqual(attention.indexer.k_norm.eps, 1e-6)
-            self.assertIsNotNone(attention.indexer)
             if layer_id == 0:
                 self.assertIsNotNone(layer_config.feed_forward)
                 self.assertIsNone(layer_config.moe)
@@ -772,9 +872,52 @@ class TestGlm5Model(unittest.TestCase):
             all(
                 parameter.grad is None
                 for layer in model.layers.values()
+                if layer.attention.indexer is not None
                 for parameter in layer.attention.indexer.parameters()
             )
         )
+
+    def test_shared_index_model_forward_backward_reuses_source_indices(self):
+        torch.manual_seed(31)
+        config = glm5_configs["shared_index_debugmodel"]()
+        model = config.build()
+        model.init_states()
+        model.train()
+        observed_indices = {}
+        handles = []
+
+        for layer_id in (1, 2, 3):
+            def capture_indices(
+                _module,
+                _inputs,
+                output,
+                *,
+                layer_id=layer_id,
+            ) -> None:
+                observed_indices[layer_id] = output[1]
+
+            handles.append(
+                model.layers[str(layer_id)].attention.register_forward_hook(
+                    capture_indices
+                )
+            )
+        try:
+            tokens_T = torch.randint(0, config.vocab_size, (16,))
+            positions_T = torch.arange(8).repeat(2)
+            labels_T = torch.randint(0, config.vocab_size, (16,))
+            logits_TV = model(tokens_T, positions=positions_T)
+            loss = F.cross_entropy(logits_TV.float(), labels_T)
+            loss.backward()
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        self.assertTrue(torch.isfinite(loss))
+        self.assertIs(observed_indices[2], observed_indices[1])
+        self.assertIs(observed_indices[3], observed_indices[1])
+        self.assertIsNone(model.layers["2"].attention.indexer)
+        self.assertIsNone(model.layers["3"].attention.indexer)
+        self.assertIsNotNone(model.layers["4"].attention.indexer)
 
     def test_debug_model_reports_exact_positive_nparams_and_flops(self):
         config = glm5_configs["debugmodel"]()
@@ -810,6 +953,81 @@ class TestGlm5Registration(unittest.TestCase):
         self.assertIs(spec.state_dict_adapter, Glm5StateDictAdapter)
         self.assertIs(spec.pipelining_fn, pipeline_llm)
         self.assertIs(spec.post_optimizer_build_fn, register_moe_load_balancing_hook)
+
+    def test_shared_index_debug_config_uses_shared_layers(self):
+        config = glm5_shared_index_debugmodel()
+        layers = config.model_spec.model.layers
+
+        self.assertEqual(config.model_spec.flavor, "shared_index_debugmodel")
+        self.assertEqual(
+            [layer.attention.index_source_layer for layer in layers],
+            [0, 1, 1, 1, 4, 4, 4, 7],
+        )
+
+    def test_full_dsa_debug_config_matches_debug_size_and_shares_indices(self):
+        config = glm5_full_dsa_debugmodel()
+        debug_config = glm5_debugmodel()
+        layers = config.model_spec.model.layers
+        attention = layers[0].attention
+        debug_attention = debug_config.model_spec.model.layers[0].attention
+        self.assertIsNotNone(attention.indexer)
+        self.assertIsNotNone(debug_attention.indexer)
+        assert attention.indexer is not None
+        assert debug_attention.indexer is not None
+
+        self.assertEqual(config.model_spec.flavor, "full_dsa_debugmodel")
+        self.assertEqual(config.model_spec.model.dim, debug_config.model_spec.model.dim)
+        self.assertEqual(
+            config.model_spec.model.vocab_size,
+            debug_config.model_spec.model.vocab_size,
+        )
+        self.assertEqual(len(layers), len(debug_config.model_spec.model.layers))
+        self.assertEqual(attention.n_heads, debug_attention.n_heads)
+        self.assertEqual(attention.kv_lora_rank, debug_attention.kv_lora_rank)
+        self.assertEqual(attention.qk_rope_head_dim, debug_attention.qk_rope_head_dim)
+        self.assertEqual(attention.indexer.n_heads, debug_attention.indexer.n_heads)
+        self.assertEqual(attention.indexer.head_dim, debug_attention.indexer.head_dim)
+        self.assertEqual(
+            attention.indexer.index_topk,
+            debug_attention.indexer.index_topk,
+        )
+        self.assertEqual(
+            [layer.attention.index_source_layer for layer in layers],
+            [0, 1, 2, 2, 2, 2, 6, 6],
+        )
+
+    def test_glm5_2_config_matches_released_architecture(self):
+        config = glm5_configs["GLM-5.2"]()
+        layers = config.layers
+        attention = layers[0].attention
+        moe = layers[3].moe
+
+        self.assertEqual(config.dim, 6144)
+        self.assertEqual(config.vocab_size, 154880)
+        self.assertEqual(len(layers), 78)
+        self.assertTrue(all(layer.moe is None for layer in layers[:3]))
+        self.assertTrue(all(layer.moe is not None for layer in layers[3:]))
+        self.assertEqual(attention.n_heads, 64)
+        self.assertEqual(attention.q_lora_rank, 2048)
+        self.assertEqual(attention.kv_lora_rank, 512)
+        self.assertEqual(attention.qk_nope_head_dim, 192)
+        self.assertEqual(attention.qk_rope_head_dim, 64)
+        self.assertEqual(attention.v_head_dim, 256)
+        self.assertEqual(attention.rope.max_context_length, 1_048_576)
+        self.assertEqual(attention.rope.theta, 8_000_000)
+        self.assertIsNotNone(attention.indexer)
+        assert attention.indexer is not None
+        self.assertEqual(attention.indexer.n_heads, 32)
+        self.assertEqual(attention.indexer.head_dim, 128)
+        self.assertEqual(attention.indexer.index_topk, 2048)
+        self.assertIsNotNone(moe)
+        assert moe is not None
+        self.assertEqual(moe.num_experts, 256)
+        self.assertEqual(moe.router.top_k, 8)
+        self.assertEqual(
+            [layers[index].attention.index_source_layer for index in range(11)],
+            [0, 1, 2, 2, 2, 2, 6, 6, 6, 6, 10],
+        )
 
     def test_debug_training_config_uses_single_device_defaults(self):
         config = glm5_debugmodel()
@@ -1112,9 +1330,9 @@ class TestGlm5Registration(unittest.TestCase):
             attention.inner_attention.sharding_config.local_map.in_grad_placements
         )
         self.assertIsNotNone(inner_grad_layouts)
-        self.assertEqual(len(inner_grad_layouts), 5)
+        self.assertEqual(len(inner_grad_layouts), 4)
+        self.assertIsNotNone(inner_grad_layouts[2])
         self.assertIsNotNone(inner_grad_layouts[3])
-        self.assertIsNotNone(inner_grad_layouts[4])
 
         # DSA indexer: every projection is Replicate on TP (correctness-first:
         # a head-shard would leave topk on a partial score tensor).
@@ -1170,6 +1388,20 @@ class TestGlm5Registration(unittest.TestCase):
 
 
 class TestGlm5ContextParallel(unittest.TestCase):
+    def test_pp_stage_rejects_cross_stage_shared_index_source(self):
+        shared_attention = dataclasses.replace(
+            _attention_config(),
+            layer_id=3,
+            index_source_layer=2,
+            indexer=None,
+        ).build()
+        stage = SimpleNamespace(
+            layers={"3": SimpleNamespace(attention=shared_attention)}
+        )
+
+        with self.assertRaisesRegex(NotImplementedError, "pipeline stage.*layer 3"):
+            _validate_glm5_pp_index_stage(stage, pp_enabled=True)
+
     def test_cp_wrapper_skips_collectives_for_output_only_pp_stage(self):
         observed = {}
 
@@ -1207,7 +1439,7 @@ class TestGlm5ContextParallel(unittest.TestCase):
         get_attention_masks.assert_not_called()
         all_gather.assert_not_called()
 
-    def test_cp_wrapper_builds_mask_and_gathers_indexer_keys_and_attention_kv(self):
+    def test_cp_wrapper_builds_mask_and_gathers_indexer_keys_and_compressed_kv(self):
         attention = _attention_config().build()
         observed = {}
 
@@ -1235,10 +1467,11 @@ class TestGlm5ContextParallel(unittest.TestCase):
             observed["indexer_k"] = k
             return torch.zeros(q.shape[:1] + (2,), dtype=torch.int32)
 
-        def inner_forward(q, k, v, attention_mask, topk_indices, *, scale):
-            observed["attention_k"] = k
-            observed["attention_v"] = v
-            return torch.zeros(q.shape[:-1] + (v.shape[-1],))
+        def inner_forward(
+            q, kv, attention_mask, topk_indices, *, scale, latent_dim
+        ):
+            observed["attention_kv"] = kv
+            return torch.zeros(q.shape[:-1] + (latent_dim,))
 
         attention.indexer.topk.forward = topk_forward
         attention.inner_attention.forward = inner_forward
@@ -1278,15 +1511,14 @@ class TestGlm5ContextParallel(unittest.TestCase):
             mask_BQK = torch.zeros(2, 4)
             attention.indexer.topk(q_BQNH, k_BKH, weights_BQN, mask_BQK)
 
-            k_BLNH = torch.randn(2, 2, 4)
-            v_BLNH = torch.randn(2, 2, 3)
+            kv_BL1H = torch.randn(2, 1, 4)
             attention.inner_attention(
                 q_BQNH,
-                k_BLNH,
-                v_BLNH,
+                kv_BL1H,
                 torch.zeros(1, 2, 4),
                 torch.zeros(2, 2, dtype=torch.int32),
                 scale=0.5,
+                latent_dim=3,
             )
 
         self.assertTrue(
@@ -1301,8 +1533,10 @@ class TestGlm5ContextParallel(unittest.TestCase):
         )
         self.assertEqual(observed["indexer_k"].shape[0], 4)
         self.assertTrue(torch.equal(observed["indexer_k"][2:], k_BKH + 10))
-        self.assertEqual(observed["attention_k"].shape[0], 4)
-        self.assertEqual(observed["attention_v"].shape[0], 4)
+        self.assertEqual(observed["attention_kv"].shape[0], 4)
+        self.assertTrue(
+            torch.equal(observed["attention_kv"][2:], kv_BL1H + 10)
+        )
 
 
 class TestGlm5StateDictAdapter(unittest.TestCase):
@@ -1358,7 +1592,9 @@ class TestGlm5StateDictAdapter(unittest.TestCase):
                 "model.layers.1.self_attn.indexer.wk.weight": indexer_wk,
                 "model.layers.1.self_attn.indexer.k_norm.weight": indexer_norm_weight,
                 "model.layers.1.self_attn.indexer.k_norm.bias": indexer_norm_bias,
-                "model.layers.1.self_attn.indexer.weights_proj.weight": indexer_weights_proj,
+                "model.layers.1.self_attn.indexer.weights_proj.weight": (
+                    indexer_weights_proj
+                ),
                 "model.layers.1.mlp.gate.e_score_correction_bias": expert_bias,
             }
         )
@@ -1384,6 +1620,26 @@ class TestGlm5StateDictAdapter(unittest.TestCase):
         adapter = Glm5StateDictAdapter(config, hf_assets_path=None)
         original = model.state_dict()
 
+        restored = adapter.from_hf(adapter.to_hf(original))
+
+        self.assertEqual(set(restored), set(original))
+        for key in original:
+            self.assertTrue(torch.equal(restored[key], original[key]), key)
+
+    def test_shared_index_state_dict_roundtrip_omits_shared_indexers(self):
+        config = glm5_configs["debugmodel"]()
+        shared_layers = build_glm5_layers(
+            **(_debug_layer_kwargs() | {"index_topk_pattern": "FSSFFSSF"})
+        )
+        config = dataclasses.replace(config, layers=shared_layers)
+        model = config.build()
+        model.init_states()
+        adapter = Glm5StateDictAdapter(config, hf_assets_path=None)
+        original = model.state_dict()
+
+        self.assertFalse(
+            any(key.startswith("layers.1.attention.indexer") for key in original)
+        )
         restored = adapter.from_hf(adapter.to_hf(original))
 
         self.assertEqual(set(restored), set(original))

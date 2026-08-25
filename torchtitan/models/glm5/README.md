@@ -11,6 +11,9 @@ The numerical reference is Hugging Face Transformers'
 `src/transformers/models/glm_moe_dsa` implementation, specifically
 `GlmMoeDsaForCausalLM`. The TorchTitan model uses a strict
 `Glm5StateDictAdapter` to move the same weights between the two layouts.
+The default flavor keeps an indexer on every layer for compatibility with the
+existing HF parity suite. `glm5_shared_index_debugmodel` exercises the released
+cross-layer index-sharing behavior.
 
 ## Run the debug configuration
 
@@ -26,6 +29,31 @@ For the repository launcher, request exactly one process/device:
 ```bash
 NGPU=1 MODULE=glm5 CONFIG=glm5_debugmodel ./run_train.sh
 ```
+
+The shared-index flavor uses the same dimensions and a frequency-three
+`FFSSFSSF` schedule:
+
+```bash
+NGPU=1 MODULE=glm5 CONFIG=glm5_shared_index_debugmodel ./run_train.sh
+```
+
+`glm5_full_dsa_debugmodel` has exactly the same reduced dimensions as
+`glm5_debugmodel`, but uses the production frequency-four cross-layer index
+sharing schedule. It is the fast correctness flavor for the complete DSA data
+flow; the original debug flavor remains the parity baseline.
+
+```bash
+NGPU=1 MODULE=glm5 CONFIG=glm5_full_dsa_debugmodel ./run_train.sh
+```
+
+The model registry also exposes `model_registry("GLM-5.2")`, which defines the
+released, non-quantized 78-layer base decoder: hidden size 6144, 64 attention
+heads, Q/KV LoRA ranks 2048/512, 256 routed experts, 2048-token sparse
+attention, frequency-four index sharing, and a 1,048,576-token RoPE cache
+contract. It is an architecture/checkpoint definition rather than a local
+debug trainer configuration; production data, tokenizer, checkpoint, and
+parallelism settings must be supplied by the deployment. The release's MTP
+head remains outside this DSA-focused model flavor.
 
 Data-parallel runs over 8 GPUs use the same launcher with the parallelism
 degrees set explicitly:
@@ -73,8 +101,10 @@ The model retains GLM-5's Q-LoRA/KV-LoRA multi-head latent attention (MLA),
 interleaved RoPE, per-query DSA top-k selection, and the FP32 router correction
 path, while reducing the dimensions and expert count above.
 
-The GLM-5-specific MLA, DSA indexer, and `DSAInnerAttention` reference kernel
-live in `model.py`. Embeddings,
+The GLM-5-specific absorbed MLA, DSA indexer, and `SparseMLA` PyTorch reference
+live in `model.py`. Unlike the earlier dense reference, the main attention
+gathers only selected compressed KV rows and never expands full per-head K/V.
+Embeddings,
 linear layers, RMSNorm/LayerNorm, interleaved RoPE, dense FFNs, routing,
 routed/shared MoE experts, decoder blocks, and parameter initialization reuse
 `torchtitan/models/common`.
@@ -105,18 +135,38 @@ acceptance gate, not a CPU substitute: it is skipped on a host without CUDA
 and must be run on a one-GPU CUDA host before claiming GPU numerical
 acceptance.
 
+## Optional TileLang operators
+
+The GLM-5 `ops` package contains optional TileLang indexer and SparseMLA
+implementations. They reuse the same model component contracts and state-dict
+layout, but require CUDA, BF16, TileLang, and the production operator geometry.
+The debug flavors exercise the same data flow but do not satisfy those kernel
+shapes.
+
+For a compatible production trainer configuration, enable the operators with:
+
+```bash
+--override.imports \
+torchtitan.models.glm5.ops.tilelang.tilelang_dsa_indexer,torchtitan.models.glm5.ops.tilelang.tilelang_sparse_mla
+```
+
+The default PyTorch implementation remains device-independent and is the
+correctness path for GPU and NPU. An NPU package can replace either component
+config independently without patching the GLM model; the current Turbo path
+replaces SparseMLA and retains the reference indexer.
+
+See [FULL_DSA.md](FULL_DSA.md) for the mathematical path, HF compatibility
+mode, GPU/NPU operator mapping, and distributed boundaries.
+
 ## Current boundaries
 
-DSA uses an eager dense score matrix followed by a top-k mask. Its time and
-memory are quadratic in sequence length, so this implementation is suitable
-only for the reduced debug sequence length and is not a Flash-MLA or dedicated
-DSA-kernel implementation.
+The PyTorch indexer still materializes its complete score matrix before top-k,
+so index selection remains quadratic without the optional fused indexer. The
+main attention itself is sparse and scales with the selected top-k.
 
 The current flavor explicitly does not support:
 
 - KV cache or incremental decoding;
-- Flash-MLA or a production specialized DSA kernel;
-- cross-layer top-k sharing / shared indexers;
 - MTP layers or an auxiliary indexer training objective;
 - CP load balancing or a communication-overlapped production DSA kernel;
 - the `spmd_types` backend.
@@ -124,8 +174,10 @@ The current flavor explicitly does not support:
 The correctness-first CP path gathers positions inside the GLM forward wrapper
 and builds a local-query/global-key dense mask without changing the shared
 Trainer. It then gathers the indexer's key projection before global top-k and
-gathers attention K/V before sparse attention. This preserves GLM DSA semantics
-but does not yet reduce global-key communication or storage. The runtime accepts
+gathers compressed KV before sparse attention. This preserves GLM DSA semantics
+but does not yet overlap global-key communication. Pipeline stages that contain
+shared-index layers must begin on a full-index layer because top-k tensors are
+not transferred across PP stage boundaries. The runtime accepts
 DDP/HSDP/FSDP, CP, TP, PP, and EP on the `partial_dtensor` backend and rejects the
 unsupported layouts above. The indexer runs under `torch.no_grad()` by design,
 so language-model loss does not train its parameters. Its pretrained parameters
@@ -140,10 +192,10 @@ and is currently pending because this host has no CUDA device.
 
 After the single-device correctness milestone, later work may add:
 
-1. A communication-overlapped, index-aware DSA or Flash-MLA CP kernel.
+1. A communication-overlapped, index-aware SparseMLA CP kernel.
 2. Validation and enablement of the `spmd_types` backend.
 3. KV cache and incremental decoding.
-4. Cross-layer IndexCache and shared-indexer patterns.
+4. Cross-stage IndexCache transport for arbitrary PP boundaries.
 5. MTP layers and released-checkpoint coverage.
 6. An explicit auxiliary or distillation objective for training indexers from
    random initialization.

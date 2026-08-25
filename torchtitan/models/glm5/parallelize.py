@@ -35,6 +35,20 @@ __all__ = [
 ]
 
 
+def _validate_glm5_pp_index_stage(model: Glm5Model, *, pp_enabled: bool) -> None:
+    if not pp_enabled or len(model.layers) == 0:
+        return
+    first_layer = next(iter(model.layers.values()))
+    attention = first_layer.attention
+    if attention.indexer is None:
+        raise NotImplementedError(
+            "a GLM-5 pipeline stage cannot start with a shared-index "
+            f"layer {attention.layer_id}; its source layer "
+            f"{attention.index_source_layer} is on an earlier stage. "
+            "Choose PP boundaries that start every stage on a full-index layer."
+        )
+
+
 def _all_gather_sequence_no_grad(
     tensor: torch.Tensor,
     cp_mesh: DeviceMesh,
@@ -56,7 +70,7 @@ def apply_glm5_cp_to_forward(model: Glm5Model, cp_mesh: DeviceMesh) -> None:
     wrapper gathers positions and builds the local-query/global-key dense mask
     inside GLM, so no model-specific behavior leaks into the shared Trainer or
     CP input utility. The DSA indexer then gathers its key projection before
-    global top-k selection, and inner attention gathers K/V before applying
+    global top-k selection, and SparseMLA gathers compressed KV before applying
     those global indices. Contiguous CP shards are required so CP rank order
     remains the original global token order.
 
@@ -104,31 +118,32 @@ def apply_glm5_cp_to_forward(model: Glm5Model, cp_mesh: DeviceMesh) -> None:
     model.forward = cp_model_forward
 
     for block in model.layers.values():
-        topk = block.attention.indexer.topk
-        original_topk_forward = topk.forward
+        if block.attention.indexer is not None:
+            topk = block.attention.indexer.topk
+            original_topk_forward = topk.forward
 
-        @wraps(original_topk_forward)
-        def cp_topk_forward(
-            q_QNH,
-            k_KH,
-            weights_QN,
-            attention_mask_QK,
-            *,
-            _forward=original_topk_forward,
-        ):
-            global_k_KH = _all_gather_sequence_no_grad(
-                k_KH,
-                cp_mesh,
-                sequence_dim=0,
-            )
-            return _forward(
+            @wraps(original_topk_forward)
+            def cp_topk_forward(
                 q_QNH,
-                global_k_KH,
+                k_KH,
                 weights_QN,
                 attention_mask_QK,
-            )
+                *,
+                _forward=original_topk_forward,
+            ):
+                global_k_KH = _all_gather_sequence_no_grad(
+                    k_KH,
+                    cp_mesh,
+                    sequence_dim=0,
+                )
+                return _forward(
+                    q_QNH,
+                    global_k_KH,
+                    weights_QN,
+                    attention_mask_QK,
+                )
 
-        topk.forward = cp_topk_forward
+            topk.forward = cp_topk_forward
 
         inner_attention = block.attention.inner_attention
         original_inner_forward = inner_attention.forward
@@ -136,27 +151,32 @@ def apply_glm5_cp_to_forward(model: Glm5Model, cp_mesh: DeviceMesh) -> None:
         @wraps(original_inner_forward)
         def cp_inner_forward(
             q_QNH,
-            k_KNH,
-            v_KNV,
+            kv_K1H,
             attention_masks_1QK,
             topk_indices_QS,
             *,
             scale,
+            latent_dim,
             _forward=original_inner_forward,
         ):
-            global_k_KNH, global_v_KNV = flex_cp_allgather(
-                k_KNH.contiguous(),
-                v_KNV.contiguous(),
+            # PyTorch's CP autograd collective is a K/V pair API. SparseMLA
+            # owns one compressed KV tensor, so pass the same tensor through
+            # both slots and consume one result; the unused output contributes
+            # a zero gradient while the used output retains reduce-scatter
+            # backward semantics.
+            global_kv_K1H, _ = flex_cp_allgather(
+                kv_K1H.contiguous(),
+                kv_K1H.contiguous(),
                 0,
                 process_group_name,
             )
             return _forward(
                 q_QNH,
-                global_k_KNH,
-                global_v_KNV,
+                global_kv_K1H,
                 attention_masks_1QK,
                 topk_indices_QS,
                 scale=scale,
+                latent_dim=latent_dim,
             )
 
         inner_attention.forward = cp_inner_forward
@@ -181,6 +201,8 @@ def parallelize_glm5(
     partial-DTensor wrapper model and gathers global DSA keys for local queries.
     """
     validate_glm5_parallelism(parallelism, parallel_dims)
+
+    _validate_glm5_pp_index_stage(model, pp_enabled=parallel_dims.pp_enabled)
 
     if parallel_dims.cp_enabled:
         apply_glm5_cp_to_forward(model, parallel_dims.get_mesh("cp"))

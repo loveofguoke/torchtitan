@@ -128,21 +128,33 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
             "attention.wkv_a.weight": attention.wkv_a,
             "attention.wkv_b.weight": attention.wkv_b,
             "attention.wo.weight": attention.wo,
-            "attention.indexer.wq_b.weight": attention.indexer.wq_b,
-            "attention.indexer.wk.weight": attention.indexer.wk,
-            "attention.indexer.weights_proj.weight": attention.indexer.weights_proj,
         }
+        if attention.indexer is not None:
+            linear_configs.update(
+                {
+                    "attention.indexer.wq_b.weight": attention.indexer.wq_b,
+                    "attention.indexer.wk.weight": attention.indexer.wk,
+                    "attention.indexer.weights_proj.weight": (
+                        attention.indexer.weights_proj
+                    ),
+                }
+            )
         if suffix in linear_configs:
             return self._linear_shape(linear_configs[suffix])
 
         norm_configs = {
             "attention.q_norm.weight": attention.q_norm,
             "attention.kv_norm.weight": attention.kv_norm,
-            "attention.indexer.k_norm.weight": attention.indexer.k_norm,
-            "attention.indexer.k_norm.bias": attention.indexer.k_norm,
             "attention_norm.weight": layer.attention_norm,
             "ffn_norm.weight": layer.ffn_norm,
         }
+        if attention.indexer is not None:
+            norm_configs.update(
+                {
+                    "attention.indexer.k_norm.weight": attention.indexer.k_norm,
+                    "attention.indexer.k_norm.bias": attention.indexer.k_norm,
+                }
+            )
         if suffix in norm_configs:
             return self._norm_shape(norm_configs[suffix].normalized_shape)
 
