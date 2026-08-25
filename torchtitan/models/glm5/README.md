@@ -135,25 +135,24 @@ acceptance gate, not a CPU substitute: it is skipped on a host without CUDA
 and must be run on a one-GPU CUDA host before claiming GPU numerical
 acceptance.
 
-## Optional TileLang operators
+## Optional Triton operators
 
-The GLM-5 `ops` package contains optional TileLang indexer and SparseMLA
-implementations. They reuse the same model component contracts and state-dict
-layout, but require CUDA, BF16, TileLang, and the production operator geometry.
-The debug flavors exercise the same data flow but do not satisfy those kernel
-shapes.
+The GLM-5 `ops` package contains optional Triton indexer and SparseMLA
+implementations. They reuse the same component contracts and state-dict
+layout. The CUDA path is compiled by Triton; TorchTitanTurbo registers the
+same mathematical kernels for Triton-Ascend.
 
 For a compatible production trainer configuration, enable the operators with:
 
 ```bash
 --override.imports \
-torchtitan.models.glm5.ops.tilelang.tilelang_dsa_indexer,torchtitan.models.glm5.ops.tilelang.tilelang_sparse_mla
+torchtitan.models.glm5.ops.triton.triton_dsa_indexer,torchtitan.models.glm5.ops.triton.triton_sparse_mla
 ```
 
 The default PyTorch implementation remains device-independent and is the
 correctness path for GPU and NPU. An NPU package can replace either component
 config independently without patching the GLM model; the current Turbo path
-replaces SparseMLA and retains the reference indexer.
+can replace either component independently without changing this model.
 
 See [FULL_DSA.md](FULL_DSA.md) for the mathematical path, HF compatibility
 mode, GPU/NPU operator mapping, and distributed boundaries.
@@ -202,3 +201,11 @@ After the single-device correctness milestone, later work may add:
 
 Each stage requires its own correctness and numerical-validation design; none
 is implied by the debug milestone.
+
+See [PERFORMANCE.md](PERFORMANCE.md) for opt-in compute, communication, memory,
+and recomputation experiments and their profiler acceptance rules.
+The Chinese implementation and interview-oriented explanation is in
+[性能优化实践.md](性能优化实践.md).
+Confirmed kernels and unregistered prototypes are documented separately in
+[ops/README.md](ops/README.md) and
+[ops_candidate/README.md](ops_candidate/README.md).

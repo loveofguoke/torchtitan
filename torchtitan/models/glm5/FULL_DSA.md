@@ -42,42 +42,40 @@ score tensor. It gathers `[Q, S, C+R]` compressed KV and computes only
 `[Q, N, S]` scores.
 
 The PyTorch indexer is deliberately readable and still materializes one
-`[Q, K]` index-score matrix. `ops/tilelang.py` evaluates the same equation in
-query blocks and uses local TileLang kernels. This bounds the materialized
-index-score rows per launch, while preserving exact top-k over the complete
-legal key range.
+`[Q, K]` index-score matrix. `ops/triton.py` evaluates the same equation in
+query blocks with a Triton kernel. It avoids the intermediate `[N,Q,K]`
+head-score tensor while preserving exact top-k over the complete legal key
+range.
 
 ## GPU operator mapping
 
 | Component contract | Reference path | Optional GPU path |
 |---|---|---|
-| `DSAIndexerTopK.Config` | PyTorch matmul, ReLU, weighted reduction, top-k | `TileLangDSAIndexerTopK` and `tilelang_indexer_fwd.py` |
-| `SparseMLA.Config` | PyTorch gather, einsum, softmax, latent reduction | `TileLangSparseMLA` and TileLang forward/backward kernels |
+| `DSAIndexerTopK.Config` | PyTorch matmul, ReLU, weighted reduction, top-k | `TritonDSAIndexerTopK` score kernel plus PyTorch top-k |
+| `SparseMLA.Config` | PyTorch gather, einsum, softmax, latent reduction | Triton selected-score/output forward and dQ/dKV backward |
 
-The GPU implementation was derived by comparing the public GLM-5 training
-implementation in Slime with the Hugging Face mathematical model. TorchTitan
-owns its implementation and does not import Slime at runtime. The low-level
-TileLang sources retain their direct TileLang example provenance.
+The optimized path keeps the TorchTitan mathematical contract and imports no
+external training framework at runtime. It remains opt-in and is not the
+default model implementation.
 
-Enable both GPU operators only for a compatible CUDA BF16 production-shape
-configuration:
+Enable both GPU operators explicitly:
 
 ```bash
 python -m torchtitan.train --module glm5 --config <production-config> \
   --override.imports \
-  torchtitan.models.glm5.ops.tilelang.tilelang_dsa_indexer,torchtitan.models.glm5.ops.tilelang.tilelang_sparse_mla
+  torchtitan.models.glm5.ops.triton.triton_dsa_indexer,torchtitan.models.glm5.ops.triton.triton_sparse_mla
 ```
 
-The reduced debug configurations validate the reference data flow and are not
-expected to satisfy the specialized kernel geometry.
+The SparseMLA implementation has Triton forward and backward. Hardware
+acceptance still requires operator forward/gradient comparison, end-to-end
+loss/grad-norm comparison, and profiler evidence on every target backend.
 
 ## NPU correspondence
 
-TorchTitanTurbo implements `SparseMLA.Config` with
-`torch_npu.npu_sparse_flash_attention`. Tensor layout adaptation and operator
-selection remain outside the device-independent model. The PyTorch indexer is
-currently retained on NPU because the available fused NPU indexer contract does
-not match GLM-5's index-head geometry.
+TorchTitanTurbo provides two independent choices: Triton-Ascend registrations
+for the shared indexer/SparseMLA implementation, and an Ascend-native
+`torch_npu.npu_sparse_flash_attention` SparseMLA override. Tensor layout
+adaptation and operator selection remain outside the device-independent model.
 
 ## Hugging Face compatibility mode
 
