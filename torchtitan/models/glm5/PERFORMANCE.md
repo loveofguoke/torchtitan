@@ -5,6 +5,10 @@ performance work. The default model remains the correctness reference. Every
 optimization must be explicitly selected, numerically compared with that
 reference, and measured with a profiler before it is promoted.
 
+The authoritative runnable matrix and promotion decision live in the
+[torchtitan-test Full DSA optimization workflow](https://github.com/loveofguoke/torchtitan-test/blob/feat/glm5-full-dsa-test/tests/glm5_2_performance/OPTIMIZATION.md).
+This file defines model-side opportunities and acceptance requirements only.
+
 ## Boundaries
 
 TorchTitan owns device-independent model structure and generic training
