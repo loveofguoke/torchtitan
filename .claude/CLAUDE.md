@@ -78,6 +78,13 @@ You should NEVER use `--debug.deterministic_warn_only`.
    conversions "just in case." Only validate explicit contracts, user-facing
    configuration, or invariants whose failure would otherwise be silent or unclear.
 
+8. **Audit the GLM three-repository contract.** Before changing GLM-5 or a
+   shared model/trainer interface used by it, read
+   `torchtitan/models/glm5/DEPENDENCY_AUDIT.md`. Resolve downstream
+   TorchTitanTurbo patches and torchtitan-test call sites, then run the
+   behavioral checks listed there. Do not assume an import-only check proves a
+   copied or monkey-patched algorithm is still compatible.
+
 ## Code Style
 
 ### Unicode

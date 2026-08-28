@@ -12,6 +12,9 @@ The numerical reference is Hugging Face Transformers'
 `GlmMoeDsaForCausalLM`. The TorchTitan model uses a strict
 `Glm5StateDictAdapter` to move the same weights between the two layouts.
 
+The cross-repository interfaces and mandatory downstream checks are documented
+in [DEPENDENCY_AUDIT.md](DEPENDENCY_AUDIT.md).
+
 ## Run the debug configuration
 
 The registered trainer configuration is selected with `--module glm5 --config
@@ -81,29 +84,41 @@ routed/shared MoE experts, decoder blocks, and parameter initialization reuse
 
 ## Verification
 
-CPU forward, causal language-model loss, and backward are covered by the
-native GLM-5 unit tests. Run the focused CPU and optional parity suite with:
+CPU forward, causal language-model loss, backward, CP helpers, state-dict
+conversion, and FLOP accounting are covered by the native GLM-5 unit tests:
 
 ```bash
 python -m pytest \
   tests/unit_tests/test_glm5.py \
-  tests/unit_tests/test_glm5_parity.py \
-  tests/unit_tests/test_config_manager.py -v
+  tests/unit_tests/test_state_dict_adapter.py -v
 ```
 
-On a host with one CUDA GPU and Transformers installed, the same parity module
-executes the FP32 component comparisons and the BF16 end-to-end forward/loss/
-gradient comparison after state-dict conversion:
+The MFU estimate follows TorchTitan's common MoE convention, but charges the
+frozen DSA indexer for forward work only and includes its query/key score and
+per-head score-reduction terms. Top-k selection and elementwise operations are
+still excluded, as they are in the framework's other model-level estimates.
+
+Exploratory Titan/HF and GPU/NPU parity lives in the separate
+`torchtitan-test` repository. From an adjacent source checkout, run its stable
+pytest entry or scenario workflow instead of looking for parity code here:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python -m pytest \
-  tests/unit_tests/test_glm5_parity.py -v
+cd ../torchtitan-test
+python -m pytest \
+  tests/unit_tests/test_glm5_2_parity_artifacts.py \
+  tests/unit_tests/test_glm5_2_parity_workflow.py -q
+
+python tests/glm5_2_parity/titan_hf_gpu_fp32_random.py --data
+python tests/glm5_2_parity/titan_hf_gpu_fp32_random.py --actual-capture
+python tests/glm5_2_parity/titan_hf_gpu_fp32_random.py --expected-capture
+python tests/glm5_2_parity/titan_hf_gpu_fp32_random.py --compare
 ```
 
-The CPU tests pass in the development environment. CUDA parity is an
-acceptance gate, not a CPU substitute: it is skipped on a host without CUDA
-and must be run on a one-GPU CUDA host before claiming GPU numerical
-acceptance.
+The exact GPU/NPU commands, fixture transport, rerun lifecycle, and report
+semantics are maintained in `torchtitan-test/tests/glm5_2_parity/README.md`.
+CPU tests do not replace accelerator parity; rerun the affected scenario after
+model mathematics, state conversion, routing, precision, or parallel input
+semantics change.
 
 ## Current boundaries
 
@@ -134,11 +149,7 @@ of the model state dict and checkpoints.
 
 ## Roadmap
 
-Before beginning these later stages, run the recorded CUDA parity suite on a
-one-GPU CUDA host. It remains the numerical acceptance gate for this milestone
-and is currently pending because this host has no CUDA device.
-
-After the single-device correctness milestone, later work may add:
+Later work may add:
 
 1. A communication-overlapped, index-aware DSA or Flash-MLA CP kernel.
 2. Validation and enablement of the `spmd_types` backend.

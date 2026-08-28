@@ -38,6 +38,7 @@ from torchtitan.models.glm5.model import (
     Glm5TransformerBlock,
 )
 from torchtitan.models.glm5.parallelize import apply_glm5_cp_to_forward
+from torchtitan.models.utils import get_moe_model_nparams_and_flops
 
 
 def _indexer_config() -> Glm5DsaIndexer.Config:
@@ -789,6 +790,41 @@ class TestGlm5Model(unittest.TestCase):
         self.assertGreater(flops, 0)
         self.assertEqual(
             nparams, sum(parameter.numel() for parameter in model.parameters())
+        )
+
+    def test_flops_count_indexer_as_forward_only(self):
+        config = glm5_configs["debugmodel"]()
+        model = config.build()
+        model.init_states()
+        seq_len = 16
+        attention = config.layers[0].attention
+        self.assertIsInstance(attention, Glm5Attention.Config)
+        _, common_flops = get_moe_model_nparams_and_flops(
+            config,
+            model,
+            attention.n_heads,
+            attention.qk_head_dim + attention.v_head_dim,
+            seq_len,
+        )
+        indexer_params = sum(
+            parameter.numel()
+            for name, parameter in model.named_parameters()
+            if ".attention.indexer." in name
+        )
+        self.assertGreater(indexer_params, 0)
+        expected_indexer_scores = (
+            2
+            * len(config.layers)
+            * attention.indexer.n_heads
+            * (attention.indexer.head_dim + 1)
+            * seq_len
+        )
+
+        _, actual_flops = config.get_nparams_and_flops(model, seq_len=seq_len)
+
+        self.assertEqual(
+            actual_flops,
+            common_flops - 4 * indexer_params + expected_indexer_scores,
         )
 
 

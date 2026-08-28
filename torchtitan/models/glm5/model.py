@@ -510,11 +510,25 @@ class Glm5Model(Decoder):
                 attention.qk_head_dim + attention.v_head_dim,
                 seq_len,
             )
+            # The common parameter-based estimate charges every parameter for
+            # forward and backward matmuls (6 FLOPs per parameter). GLM-5's
+            # pretrained indexer is frozen and runs under no_grad, so it only
+            # incurs its forward cost (2 FLOPs per parameter). Keep the total
+            # parameter count unchanged while removing the nonexistent
+            # indexer backward work from MFU accounting.
+            nparams_indexer = sum(
+                parameter.numel()
+                for name, parameter in model.named_parameters()
+                if ".attention.indexer." in name
+            )
+            base_flops -= 4 * nparams_indexer
+            # Per token, the indexer computes N dot products of width H against
+            # the full sequence, followed by a weighted reduction over N heads.
             dsa_flops = (
                 2
                 * len(self.layers)
                 * attention.indexer.n_heads
-                * attention.indexer.head_dim
+                * (attention.indexer.head_dim + 1)
                 * seq_len
             )
             return nparams, base_flops + dsa_flops
