@@ -4,6 +4,13 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+"""Trainer-level GLM-5 configurations.
+
+The model registry describes architecture; this module adds data, loss,
+optimizer, schedule, precision, checkpoint, and parallelism defaults. CLI
+overrides used by torchtitan-test are applied on top of this debug baseline.
+"""
+
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.data import ConcatThenSplitPackingConfig, GrainDataLoader
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss

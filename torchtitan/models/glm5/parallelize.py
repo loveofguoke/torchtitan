@@ -4,6 +4,19 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+"""Runtime composition of GLM-5 parallel dimensions.
+
+This file does not define model mathematics. It orders the transforms that
+make the same model run on CP/TP/EP/DP and optional PP stages:
+
+``CP forward wrapping -> TP/EP DTensor parallelize -> activation checkpoint
+-> torch.compile -> composable FSDP2``.
+
+The order is a contract. CP replaces local forward functions before
+``Module.parallelize`` captures them in ``local_map``; FSDP is last so it wraps
+the final parameter layout rather than parameters that later transforms replace.
+"""
+
 from functools import wraps
 
 import torch
@@ -41,7 +54,12 @@ def _all_gather_sequence_no_grad(
     *,
     sequence_dim: int,
 ) -> torch.Tensor:
-    """Gather a sequence-sharded tensor in CP rank order without autograd."""
+    """Gather a sequence-sharded tensor in CP rank order without autograd.
+
+    This helper is for non-trainable metadata or the frozen DSA index path.
+    Trainable K/V uses ``flex_cp_allgather`` below so backward returns the
+    correct gradient shard instead of silently treating the gather as constant.
+    """
 
     local_tensor = tensor.contiguous()
     gathered = [torch.empty_like(local_tensor) for _ in range(cp_mesh.size())]
@@ -64,6 +82,8 @@ def apply_glm5_cp_to_forward(model: Glm5Model, cp_mesh: DeviceMesh) -> None:
     ``local_map`` captures the wrapped local-tensor functions.
     """
 
+    # ``flex_cp_allgather`` accepts a process-group name rather than a
+    # DeviceMesh. Resolve it once and close over it for every decoder layer.
     process_group_name = dist._get_process_group_name(cp_mesh.get_group())
     original_model_forward = model.forward
     original_get_attention_masks = model.get_attention_masks
@@ -95,6 +115,8 @@ def apply_glm5_cp_to_forward(model: Glm5Model, cp_mesh: DeviceMesh) -> None:
             global_mask = original_get_attention_masks(global_positions)
             assert global_mask is not None
             local_query_len = positions.shape[-1]
+            # CP uses contiguous sequence shards. Rank r owns query interval
+            # [r * Q_local, (r + 1) * Q_local) but keys span the global K axis.
             query_start = cp_mesh.get_local_rank() * local_query_len
             attention_masks = global_mask[
                 :, query_start : query_start + local_query_len, :
@@ -116,6 +138,8 @@ def apply_glm5_cp_to_forward(model: Glm5Model, cp_mesh: DeviceMesh) -> None:
             *,
             _forward=original_topk_forward,
         ):
+            # The frozen indexer must rank every global key, not merely this
+            # rank's local CP shard; otherwise top-k semantics change with CP.
             global_k_KH = _all_gather_sequence_no_grad(
                 k_KH,
                 cp_mesh,
@@ -144,6 +168,9 @@ def apply_glm5_cp_to_forward(model: Glm5Model, cp_mesh: DeviceMesh) -> None:
             scale,
             _forward=original_inner_forward,
         ):
+            # Q stays local to this CP rank. K/V are reconstructed in global
+            # token order, and autograd later reduces/slices their gradients
+            # back to the owner ranks through the CP-aware primitive.
             global_k_KNH, global_v_KNV = flex_cp_allgather(
                 k_KNH.contiguous(),
                 v_KNV.contiguous(),
@@ -182,6 +209,8 @@ def parallelize_glm5(
     """
     validate_glm5_parallelism(parallelism, parallel_dims)
 
+    # Install transforms from logical-token behavior toward parameter wrapping.
+    # Reordering these branches can change which callable local_map/compile sees.
     if parallel_dims.cp_enabled:
         apply_glm5_cp_to_forward(model, parallel_dims.get_mesh("cp"))
 

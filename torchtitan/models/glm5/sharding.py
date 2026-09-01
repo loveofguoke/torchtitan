@@ -4,6 +4,23 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+"""Declarative DTensor layouts for GLM-5.
+
+Model code names logical global dimensions; this module states how each tensor
+is placed on the DP/CP/TP/EP mesh. A ``ShardingConfig`` has three important
+roles: describe incoming placements, request redistributions when a module
+needs another placement, and declare parameter/state placements. Collectives
+are consequences of those placement changes rather than handwritten calls.
+
+The high-level plan is:
+
+* CP shards the token/query axis and gathers global DSA keys in ``parallelize``.
+* TP shards attention heads and FFN hidden dimensions; low-rank MLA weights and
+  the frozen DSA indexer stay TP-replicated for correctness and simplicity.
+* SP keeps intermediate token activations sharded across TP where supported.
+* EP uses the common MoE sharding plan for routed experts and token dispatch.
+"""
+
 from typing import TYPE_CHECKING
 
 import spmd_types as spmd
@@ -39,7 +56,12 @@ _GROUPED_EXPERTS_PARAM_LAYOUT: dict[str, spmd.PerMeshAxisSpmdType] = {
 
 
 def _dsa_mask_layout() -> SpmdLayout:
-    """Describe dense ``[1, query, key]`` mask placement."""
+    """Describe dense ``[1, query, key]`` mask placement.
+
+    DP and CP partition the query axis because each rank owns local tokens.
+    The key axis remains global after CP gather, and TP replicates the mask
+    because every head shard applies the same causal/top-k legality rules.
+    """
 
     return SpmdLayout(
         {
@@ -127,6 +149,8 @@ def _set_glm5_layer_sharding(
     attention = layer_cfg.attention
     assert isinstance(attention, Glm5Attention.Config)
 
+    # Both norms preserve the activation layout. Under SP their token axis is
+    # sharded over TP; without SP attention consumes a replicated TP activation.
     norm = norm_config(enable_sp=enable_sp)
     layer_cfg.attention_norm.sharding_config = norm
     layer_cfg.ffn_norm.sharding_config = norm
@@ -201,6 +225,8 @@ def set_glm5_attention_sharding(
     attention.wkv_a.sharding_config = replicate_weight
     attention.kv_norm.sharding_config = replicate_weight
 
+    # Up-projections are column-wise: each TP rank owns a subset of heads.
+    # ``wo`` is row-wise so local head outputs reduce into the global model dim.
     attention.wq_b.sharding_config = colwise_config()
     attention.wkv_b.sharding_config = colwise_config()
     attention.wo.sharding_config = rowwise_config(output_sp=enable_sp)
@@ -218,6 +244,10 @@ def set_glm5_dsa_inner_attention_sharding(inner_attention) -> None:
     backend, CP K/V gathering is installed separately by
     ``apply_glm5_cp_to_forward`` before this local-map boundary is captured.
     """
+    # Logical [Q,N,H]: CP shards Q and TP shards N. K/V enter with the same
+    # local layout, then CP changes their token placement to Replicate for the
+    # local dense reference kernel. Their backward placement is Partial because
+    # every CP query shard contributes gradients to every gathered key/value.
     q_layout = dense_activation_placement(tp=spmd.S(1), cp=spmd.S(0))
     kv_src_layout = dense_activation_placement(tp=spmd.S(1), cp=spmd.S(0))
     kv_dst_layout = dense_activation_placement(tp=spmd.S(1), cp=spmd.R)

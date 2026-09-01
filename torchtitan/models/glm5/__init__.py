@@ -4,6 +4,15 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+"""GLM-5 model assembly and TorchTitan registry entry.
+
+``model.py`` defines modules, while this file wires their nested ``Config``
+objects, initialization policies, dense/MoE layer schedule, and ``ModelSpec``.
+The registry is the public bridge used by Trainer: it provides the model,
+parallelization callback, pipeline partitioner, optimizer hook, and checkpoint
+adapter as one coherent contract.
+"""
+
 import dataclasses
 from collections.abc import Callable
 from functools import partial
@@ -106,7 +115,12 @@ def make_glm5_attention_config(
     attention_dropout: float,
     rope: ComplexRoPE.Config,
 ) -> Glm5Attention.Config:
-    """Build a fully specified GLM-5 MLA plus DSA attention config."""
+    """Build a fully specified GLM-5 MLA plus DSA attention config.
+
+    Configs are nested instead of constructing modules directly so TorchTitan
+    can validate, shard, pipeline-partition, and initialize the model before
+    materializing parameters on the target device.
+    """
     qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
     return Glm5Attention.Config(
         dim=dim,
@@ -229,6 +243,8 @@ def build_glm5_layers(
 
     layers: list[TransformerBlock.Config] = []
     for layer_id in range(n_layers):
+        # Every block uses MLA+DSA attention. Only the FFN family changes:
+        # early blocks are dense and the remaining blocks use routed+shared MoE.
         attention = make_glm5_attention_config(
             layer_id=layer_id,
             dim=dim,
@@ -353,6 +369,7 @@ glm5_configs = {"debugmodel": _debugmodel}
 
 
 def model_registry(flavor: str = "debugmodel") -> ModelSpec:
+    """Return every framework callback required to train one GLM-5 flavor."""
     return ModelSpec(
         name="glm5",
         flavor=flavor,

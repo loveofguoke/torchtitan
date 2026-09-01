@@ -4,12 +4,20 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""GLM-5 checkpoint conversion for local and distributed model states.
+"""Bidirectional GLM-5 checkpoint conversion for local tensors and DTensors.
 
-Transformers stores a routed-expert gate and up projection in one tensor,
-whereas TorchTitan's ``GroupedExperts`` owns three explicit grouped tensors.
-The conversion preserves DTensor placements so TorchTitan's distributed
-checkpoint writer can save and load HuggingFace safetensors directly.
+TorchTitan and Hugging Face use different parameter names and different routed
+expert packing. Most parameters need only a key rename. Routed expert gate/up
+weights are separate in TorchTitan but fused along hidden dimension 1 in HF.
+
+That fusion is trivial for local tensors. It is not trivial when TP already
+shards dimension 1: concatenating two local shards would produce
+``gate_rank0, up_rank0, gate_rank1, up_rank1`` globally instead of HF's
+``all_gate, all_up`` order. The all-to-all helpers below exchange half-rank
+chunks so conversion preserves both global value order and DTensor placement.
+The inverse path uses the exact reverse exchange. Preserving DTensor placements
+also lets TorchTitan's distributed checkpoint writer save and load HuggingFace
+safetensors without first materializing one full model on every rank.
 """
 
 import re
@@ -237,6 +245,13 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
 
     @classmethod
     def _all_to_all_fuse_gate_up(cls, gate: DTensor, up: DTensor) -> DTensor:
+        """Fuse TP-sharded gate/up weights into HF global ordering.
+
+        Each source rank sends its gate shard to one destination half and its
+        up shard to the corresponding destination in the other half. The local
+        reshape then joins the received pair along hidden dimension 1 while the
+        returned DTensor keeps the original Shard(1) placement.
+        """
         mesh_axis = cls._tp_axis_for_fusion(gate)
         tp_size = gate.device_mesh.size(mesh_axis)
         if tp_size == 1:
@@ -258,6 +273,8 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
             )
         num_local_experts, shard_width, dim = local_gate.shape
 
+        # Pack on the expert axis so all_to_all_single can use element counts as
+        # split sizes without flattening or losing [E,F,D] structure.
         packed = torch.cat((local_gate, local_up), dim=0)
         output = torch.empty_like(packed)
         half_tp = tp_size // 2
@@ -295,6 +312,7 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
 
     @classmethod
     def _all_to_all_split_gate_up(cls, fused: DTensor) -> tuple[DTensor, DTensor]:
+        """Reverse distributed HF fusion and restore TorchTitan gate/up shards."""
         mesh_axis = cls._tp_axis_for_fusion(fused)
         tp_size = fused.device_mesh.size(mesh_axis)
         if tp_size == 1:
@@ -397,6 +415,7 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
         return gate, up
 
     def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
+        """Validate and convert one HF state dict into TorchTitan key/layout form."""
         self._validate_hf_rope_config(ComplexRoPE.Config)
         state_dict: dict[str, Any] = {}
 
@@ -447,6 +466,7 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
         return state_dict
 
     def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+        """Validate and convert TorchTitan state into HF names and expert packing."""
         hf_state_dict: dict[str, Any] = {}
         fused_experts: dict[int, dict[str, Any]] = {}
 

@@ -4,6 +4,27 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+"""Device-neutral GLM-5 model mathematics.
+
+Read this file from the outside in:
+
+1. ``Glm5Model`` supplies token embedding, decoder blocks, final norm, and the
+   language-model head inherited from ``Decoder``.
+2. ``Glm5TransformerBlock`` composes pre-norm DSA attention with either a
+   dense FFN or the common TorchTitan MoE implementation.
+3. ``Glm5Attention`` expands MLA's low-rank Q/KV representations, asks the
+   frozen ``Glm5DsaIndexer`` which keys each query may attend to, and delegates
+   score/value computation to ``DSAInnerAttention``.
+4. ``DSAIndexerTopK`` is the correctness-first mathematical definition of the
+   index selection rule. Device kernels and NPU-only workarounds belong in
+   TorchTitanTurbo, not here.
+
+The model uses token-first tensors because TorchTitan packs microbatches into a
+single token dimension before model forward. Distributed placement is declared
+separately in ``sharding.py``; the formulas below describe global logical
+shapes and remain unchanged when a dimension is local-sharded.
+"""
+
 from dataclasses import dataclass, replace
 
 import torch
@@ -26,6 +47,14 @@ def _create_dense_dsa_mask(
     *,
     dtype: torch.dtype,
 ) -> torch.Tensor:
+    """Build a packed-document causal additive mask of shape ``[1, T, T]``.
+
+    ``positions_T`` restarts at zero for every packed document. The cumulative
+    restart count is therefore a document id. A query can see a key only when
+    both tokens belong to the same document and the key is not in the future.
+    Disallowed entries use the minimum finite value so adding the mask before
+    softmax makes their probability numerically zero.
+    """
     T = positions_T.shape[0]
     token_indices_T = torch.arange(T, device=positions_T.device)
     document_ids_T = (positions_T == 0).cumsum(0)
@@ -38,7 +67,14 @@ def _create_dense_dsa_mask(
 
 
 class DSAIndexerTopK(Module):
-    """Compute local-query top-k indices against a global key sequence."""
+    """Compute local-query top-k indices against a global key sequence.
+
+    For every indexer head ``n`` and query/key pair, the indexer computes
+    ``relu(dot(q[q,n,:], k[k,:]) * scale)``. ``weights_QN`` then reduces the
+    head dimension into one score per ``(query, key)``. The causal/document
+    mask is added before the final top-k. The output is integer metadata; no
+    gradient flows through the discrete selection.
+    """
 
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
@@ -73,10 +109,14 @@ class DSAIndexerTopK(Module):
             raise ValueError("DSA indexer weights must have shape [Q, N].")
         if attention_mask_QK.shape != (Q, K):
             raise ValueError("DSA indexer attention mask must have shape [Q, K].")
+        # [Q,N,H] x [H,K] -> [N,Q,K]. Index scores intentionally use FP32:
+        # the K/K+1 boundary can change under a single low-precision ULP.
         scores_NQK = torch.matmul(
             q_QNH.float().transpose(0, 1), k_KH.float().transpose(0, 1)
         ) * self.softmax_scale
         scores_NQK = F.relu(scores_NQK)
+        # Each query predicts N mixing weights, producing one global-key score
+        # after the weighted reduction over indexer heads.
         index_scores_QK = torch.matmul(
             weights_QN.unsqueeze(1), scores_NQK.transpose(0, 1)
         ).squeeze(1)
@@ -86,6 +126,14 @@ class DSAIndexerTopK(Module):
 
 
 class Glm5DsaIndexer(Module):
+    """Frozen pretrained query-to-key selector used by DSA.
+
+    ``hidden_states_TD`` supplies both the shared key and per-head mixing
+    weights. ``q_resid_TR`` reuses MLA's normalized Q LoRA representation so
+    the main attention and indexer observe the same query state. RoPE is
+    applied only to the configured rotary prefix; the remaining features pass
+    through unchanged.
+    """
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
         dim: int
@@ -134,6 +182,9 @@ class Glm5DsaIndexer(Module):
         self.requires_grad_(False)
 
     def _apply(self, fn, recurse: bool = True):
+        # ``model.to(dtype=...)`` visits frozen modules too. Restore this gate
+        # to FP32 after the generic transform because its boundary decisions
+        # are more sensitive than the surrounding BF16 attention projections.
         super()._apply(fn, recurse=recurse)
         self.weights_proj.float()
         return self
@@ -147,6 +198,9 @@ class Glm5DsaIndexer(Module):
         attention_mask_TK: torch.Tensor | None,
     ) -> torch.Tensor:
         T = hidden_states_TD.shape[0]
+        # Build query and key features in the same indexer space. The key has a
+        # singleton head dimension because every query head searches one shared
+        # global key sequence.
         q_TNH = self.wq_b(q_resid_TR).view(T, self.n_heads, self.head_dim)
         q_rot_TNR, q_pass_TNP = torch.split(
             q_TNH,
@@ -163,6 +217,8 @@ class Glm5DsaIndexer(Module):
         q_TNH = torch.cat((q_rot_TNR, q_pass_TNP), dim=-1)
         k_TH = torch.cat((k_rot_T1R, k_pass_T1P), dim=-1).squeeze(1)
 
+        # The learned per-token head weights turn N head-specific similarities
+        # into the scalar [T,T] ranking consumed by top-k.
         weights_TN = self.weights_proj(
             hidden_states_TD.to(self.weights_proj.weight.dtype)
         ).float() * (self.n_heads**-0.5)
@@ -222,12 +278,18 @@ class DSAInnerAttention(Module):
         if not attention_masks_1QK.is_floating_point():
             raise ValueError("attention_masks must use a floating additive dtype.")
 
+        # Materialize the reference sparse pattern as a dense boolean mask.
+        # This preserves DSA mathematics and makes the kernel boundary explicit,
+        # but it does not avoid the dense QK matmul. Optimized sparse gather and
+        # fused kernels can replace this module without changing its contract.
         selected_QK = torch.zeros_like(
             attention_masks_1QK[0], dtype=torch.bool
         ).scatter(-1, topk_indices_QS.long(), True)
         sparse_mask_1QK = attention_masks_1QK.masked_fill(
             ~selected_QK.unsqueeze(0), torch.finfo(q_QNH.dtype).min
         )
+        # [Q,N,H] and [K,N,H] -> [N,Q,K]. Only selected causal entries survive
+        # the additive mask. Softmax accumulates in FP32 for numerical stability.
         scores_NQK = torch.matmul(
             q_QNH.transpose(0, 1), k_KNH.transpose(0, 1).transpose(-1, -2)
         ) * scale
@@ -242,6 +304,14 @@ class DSAInnerAttention(Module):
 
 
 class Glm5Attention(BaseAttention):
+    """Multi-head latent attention (MLA) gated by DSA top-k indices.
+
+    Q follows ``D -> q_lora_rank -> N * (nope + rope)``. KV follows
+    ``D -> (kv_lora_rank + rope)`` and expands only after the low-rank norm.
+    The indexer consumes the same token states and returns ``[T, topk]`` key
+    indices. ``inner_attention`` is the replaceable boundary between model
+    mathematics and a dense or genuinely sparse device implementation.
+    """
     @dataclass(kw_only=True, slots=True)
     class Config(BaseAttention.Config):
         dim: int
@@ -378,11 +448,16 @@ class Glm5Attention(BaseAttention):
         if positions_T is None:
             positions_T = torch.arange(T, device=x_TD.device)
 
+        # Query path: compress to LoRA rank R, normalize, then expand to N
+        # heads. Split content (NoPE) from position-sensitive (RoPE) features.
         q_resid_TR = self.q_norm(self.wq_a(x_TD))
         q_TNH = self.wq_b(q_resid_TR).view(T, self.n_heads, self.qk_head_dim)
         q_nope_TNP, q_rope_TNR = torch.split(
             q_TNH, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
         )
+        # KV path: keep content in a compressed latent representation and keep
+        # one shared rotary key. The expensive per-head expansion happens only
+        # after normalization.
         compressed_kv_TC = self.wkv_a(x_TD)
         kv_TR, k_rope_TR = torch.split(
             compressed_kv_TC,
@@ -404,6 +479,8 @@ class Glm5Attention(BaseAttention):
             (k_nope_TNP, k_rope_T1R.expand(-1, self.n_heads, -1)),
             dim=-1,
         )
+        # Selection and value computation are separate on purpose: the indexer
+        # is frozen and discrete, while the attention path remains trainable.
         topk_indices_TS = self.indexer(
             x_TD,
             q_resid_TR,
@@ -447,6 +524,9 @@ class Glm5TransformerBlock(TransformerBlock):
         attention_masks: torch.Tensor,
         positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # Pre-norm residual block. Dense and MoE FFNs share the same residual
+        # contract, so pipeline and activation-checkpoint code need not special
+        # case the layer type.
         x_TD = x_TD + self.attention(
             self.attention_norm(x_TD), attention_masks, positions
         )
@@ -459,7 +539,12 @@ class Glm5TransformerBlock(TransformerBlock):
 
 
 class Glm5Model(Decoder):
-    """GLM-5 decoder with dense reference DSA attention."""
+    """GLM-5 decoder with dense reference DSA attention.
+
+    The inherited decoder accepts token ids on the first PP stage and hidden
+    states on later stages. A PP stage may own zero decoder layers, which is why
+    mask construction and forward preserve embedding-only/output-only stages.
+    """
 
     @dataclass(kw_only=True, slots=True)
     class Config(Decoder.Config):
