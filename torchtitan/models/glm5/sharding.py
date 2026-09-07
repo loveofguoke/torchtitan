@@ -192,11 +192,8 @@ def set_glm5_attention_sharding(
     ``wo`` is Rowwise. The DSA indexer is kept fully Replicate on TP (see
     ``set_glm5_indexer_sharding``).
     """
-    # ``attention_masks`` must arrive as a Replicate DTensor under TP: the
-    # eager DSA mask construction (zeros_like + scatter, masked_fill) rejects
-    # mixing a plain base tensor with a DTensor arg, so the whole mask path
-    # runs on Replicate DTensors. On a single device the mesh is absent and the
-    # input stays plain.
+    # Masks and shared indices are TP-replicated metadata. The inner-attention
+    # local_map unwraps them before constructing the sparse BlockMask.
     attention.sharding_config = ShardingConfig(
         in_src_shardings={
             "x_TD": (
@@ -205,10 +202,12 @@ def set_glm5_attention_sharding(
                 else dense_activation_placement(tp=spmd.I, cp=spmd.S(0))
             ),
             "attention_masks": _dsa_mask_layout(),
+            "topk_indices_TS": dense_activation_placement(tp=spmd.R, cp=spmd.S(0)),
         },
         in_dst_shardings={
             "x_TD": dense_activation_placement(tp=spmd.R, cp=spmd.S(0)),
             "attention_masks": _dsa_mask_layout(),
+            "topk_indices_TS": dense_activation_placement(tp=spmd.R, cp=spmd.S(0)),
         },
     )
     attention.rope.sharding_config = ShardingConfig(
@@ -236,17 +235,17 @@ def set_glm5_attention_sharding(
 
 
 def set_glm5_dsa_inner_attention_sharding(inner_attention) -> None:
-    """Run dense DSA score computation on TP-local tensors.
+    """Build BlockMask and run sparse attention on TP-local tensors.
 
     Q/K/V are TP-sharded on the head dimension. The dense mask and DSA top-k
     indices are replicated on TP. Keeping this boundary in ``local_map`` avoids
-    mixing DTensors with the local dense attention kernel. On the default
+    mixing DTensors with local BlockMask construction. On the default
     backend, CP K/V gathering is installed separately by
     ``apply_glm5_cp_to_forward`` before this local-map boundary is captured.
     """
     # Logical [Q,N,H]: CP shards Q and TP shards N. K/V enter with the same
     # local layout, then CP changes their token placement to Replicate for the
-    # local dense reference kernel. Their backward placement is Partial because
+    # local FlexAttention kernel. Their backward placement is Partial because
     # every CP query shard contributes gradients to every gathered key/value.
     q_layout = dense_activation_placement(tp=spmd.S(1), cp=spmd.S(0))
     kv_src_layout = dense_activation_placement(tp=spmd.S(1), cp=spmd.S(0))
@@ -259,14 +258,14 @@ def set_glm5_dsa_inner_attention_sharding(inner_attention) -> None:
             "q_QNH": q_layout,
             "k_KNH": kv_src_layout,
             "v_KNV": kv_src_layout,
-            "attention_masks_1QK": mask_layout,
+            "attention_masks": mask_layout,
             "topk_indices_QS": topk_layout,
         },
         in_dst_shardings={
             "q_QNH": q_layout,
             "k_KNH": kv_dst_layout,
             "v_KNV": kv_dst_layout,
-            "attention_masks_1QK": mask_layout,
+            "attention_masks": mask_layout,
             "topk_indices_QS": topk_layout,
         },
         out_src_shardings=q_layout,

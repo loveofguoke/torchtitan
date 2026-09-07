@@ -39,16 +39,17 @@ from torchtitan.models.common.param_init import depth_scaled_std
 from torchtitan.protocols.model_spec import ModelSpec
 
 from .model import (
-    DSAIndexerTopK,
-    DSAInnerAttention,
     Glm5Attention,
-    Glm5DsaIndexer,
     Glm5Model,
     Glm5TransformerBlock,
 )
+from .dsa import DSAIndexerTopK, Glm5DsaIndexer, Glm5FlexAttention
+
 from .parallelize import parallelize_glm5
 from .sharding import validate_glm5_parallelism
 from .state_dict_adapter import Glm5StateDictAdapter
+
+DSAInnerAttention = Glm5FlexAttention
 
 __all__ = [
     "DSAIndexerTopK",
@@ -191,7 +192,7 @@ def make_glm5_attention_config(
                 softmax_scale=index_head_dim**-0.5,
             ),
         ),
-        inner_attention=DSAInnerAttention.Config(
+        inner_attention=Glm5FlexAttention.Config(
             attention_dropout=attention_dropout,
         ),
     )
@@ -365,7 +366,17 @@ def _debugmodel() -> Glm5Model.Config:
     )
 
 
-glm5_configs = {"debugmodel": _debugmodel}
+def _shared_dsa_debugmodel() -> Glm5Model.Config:
+    config = _debugmodel()
+    config.index_sources = (0, 0, 2, 2, 4, 4, 6, 6)
+    return config
+
+
+glm5_configs = {
+    "debugmodel": _debugmodel,
+    "dsa_debugmodel": _debugmodel,
+    "shared_dsa_debugmodel": _shared_dsa_debugmodel,
+}
 
 
 def model_registry(flavor: str = "debugmodel") -> ModelSpec:

@@ -162,7 +162,7 @@ def apply_glm5_cp_to_forward(model: Glm5Model, cp_mesh: DeviceMesh) -> None:
             q_QNH,
             k_KNH,
             v_KNV,
-            attention_masks_1QK,
+            attention_masks,
             topk_indices_QS,
             *,
             scale,
@@ -181,7 +181,7 @@ def apply_glm5_cp_to_forward(model: Glm5Model, cp_mesh: DeviceMesh) -> None:
                 q_QNH,
                 global_k_KNH,
                 global_v_KNV,
-                attention_masks_1QK,
+                attention_masks,
                 topk_indices_QS,
                 scale=scale,
             )
@@ -208,6 +208,7 @@ def parallelize_glm5(
     partial-DTensor wrapper model and gathers global DSA keys for local queries.
     """
     validate_glm5_parallelism(parallelism, parallel_dims)
+    validate_glm5_index_sharing(model)
 
     # Install transforms from logical-token behavior toward parameter wrapping.
     # Reordering these branches can change which callable local_map/compile sees.
@@ -258,3 +259,23 @@ def parallelize_glm5(
     )
 
     return model
+
+
+def validate_glm5_index_sharing(model: Glm5Model) -> None:
+    """Validate index producers after PP has partitioned decoder layers.
+
+    Shared indices are per-forward metadata, not a persistent cache. PP only
+    transfers hidden states today, so every consumer needs its producer on the
+    same stage. Do not recompute indices from the consumer's hidden states:
+    that would change the model's selected attention edges.
+    """
+    if not model.index_sources:
+        return
+    local_layers = {int(name) for name in model.layers}
+    for layer in local_layers:
+        source = model.index_sources[layer]
+        if source not in local_layers:
+            raise NotImplementedError(
+                f"DSA layer {layer} needs indices from layer {source} on another "
+                "PP stage; keep each index-sharing group within one stage."
+            )

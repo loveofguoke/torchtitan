@@ -14,293 +14,32 @@ Read this file from the outside in:
    dense FFN or the common TorchTitan MoE implementation.
 3. ``Glm5Attention`` expands MLA's low-rank Q/KV representations, asks the
    frozen ``Glm5DsaIndexer`` which keys each query may attend to, and delegates
-   score/value computation to ``DSAInnerAttention``.
-4. ``DSAIndexerTopK`` is the correctness-first mathematical definition of the
-   index selection rule. Device kernels and NPU-only workarounds belong in
-   TorchTitanTurbo, not here.
+   score/value computation to ``Glm5FlexAttention`` in ``dsa.py``.
+4. ``dsa.py`` contains the indexer and token-selected BlockMask construction.
 
 The model uses token-first tensors because TorchTitan packs microbatches into a
 single token dimension before model forward. Distributed placement is declared
 separately in ``sharding.py``; the formulas below describe global logical
-shapes and remain unchanged when a dimension is local-sharded.
+shapes. Distributed adaptation of this sparse path is a separate step.
 """
 
 from dataclasses import dataclass, replace
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
-from torchtitan.models.common import ComplexRoPE, LayerNorm, Linear, RMSNorm
+from torchtitan.models.common import ComplexRoPE, Linear, RMSNorm
 from torchtitan.models.common.attention import BaseAttention
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.models.utils import get_moe_model_nparams_and_flops
 from torchtitan.protocols.module import Module
 
+from .dsa import DSAIndexerTopK, Glm5DsaIndexer, create_dsa_causal_mask
+from .dsa import Glm5FlexAttention as DSAInnerAttention
+
 # Tensor dimensions used in this file:
 # T/Q/K: token, query-token, and key-token dimensions.
 # D/N/H/R/P/V: model, head-count, head, RoPE, pass-through, and value dimensions.
-
-
-def _create_dense_dsa_mask(
-    positions_T: torch.Tensor,
-    *,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """Build a packed-document causal additive mask of shape ``[1, T, T]``.
-
-    ``positions_T`` restarts at zero for every packed document. The cumulative
-    restart count is therefore a document id. A query can see a key only when
-    both tokens belong to the same document and the key is not in the future.
-    Disallowed entries use the minimum finite value so adding the mask before
-    softmax makes their probability numerically zero.
-    """
-    T = positions_T.shape[0]
-    token_indices_T = torch.arange(T, device=positions_T.device)
-    document_ids_T = (positions_T == 0).cumsum(0)
-    allowed_TT = (token_indices_T[:, None] >= token_indices_T[None, :]) & (
-        document_ids_T[:, None] == document_ids_T[None, :]
-    )
-    return torch.zeros(
-        1, T, T, dtype=dtype, device=positions_T.device
-    ).masked_fill(~allowed_TT.unsqueeze(0), torch.finfo(dtype).min)
-
-
-class DSAIndexerTopK(Module):
-    """Compute local-query top-k indices against a global key sequence.
-
-    For every indexer head ``n`` and query/key pair, the indexer computes
-    ``relu(dot(q[q,n,:], k[k,:]) * scale)``. ``weights_QN`` then reduces the
-    head dimension into one score per ``(query, key)``. The causal/document
-    mask is added before the final top-k. The output is integer metadata; no
-    gradient flows through the discrete selection.
-    """
-
-    @dataclass(kw_only=True, slots=True)
-    class Config(Module.Config):
-        index_topk: int
-        softmax_scale: float
-
-        def __post_init__(self) -> None:
-            if self.index_topk <= 0:
-                raise ValueError("index_topk must be > 0.")
-            if self.softmax_scale <= 0.0:
-                raise ValueError("softmax_scale must be > 0.")
-
-    def __init__(self, config: Config) -> None:
-        super().__init__()
-        self.index_topk = config.index_topk
-        self.softmax_scale = config.softmax_scale
-
-    def forward(
-        self,
-        q_QNH: torch.Tensor,
-        k_KH: torch.Tensor,
-        weights_QN: torch.Tensor,
-        attention_mask_QK: torch.Tensor,
-    ) -> torch.Tensor:
-        if q_QNH.ndim != 3 or k_KH.ndim != 2:
-            raise ValueError("DSA indexer q and k must have rank 3 and 2.")
-        Q, N, H = q_QNH.shape
-        K = k_KH.shape[0]
-        if k_KH.shape != (K, H):
-            raise ValueError("DSA indexer k must have shape [K, H].")
-        if weights_QN.shape != (Q, N):
-            raise ValueError("DSA indexer weights must have shape [Q, N].")
-        if attention_mask_QK.shape != (Q, K):
-            raise ValueError("DSA indexer attention mask must have shape [Q, K].")
-        # [Q,N,H] x [H,K] -> [N,Q,K]. Index scores intentionally use FP32:
-        # the K/K+1 boundary can change under a single low-precision ULP.
-        scores_NQK = torch.matmul(
-            q_QNH.float().transpose(0, 1), k_KH.float().transpose(0, 1)
-        ) * self.softmax_scale
-        scores_NQK = F.relu(scores_NQK)
-        # Each query predicts N mixing weights, producing one global-key score
-        # after the weighted reduction over indexer heads.
-        index_scores_QK = torch.matmul(
-            weights_QN.unsqueeze(1), scores_NQK.transpose(0, 1)
-        ).squeeze(1)
-        index_scores_QK = index_scores_QK + attention_mask_QK.float()
-        topk = min(self.index_topk, index_scores_QK.shape[-1])
-        return index_scores_QK.topk(topk, dim=-1).indices.to(torch.int32)
-
-
-class Glm5DsaIndexer(Module):
-    """Frozen pretrained query-to-key selector used by DSA.
-
-    ``hidden_states_TD`` supplies both the shared key and per-head mixing
-    weights. ``q_resid_TR`` reuses MLA's normalized Q LoRA representation so
-    the main attention and indexer observe the same query state. RoPE is
-    applied only to the configured rotary prefix; the remaining features pass
-    through unchanged.
-    """
-    @dataclass(kw_only=True, slots=True)
-    class Config(Module.Config):
-        dim: int
-        q_lora_rank: int
-        n_heads: int
-        head_dim: int
-        qk_rope_head_dim: int
-        index_topk: int
-        wq_b: Linear.Config
-        wk: Linear.Config
-        k_norm: LayerNorm.Config
-        weights_proj: Linear.Config
-        rope: ComplexRoPE.Config
-        topk: DSAIndexerTopK.Config
-
-        def __post_init__(self) -> None:
-            if self.q_lora_rank <= 0:
-                raise ValueError("GLM-5 DSA requires q_lora_rank > 0.")
-            if self.head_dim < self.qk_rope_head_dim:
-                raise ValueError("index_head_dim must be >= qk_rope_head_dim.")
-            if self.qk_rope_head_dim % 2 != 0:
-                raise ValueError("qk_rope_head_dim must be even.")
-            if self.index_topk <= 0:
-                raise ValueError("index_topk must be > 0.")
-            if self.topk.index_topk != self.index_topk:
-                raise ValueError("indexer and topk index_topk must match.")
-            if self.topk.softmax_scale != self.head_dim**-0.5:
-                raise ValueError("topk softmax_scale must equal head_dim**-0.5.")
-
-    def __init__(self, config: Config):
-        super().__init__()
-        self.n_heads = config.n_heads
-        self.head_dim = config.head_dim
-        self.qk_rope_head_dim = config.qk_rope_head_dim
-        self.index_topk = config.index_topk
-        self.softmax_scale = config.head_dim**-0.5
-        self.wq_b = config.wq_b.build()
-        self.wk = config.wk.build()
-        self.k_norm = config.k_norm.build()
-        self.weights_proj = config.weights_proj.build().float()
-        self.rope = config.rope.build()
-        self.topk = config.topk.build()
-        # Released GLM-5 checkpoints contain a pretrained indexer. This model
-        # has no auxiliary indexer objective, so LM training must keep it fixed
-        # and exclude its parameters from optimizer state.
-        self.requires_grad_(False)
-
-    def _apply(self, fn, recurse: bool = True):
-        # ``model.to(dtype=...)`` visits frozen modules too. Restore this gate
-        # to FP32 after the generic transform because its boundary decisions
-        # are more sensitive than the surrounding BF16 attention projections.
-        super()._apply(fn, recurse=recurse)
-        self.weights_proj.float()
-        return self
-
-    @torch.no_grad()
-    def forward(
-        self,
-        hidden_states_TD: torch.Tensor,
-        q_resid_TR: torch.Tensor,
-        positions_T: torch.Tensor,
-        attention_mask_TK: torch.Tensor | None,
-    ) -> torch.Tensor:
-        T = hidden_states_TD.shape[0]
-        # Build query and key features in the same indexer space. The key has a
-        # singleton head dimension because every query head searches one shared
-        # global key sequence.
-        q_TNH = self.wq_b(q_resid_TR).view(T, self.n_heads, self.head_dim)
-        q_rot_TNR, q_pass_TNP = torch.split(
-            q_TNH,
-            [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim],
-            dim=-1,
-        )
-        k_T1H = self.k_norm(self.wk(hidden_states_TD)).unsqueeze(1)
-        k_rot_T1R, k_pass_T1P = torch.split(
-            k_T1H,
-            [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim],
-            dim=-1,
-        )
-        q_rot_TNR, k_rot_T1R = self.rope(q_rot_TNR, k_rot_T1R, positions_T)
-        q_TNH = torch.cat((q_rot_TNR, q_pass_TNP), dim=-1)
-        k_TH = torch.cat((k_rot_T1R, k_pass_T1P), dim=-1).squeeze(1)
-
-        # The learned per-token head weights turn N head-specific similarities
-        # into the scalar [T,T] ranking consumed by top-k.
-        weights_TN = self.weights_proj(
-            hidden_states_TD.to(self.weights_proj.weight.dtype)
-        ).float() * (self.n_heads**-0.5)
-        if attention_mask_TK is None:
-            attention_mask_TK = _create_dense_dsa_mask(
-                positions_T, dtype=torch.float32
-            )[0]
-        return self.topk(q_TNH, k_TH, weights_TN, attention_mask_TK)
-
-
-class DSAInnerAttention(Module):
-    """Dense reference implementation of GLM-5 DSA attention.
-
-    Keeping score computation behind an inner-attention boundary makes the
-    configured module real (rather than dead metadata) and gives distributed
-    backends one well-defined kernel boundary for TP and CP support.
-    """
-
-    @dataclass(kw_only=True, slots=True)
-    class Config(Module.Config):
-        attention_dropout: float = 0.0
-
-        def __post_init__(self) -> None:
-            if not 0.0 <= self.attention_dropout < 1.0:
-                raise ValueError("attention_dropout must be in [0, 1).")
-
-    def __init__(self, config: Config) -> None:
-        super().__init__()
-        self.attention_dropout = config.attention_dropout
-
-    def forward(
-        self,
-        q_QNH: torch.Tensor,
-        k_KNH: torch.Tensor,
-        v_KNV: torch.Tensor,
-        attention_masks_1QK: torch.Tensor,
-        topk_indices_QS: torch.Tensor,
-        *,
-        scale: float,
-    ) -> torch.Tensor:
-        if q_QNH.ndim != 3 or k_KNH.ndim != 3 or v_KNV.ndim != 3:
-            raise ValueError("GLM-5 DSA q, k, and v must have rank 3.")
-        Q, N, H = q_QNH.shape
-        K = k_KNH.shape[0]
-        if k_KNH.shape != (K, N, H):
-            raise ValueError("GLM-5 DSA k must have shape [K, N, H].")
-        if v_KNV.shape[:2] != (K, N):
-            raise ValueError("GLM-5 DSA v must have shape [K, N, V].")
-        if topk_indices_QS.shape[0] != Q:
-            raise ValueError("GLM-5 DSA top-k indices must have shape [Q, S].")
-        if attention_masks_1QK.layout != torch.strided:
-            raise ValueError("GLM-5 DSA requires dense attention_masks.")
-        if attention_masks_1QK.shape != (1, Q, K):
-            raise ValueError("attention_masks must have shape [1, Q, K].")
-        if attention_masks_1QK.device != q_QNH.device:
-            raise ValueError("attention_masks must be on the same device as q.")
-        if not attention_masks_1QK.is_floating_point():
-            raise ValueError("attention_masks must use a floating additive dtype.")
-
-        # Materialize the reference sparse pattern as a dense boolean mask.
-        # This preserves DSA mathematics and makes the kernel boundary explicit,
-        # but it does not avoid the dense QK matmul. Optimized sparse gather and
-        # fused kernels can replace this module without changing its contract.
-        selected_QK = torch.zeros_like(
-            attention_masks_1QK[0], dtype=torch.bool
-        ).scatter(-1, topk_indices_QS.long(), True)
-        sparse_mask_1QK = attention_masks_1QK.masked_fill(
-            ~selected_QK.unsqueeze(0), torch.finfo(q_QNH.dtype).min
-        )
-        # [Q,N,H] and [K,N,H] -> [N,Q,K]. Only selected causal entries survive
-        # the additive mask. Softmax accumulates in FP32 for numerical stability.
-        scores_NQK = torch.matmul(
-            q_QNH.transpose(0, 1), k_KNH.transpose(0, 1).transpose(-1, -2)
-        ) * scale
-        scores_NQK = scores_NQK + sparse_mask_1QK
-        probs_NQK = F.softmax(scores_NQK, dim=-1, dtype=torch.float32).to(
-            q_QNH.dtype
-        )
-        probs_NQK = F.dropout(
-            probs_NQK, p=self.attention_dropout, training=self.training
-        )
-        return torch.matmul(probs_NQK, v_KNV.transpose(0, 1)).transpose(0, 1)
 
 
 class Glm5Attention(BaseAttention):
@@ -309,8 +48,8 @@ class Glm5Attention(BaseAttention):
     Q follows ``D -> q_lora_rank -> N * (nope + rope)``. KV follows
     ``D -> (kv_lora_rank + rope)`` and expands only after the low-rank norm.
     The indexer consumes the same token states and returns ``[T, topk]`` key
-    indices. ``inner_attention`` is the replaceable boundary between model
-    mathematics and a dense or genuinely sparse device implementation.
+    indices. ``inner_attention`` applies token-selected sparse attention to
+    the expanded Q/K/V tensors.
     """
     @dataclass(kw_only=True, slots=True)
     class Config(BaseAttention.Config):
@@ -329,71 +68,12 @@ class Glm5Attention(BaseAttention):
         wo: Linear.Config
         rope: ComplexRoPE.Config
         indexer: Glm5DsaIndexer.Config
-        inner_attention: DSAInnerAttention.Config
+        inner_attention: Module.Config
 
         @property
         def qk_head_dim(self) -> int:
             return self.qk_nope_head_dim + self.qk_rope_head_dim
 
-        def __post_init__(self) -> None:
-            if self.q_lora_rank <= 0:
-                raise ValueError("GLM-5 MLA requires q_lora_rank > 0.")
-            if self.kv_lora_rank <= 0:
-                raise ValueError("GLM-5 MLA requires kv_lora_rank > 0.")
-            if self.qk_nope_head_dim <= 0:
-                raise ValueError("GLM-5 MLA requires qk_nope_head_dim > 0.")
-            if self.qk_rope_head_dim <= 0:
-                raise ValueError("GLM-5 MLA requires qk_rope_head_dim > 0.")
-            if self.qk_rope_head_dim % 2 != 0:
-                raise ValueError("GLM-5 MLA requires an even qk_rope_head_dim.")
-            if self.qk_head_dim <= 0:
-                raise ValueError("GLM-5 MLA requires qk_head_dim > 0.")
-            if self.v_head_dim <= 0:
-                raise ValueError("GLM-5 MLA requires v_head_dim > 0.")
-            if self.n_heads <= 0:
-                raise ValueError("GLM-5 MLA requires n_heads > 0.")
-            if (
-                self.wq_a.in_features != self.dim
-                or self.wq_a.out_features != self.q_lora_rank
-            ):
-                raise ValueError("wq_a must project dim to q_lora_rank.")
-            if self.q_norm.normalized_shape != self.q_lora_rank:
-                raise ValueError("q_norm normalized_shape must equal q_lora_rank.")
-            if (
-                self.wq_b.in_features != self.q_lora_rank
-                or self.wq_b.out_features != self.n_heads * self.qk_head_dim
-            ):
-                raise ValueError("wq_b must project q_lora_rank to all query heads.")
-            if (
-                self.wkv_a.in_features != self.dim
-                or self.wkv_a.out_features != self.kv_lora_rank + self.qk_rope_head_dim
-            ):
-                raise ValueError(
-                    "wkv_a must project dim to compressed KV and RoPE key."
-                )
-            if self.kv_norm.normalized_shape != self.kv_lora_rank:
-                raise ValueError("kv_norm normalized_shape must equal kv_lora_rank.")
-            if (
-                self.wkv_b.in_features != self.kv_lora_rank
-                or self.wkv_b.out_features
-                != self.n_heads * (self.qk_nope_head_dim + self.v_head_dim)
-            ):
-                raise ValueError("wkv_b must project compressed KV to all KV heads.")
-            if (
-                self.wo.in_features != self.n_heads * self.v_head_dim
-                or self.wo.out_features != self.dim
-            ):
-                raise ValueError("wo must project all value heads to dim.")
-            if self.rope.dim != self.qk_rope_head_dim:
-                raise ValueError("rope dim must equal qk_rope_head_dim.")
-            if (
-                self.indexer.dim != self.dim
-                or self.indexer.q_lora_rank != self.q_lora_rank
-                or self.indexer.qk_rope_head_dim != self.qk_rope_head_dim
-            ):
-                raise ValueError(
-                    "indexer shared dimensions must match GLM-5 MLA dimensions."
-                )
 
     def __init__(self, config: Config):
         super().__init__()
@@ -423,30 +103,14 @@ class Glm5Attention(BaseAttention):
         self,
         x_TD: torch.Tensor,
         attention_masks: torch.Tensor,
-        positions_T: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        if not isinstance(attention_masks, torch.Tensor):
-            raise ValueError("GLM-5 DSA requires dense attention_masks.")
-
+        positions: torch.Tensor | None = None,
+        topk_indices_TS: torch.Tensor | None = None,
+        *,
+        return_indices: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         T = x_TD.shape[0]
-        if attention_masks.layout != torch.strided:
-            raise ValueError("GLM-5 DSA requires dense attention_masks.")
-        if (
-            attention_masks.ndim != 3
-            or attention_masks.shape[0] != 1
-            or attention_masks.shape[1] != T
-            or attention_masks.shape[2] < T
-        ):
-            raise ValueError(
-                "attention_masks must have shape [1, query_len, key_len] with "
-                "key_len >= query_len."
-            )
-        if attention_masks.device != x_TD.device:
-            raise ValueError("attention_masks must be on the same device as x_TD.")
-        if not attention_masks.is_floating_point():
-            raise ValueError("attention_masks must use a floating additive dtype.")
-        if positions_T is None:
-            positions_T = torch.arange(T, device=x_TD.device)
+        if positions is None:
+            positions = torch.arange(T, device=x_TD.device)
 
         # Query path: compress to LoRA rank R, normalize, then expand to N
         # heads. Split content (NoPE) from position-sensitive (RoPE) features.
@@ -466,7 +130,7 @@ class Glm5Attention(BaseAttention):
         )
         kv_TR = self.kv_norm(kv_TR)
         q_rope_TNR, k_rope_T1R = self.rope(
-            q_rope_TNR, k_rope_TR.unsqueeze(1), positions_T
+            q_rope_TNR, k_rope_TR.unsqueeze(1), positions
         )
         q_TNH = torch.cat((q_nope_TNP, q_rope_TNR), dim=-1)
         kv_TNX = self.wkv_b(kv_TR).view(
@@ -481,21 +145,21 @@ class Glm5Attention(BaseAttention):
         )
         # Selection and value computation are separate on purpose: the indexer
         # is frozen and discrete, while the attention path remains trainable.
-        topk_indices_TS = self.indexer(
-            x_TD,
-            q_resid_TR,
-            positions_T,
-            attention_masks[0],
-        )
+        if topk_indices_TS is None:
+            topk_indices_TS = self.indexer(
+                x_TD, q_resid_TR, positions, attention_masks[0]
+            )
         output_TNV = self.inner_attention(
             q_TNH,
             k_TNH,
             v_TNV,
+            # local_map's input placements follow positional tensor arguments.
             attention_masks,
             topk_indices_TS,
             scale=self.softmax_scale,
         )
-        return self.wo(output_TNV.contiguous().view(T, -1))
+        output_TD = self.wo(output_TNV.contiguous().view(T, -1))
+        return (output_TD, topk_indices_TS) if return_indices else output_TD
 
 
 class Glm5TransformerBlock(TransformerBlock):
@@ -523,23 +187,32 @@ class Glm5TransformerBlock(TransformerBlock):
         x_TD: torch.Tensor,
         attention_masks: torch.Tensor,
         positions: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        # Pre-norm residual block. Dense and MoE FFNs share the same residual
-        # contract, so pipeline and activation-checkpoint code need not special
-        # case the layer type.
-        x_TD = x_TD + self.attention(
-            self.attention_norm(x_TD), attention_masks, positions
-        )
+        topk_indices_TS: torch.Tensor | None = None,
+        *,
+        return_indices: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if return_indices:
+            attention_TD, topk_indices_TS = self.attention(
+                self.attention_norm(x_TD), attention_masks, positions,
+                topk_indices_TS, return_indices=True,
+            )
+        else:
+            attention_TD = self.attention(
+                self.attention_norm(x_TD), attention_masks, positions,
+                topk_indices_TS,
+            )
+        x_TD = x_TD + attention_TD
         normalized_TD = self.ffn_norm(x_TD)
         if self.moe_enabled:
             ffn_output_TD = self.moe(normalized_TD)
         else:
             ffn_output_TD = self.feed_forward(normalized_TD)
-        return x_TD + ffn_output_TD
+        output_TD = x_TD + ffn_output_TD
+        return (output_TD, topk_indices_TS) if return_indices else output_TD
 
 
 class Glm5Model(Decoder):
-    """GLM-5 decoder with dense reference DSA attention.
+    """GLM-5 decoder with FlexAttention DSA attention.
 
     The inherited decoder accepts token ids on the first PP stage and hidden
     states on later stages. A PP stage may own zero decoder layers, which is why
@@ -550,6 +223,7 @@ class Glm5Model(Decoder):
     class Config(Decoder.Config):
         dim: int = 6144
         vocab_size: int = 154880
+        index_sources: tuple[int, ...] = ()
 
         def update_from_config(self, *, config, **kwargs) -> None:
             # This import is deliberately local: the sharding module pulls in
@@ -637,7 +311,17 @@ class Glm5Model(Decoder):
             token_dtype = self.tok_embeddings.weight.dtype
         else:
             token_dtype = next(iter(self.layers.values())).attention_norm.weight.dtype
-        return _create_dense_dsa_mask(positions, dtype=token_dtype)
+        return create_dsa_causal_mask(positions, dtype=token_dtype)
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.index_sources = config.index_sources
+        if self.index_sources:
+            if len(self.index_sources) != len(config.layers):
+                raise ValueError("index_sources must contain one source per layer")
+            for layer, source in enumerate(self.index_sources):
+                if not 0 <= source <= layer or self.index_sources[source] != source:
+                    raise ValueError("index source must be a current/earlier producer layer")
 
     def forward(
         self,
@@ -649,4 +333,22 @@ class Glm5Model(Decoder):
             positions = torch.arange(tokens.shape[0], device=tokens.device)
         if attention_masks is None:
             attention_masks = self.get_attention_masks(positions)
-        return super().forward(tokens, positions, attention_masks)
+        if not self.index_sources:
+            return super().forward(tokens, positions, attention_masks)
+        hidden_TD = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
+        indices_by_source = {}
+        for name, layer in self.layers.items():
+            layer_id = int(name)
+            source = self.index_sources[layer_id]
+            if source != layer_id and source not in indices_by_source:
+                raise NotImplementedError("cross-stage DSA index sharing is not implemented")
+            hidden_TD, indices_TS = layer(
+                hidden_TD, attention_masks, positions,
+                indices_by_source.get(source), return_indices=True,
+            )
+            if source == layer_id:
+                indices_by_source[source] = indices_TS
+        hidden_TD = self.norm(hidden_TD) if self.norm is not None else hidden_TD
+        if self._skip_lm_head or self.lm_head is None:
+            return hidden_TD
+        return self.lm_head(hidden_TD)
