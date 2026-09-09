@@ -30,6 +30,13 @@ For the repository launcher, request exactly one process/device:
 NGPU=1 MODULE=glm5 CONFIG=glm5_debugmodel ./run_train.sh
 ```
 
+The shared-index DSA debug configuration reuses one Top-K selection across
+each adjacent pair of layers:
+
+```bash
+NGPU=1 MODULE=glm5 CONFIG=glm5_shared_dsa_debugmodel ./run_train.sh
+```
+
 Data-parallel runs over 8 GPUs use the same launcher with the parallelism
 degrees set explicitly:
 

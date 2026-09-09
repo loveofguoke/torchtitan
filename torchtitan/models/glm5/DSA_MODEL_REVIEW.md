@@ -7,7 +7,7 @@
 - `glm5_configs["debugmodel"]()`：默认使用 Glm5FlexAttention；旧 dense attention 实现已删除。
 - `glm5_configs["dsa_debugmodel"]()`：直接复用 debugmodel 工厂，不重复替换 inner attention。
 - `glm5_configs["shared_dsa_debugmodel"]()`：相同稀疏计算，index_sources=(0,0,2,2,4,4,6,6)。
-- 这些是模型配置工厂，本轮不新增 Trainer CLI 配置。先审阅，不代表现有多卡入口已经适配。
+- Trainer 通过 `--config glm5_shared_dsa_debugmodel` 选择共享索引模型。该入口用于正式 smoke 验证，不代表尚未执行的多卡拓扑已经通过。
 
 ## 数学与代码阅读顺序
 

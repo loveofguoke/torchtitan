@@ -24,9 +24,8 @@ from torchtitan.trainer import Trainer
 from . import model_registry
 
 
-def glm5_debugmodel() -> Trainer.Config:
-    """Short, local-assets configuration for the GLM-5 model."""
-    model_spec = model_registry("debugmodel")
+def _glm5_debugmodel(flavor: str) -> Trainer.Config:
+    model_spec = model_registry(flavor)
     return Trainer.Config(
         loss=ChunkedLossWrapper.Config(
             loss_fn=CrossEntropyLoss.Config(
@@ -68,3 +67,13 @@ def glm5_debugmodel() -> Trainer.Config:
         ),
         activation_checkpoint=None,
     )
+
+
+def glm5_debugmodel() -> Trainer.Config:
+    """Short, local-assets configuration for independent DSA indexers."""
+    return _glm5_debugmodel("debugmodel")
+
+
+def glm5_shared_dsa_debugmodel() -> Trainer.Config:
+    """Short configuration that reuses DSA indices across adjacent layers."""
+    return _glm5_debugmodel("shared_dsa_debugmodel")

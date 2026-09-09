@@ -368,6 +368,31 @@ class TestConfigManager(unittest.TestCase):
         assert config.model_spec.name == "glm5"
         assert config.model_spec.flavor == "debugmodel"
 
+    def test_glm5_shared_dsa_config(self):
+        """Test that the shared-index DSA trainer configuration is registered."""
+        config_manager = ConfigManager()
+        config = config_manager.parse_args(
+            [
+                "--module",
+                "glm5",
+                "--config",
+                "glm5_shared_dsa_debugmodel",
+            ]
+        )
+
+        assert config.model_spec.name == "glm5"
+        assert config.model_spec.flavor == "shared_dsa_debugmodel"
+        assert config.model_spec.model.index_sources == (
+            0,
+            0,
+            2,
+            2,
+            4,
+            4,
+            6,
+            6,
+        )
+
     def test_fqn_module_with_config_registry(self):
         """--module torchtitan.models.llama3.config_registry works."""
         config_manager = ConfigManager()
