@@ -96,11 +96,19 @@ def apply_glm5_cp_to_forward(model: Glm5Model, cp_mesh: DeviceMesh) -> None:
     @wraps(original_model_forward)
     def cp_model_forward(
         tokens,
+        pipeline_indices_TS=None,
         positions=None,
         attention_masks=None,
         *,
         _forward=original_model_forward,
     ):
+        # Preserve Decoder's positional ``model(tokens, positions)`` API while
+        # allowing PP to pass [T, S] shared DSA indices as its second payload.
+        if pipeline_indices_TS is not None and pipeline_indices_TS.ndim == 1:
+            if positions is not None:
+                raise ValueError("positions were provided twice")
+            positions = pipeline_indices_TS
+            pipeline_indices_TS = None
         if positions is None:
             raise ValueError("GLM-5 Context Parallel requires explicit positions.")
         # PP may leave this rank with an embedding-only or output-only stage.
@@ -121,7 +129,12 @@ def apply_glm5_cp_to_forward(model: Glm5Model, cp_mesh: DeviceMesh) -> None:
             attention_masks = global_mask[
                 :, query_start : query_start + local_query_len, :
             ]
-        return _forward(tokens, positions, attention_masks)
+        return _forward(
+            tokens,
+            pipeline_indices_TS,
+            positions=positions,
+            attention_masks=attention_masks,
+        )
 
     model.forward = cp_model_forward
 

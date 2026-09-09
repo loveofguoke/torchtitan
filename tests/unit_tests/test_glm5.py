@@ -615,10 +615,20 @@ class TestGlm5Attention(unittest.TestCase):
 
 
 class TestGlm5Model(unittest.TestCase):
-    def test_forward_signature_matches_decoder_contract(self):
+    def test_forward_signature_extends_decoder_for_pipeline_indices(self):
         self.assertEqual(
             tuple(inspect.signature(Glm5Model.forward).parameters),
+            (
+                "self",
+                "tokens",
+                "pipeline_indices_TS",
+                "positions",
+                "attention_masks",
+            ),
+        )
+        self.assertEqual(
             tuple(inspect.signature(Decoder.forward).parameters),
+            ("self", "tokens", "positions", "attention_masks"),
         )
 
     def test_layer_builder_rejects_infeasible_grouped_routing(self):
@@ -1221,7 +1231,14 @@ class TestGlm5ContextParallel(unittest.TestCase):
     def test_cp_wrapper_skips_collectives_for_output_only_pp_stage(self):
         observed = {}
 
-        def model_forward(tokens, positions, attention_masks):
+        def model_forward(
+            tokens,
+            pipeline_indices,
+            *,
+            positions,
+            attention_masks,
+        ):
+            observed["pipeline_indices"] = pipeline_indices
             observed["positions"] = positions
             observed["attention_masks"] = attention_masks
             return tokens
@@ -1250,6 +1267,7 @@ class TestGlm5ContextParallel(unittest.TestCase):
             output = model.forward(tokens_BLD, positions_BL)
 
         self.assertIs(output, tokens_BLD)
+        self.assertIsNone(observed["pipeline_indices"])
         self.assertIs(observed["positions"], positions_BL)
         self.assertIsNone(observed["attention_masks"])
         get_attention_masks.assert_not_called()
@@ -1259,7 +1277,14 @@ class TestGlm5ContextParallel(unittest.TestCase):
         attention = _attention_config().build()
         observed = {}
 
-        def model_forward(tokens, positions, attention_masks):
+        def model_forward(
+            tokens,
+            pipeline_indices,
+            *,
+            positions,
+            attention_masks,
+        ):
+            observed["pipeline_indices"] = pipeline_indices
             observed["model_positions"] = positions
             observed["attention_masks"] = attention_masks
             return tokens
@@ -1341,6 +1366,7 @@ class TestGlm5ContextParallel(unittest.TestCase):
             torch.equal(observed["global_positions"], torch.tensor([2, 3, 12, 13]))
         )
         self.assertIs(observed["model_positions"], local_positions)
+        self.assertIsNone(observed["pipeline_indices"])
         self.assertTrue(
             torch.equal(
                 observed["attention_masks"],
@@ -1351,6 +1377,42 @@ class TestGlm5ContextParallel(unittest.TestCase):
         self.assertTrue(torch.equal(observed["indexer_k"][2:], k_BKH + 10))
         self.assertEqual(observed["attention_k"].shape[0], 4)
         self.assertEqual(observed["attention_v"].shape[0], 4)
+
+    def test_cp_wrapper_forwards_pipeline_indices(self):
+        observed = {}
+
+        def model_forward(
+            tokens,
+            pipeline_indices,
+            *,
+            positions,
+            attention_masks,
+        ):
+            observed["pipeline_indices"] = pipeline_indices
+            return tokens
+
+        model = SimpleNamespace(
+            layers={},
+            forward=model_forward,
+            get_attention_masks=mock.Mock(),
+        )
+        cp_mesh = mock.Mock()
+        cp_mesh.get_group.return_value = object()
+
+        with mock.patch(
+            "torchtitan.models.glm5.parallelize.dist._get_process_group_name",
+            return_value="cp_group",
+        ):
+            apply_glm5_cp_to_forward(model, cp_mesh)
+            indices_TS = torch.arange(8, dtype=torch.int32).reshape(4, 2)
+            output = model.forward(
+                torch.zeros(4, 8),
+                indices_TS,
+                positions=torch.arange(4),
+            )
+
+        self.assertEqual(output.shape, (4, 8))
+        self.assertIs(observed["pipeline_indices"], indices_TS)
 
 
 class TestGlm5StateDictAdapter(unittest.TestCase):

@@ -29,7 +29,7 @@
 为保留现有 checkpoint 参数结构，本轮保留共享层的冻结 indexer 参数，但不执行它。
 这不是最终 PR 的共享层权重裁剪方案；adapter 和 FLOPs 统计需要在后续配套阶段处理。
 跨 PP stage 时，生产 stage 将 `(hidden_TD, topk_indices_TS)` 作为流水线输出，消费
-stage 通过第二个位置参数接收索引。索引为离散 `int64` 元数据，不参与反向传播；不得
+stage 通过第二个位置参数接收索引。索引为离散整数元数据，不参与反向传播；不得
 用消费层重新计算代替来源层索引，否则会改变模型选择的稀疏注意力边。
 未实现 indexer 辅助训练目标，不可宣称从随机初始化完整训练 indexer。
 
@@ -60,9 +60,18 @@ model.py 保留展开式 MLA、block、跨层传递，以及旧名字的兼容�
 - SP：attention 输入恢复 TP 复制，输出投影恢复 token 分片；共享索引不跟随 hidden states 在 TP 上切分。
 - CP：连续 token 分片；indexer gather 全局 key，attention 使用带反向传播的 K/V gather。mask 是本地 query × 全局 key，top-k 值保持全局 key 编号。不是 ring attention，也未减少 K/V gather 通信量。
 - EP：沿用公共 MoE dispatcher、专家布局与 FSDP 包装；DSA 索引不是 MoE 专家路由，不加入 EP token dispatch。
-- PP：独立 indexer 的层沿用原阶段接口；共享组必须完整保留在同一 stage。跨 stage 共享尚不支持。
+- PP：若共享组跨 stage，producer 输出 `(hidden, indices)`，后续 stage 通过
+  PipelineStage P2P 传递该整数元数据；只有 hidden state 参与反向传播。
 - DP/FSDP：沿用公共参数分片；索引只在本次 forward 中存活，不注册为 buffer 或 checkpoint 状态。
+
+组合拓扑中的共享索引 placement 由产生它的 query token 决定：在 TP 轴上为
+`Replicate()`，在 CP 轴上为 `Shard(0)`，在 DP/FSDP/HSDP replica 内随对应 batch
+副本自然复制，EP 不改变它。PP 只在保持相同 TP/CP/DP 坐标的相邻 stage 间传输，
+因此 `PP+TP` 传递每个 TP rank 上相同的索引副本，`PP+CP` 传递对应 CP rank 的本地
+query 索引分片，`PP+TP+CP` 同时保持这两个 placement。
 
 local_map 输入 placement 按位置对应，因此内部调用保留五个位置张量参数（Q/K/V/mask/indices），scale 使用关键字。公共参数名仍是 attention_masks。
 
-新增测试覆盖 CP 本地 query/全局 key 的 mask 语义和 PP 共享组边界；本地无 torch，未执行这些测试。仍需 GPU 单卡、TP、CP、TP+CP、EP、TP+EP、PP 和 FSDP 组合的前后向验证，不能据此宣称所有拓扑已跑通。
+新增测试覆盖 CP 本地 query/全局 key 的 mask 语义、PP 跨 stage payload 和 CP wrapper
+对该 payload 的透传。GPU `pp8` 已完成两步前后向；其他组合仍需逐项完成设备验证，
+不能由单一拓扑结果推断全部通过。
