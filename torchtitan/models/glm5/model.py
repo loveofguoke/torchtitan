@@ -326,29 +326,59 @@ class Glm5Model(Decoder):
     def forward(
         self,
         tokens: torch.Tensor,
+        pipeline_indices_TS: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,
         attention_masks: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # Preserve Decoder's positional ``model(tokens, positions)`` API. PP
+        # metadata is [T, S], while GLM positions are required to be [T].
+        if pipeline_indices_TS is not None and pipeline_indices_TS.ndim == 1:
+            if positions is not None:
+                raise ValueError("positions were provided twice")
+            positions = pipeline_indices_TS
+            pipeline_indices_TS = None
         if positions is None:
             positions = torch.arange(tokens.shape[0], device=tokens.device)
         if attention_masks is None:
             attention_masks = self.get_attention_masks(positions)
         if not self.index_sources:
             return super().forward(tokens, positions, attention_masks)
-        hidden_TD = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
-        indices_by_source = {}
+        hidden_TD = (
+            self.tok_embeddings(tokens)
+            if self.tok_embeddings is not None
+            else tokens
+        )
+        local_layers = {int(name) for name in self.layers}
+        external_sources = {
+            self.index_sources[layer]
+            for layer in local_layers
+            if self.index_sources[layer] not in local_layers
+        }
+        indices_by_source: dict[int, torch.Tensor] = {}
+        if external_sources:
+            if pipeline_indices_TS is None:
+                raise ValueError("this GLM-5 PP stage requires DSA indices")
+            source = next(iter(external_sources))
+            indices_by_source[source] = pipeline_indices_TS
         for name, layer in self.layers.items():
             layer_id = int(name)
             source = self.index_sources[layer_id]
-            if source != layer_id and source not in indices_by_source:
-                raise NotImplementedError("cross-stage DSA index sharing is not implemented")
             hidden_TD, indices_TS = layer(
-                hidden_TD, attention_masks, positions,
-                indices_by_source.get(source), return_indices=True,
+                hidden_TD,
+                attention_masks,
+                positions,
+                indices_by_source.get(source),
+                return_indices=True,
             )
             if source == layer_id:
                 indices_by_source[source] = indices_TS
         hidden_TD = self.norm(hidden_TD) if self.norm is not None else hidden_TD
         if self._skip_lm_head or self.lm_head is None:
+            if local_layers:
+                next_layer = max(local_layers) + 1
+                if next_layer < len(self.index_sources):
+                    source = self.index_sources[next_layer]
+                    if source != next_layer:
+                        return hidden_TD, indices_by_source[source]
             return hidden_TD
         return self.lm_head(hidden_TD)

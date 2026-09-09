@@ -3,8 +3,14 @@
 
 import pytest
 import torch
+import torch.nn as nn
 from types import SimpleNamespace
 
+from torchtitan.distributed.pipeline_parallel import (
+    _generate_llm_fqn_per_model_part,
+    _split_module,
+)
+from torchtitan.models.glm5 import glm5_configs
 from torchtitan.models.glm5.dsa import build_dsa_block_mask, Glm5FlexAttention
 from torchtitan.models.glm5.parallelize import validate_glm5_index_sharing
 
@@ -14,10 +20,61 @@ def test_index_sharing_accepts_stage_local_groups():
     validate_glm5_index_sharing(model)
 
 
-def test_index_sharing_rejects_cross_stage_producer():
+def test_index_sharing_accepts_one_cross_stage_producer():
     model = SimpleNamespace(index_sources=(0, 0, 0, 0), layers={"2": None, "3": None})
-    with pytest.raises(NotImplementedError, match="layer 2.*layer 0"):
+    validate_glm5_index_sharing(model)
+
+
+def test_index_sharing_rejects_multiple_cross_stage_producers():
+    model = SimpleNamespace(index_sources=(0, 0, 2, 2), layers={"1": None, "3": None})
+    with pytest.raises(ValueError, match="only one source layer"):
         validate_glm5_index_sharing(model)
+
+
+def test_pp_stages_forward_shared_indices_across_boundaries():
+    class FakeLayer(nn.Module):
+        def __init__(self, layer_id):
+            super().__init__()
+            self.layer_id = layer_id
+
+        def forward(
+            self,
+            hidden_TD,
+            attention_masks,
+            positions,
+            topk_indices_TS,
+            *,
+            return_indices,
+        ):
+            if topk_indices_TS is None:
+                topk_indices_TS = torch.full(
+                    (hidden_TD.shape[0], 1), self.layer_id, dtype=torch.long
+                )
+            return hidden_TD + self.layer_id, topk_indices_TS
+
+    config = glm5_configs["shared_dsa_debugmodel"]()
+    model = config.build()
+    model.tok_embeddings = None
+    model.norm = None
+    model.lm_head = None
+    model.layers = nn.ModuleDict(
+        {str(layer): FakeLayer(layer) for layer in range(len(config.layers))}
+    )
+    stage_fqns = _generate_llm_fqn_per_model_part(
+        8, len(config.layers), input_weight=1, output_weight=1
+    )
+    stages = [_split_module(model, fqns) for fqns in stage_fqns]
+
+    payload = torch.zeros(4, config.dim)
+    positions = torch.arange(4)
+    for stage in stages:
+        if isinstance(payload, tuple):
+            payload = stage(*payload, positions=positions)
+        else:
+            payload = stage(payload, positions=positions)
+
+    assert isinstance(payload, torch.Tensor)
+    torch.testing.assert_close(payload, torch.full_like(payload, sum(range(8))))
 
 
 def test_cp_mask_uses_global_key_indices_for_local_queries():

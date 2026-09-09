@@ -262,20 +262,16 @@ def parallelize_glm5(
 
 
 def validate_glm5_index_sharing(model: Glm5Model) -> None:
-    """Validate index producers after PP has partitioned decoder layers.
-
-    Shared indices are per-forward metadata, not a persistent cache. PP only
-    transfers hidden states today, so every consumer needs its producer on the
-    same stage. Do not recompute indices from the consumer's hidden states:
-    that would change the model's selected attention edges.
-    """
+    """Validate the shared-index payload required by a PP model chunk."""
     if not model.index_sources:
         return
     local_layers = {int(name) for name in model.layers}
-    for layer in local_layers:
-        source = model.index_sources[layer]
-        if source not in local_layers:
-            raise NotImplementedError(
-                f"DSA layer {layer} needs indices from layer {source} on another "
-                "PP stage; keep each index-sharing group within one stage."
-            )
+    external_sources = {
+        model.index_sources[layer]
+        for layer in local_layers
+        if model.index_sources[layer] not in local_layers
+    }
+    if len(external_sources) > 1:
+        raise ValueError(
+            "a GLM-5 PP stage can receive indices from only one source layer"
+        )

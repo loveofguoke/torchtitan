@@ -28,7 +28,9 @@
 只共享所选位置，各层 Q/K/V 都重新计算。来源必须是自身或更早的 producer。
 为保留现有 checkpoint 参数结构，本轮保留共享层的冻结 indexer 参数，但不执行它。
 这不是最终 PR 的共享层权重裁剪方案；adapter 和 FLOPs 统计需要在后续配套阶段处理。
-跨 PP stage 的索引来源缺失在 parallelize 入口显式拒绝；不得用消费层重新计算代替来源层索引。
+跨 PP stage 时，生产 stage 将 `(hidden_TD, topk_indices_TS)` 作为流水线输出，消费
+stage 通过第二个位置参数接收索引。索引为离散 `int64` 元数据，不参与反向传播；不得
+用消费层重新计算代替来源层索引，否则会改变模型选择的稀疏注意力边。
 未实现 indexer 辅助训练目标，不可宣称从随机初始化完整训练 indexer。
 
 ## 验证

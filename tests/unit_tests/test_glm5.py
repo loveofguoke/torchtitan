@@ -750,6 +750,18 @@ class TestGlm5Model(unittest.TestCase):
 
         self.assertEqual(logits_BLV.shape, (24, 2048))
 
+    def test_shared_dsa_model_preserves_positional_positions(self):
+        config = glm5_configs["shared_dsa_debugmodel"]()
+        model = config.build()
+        model.init_states()
+        tokens_BL = torch.randint(0, config.vocab_size, (16,))
+        positions_BL = torch.arange(16)
+
+        actual = model(tokens_BL, positions_BL)
+        expected = model(tokens_BL, positions=positions_BL)
+
+        torch.testing.assert_close(actual, expected)
+
     def test_debug_model_cpu_forward_loss_backward(self):
         torch.manual_seed(29)
         config = glm5_configs["debugmodel"]()
