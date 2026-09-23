@@ -280,8 +280,9 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
     ) -> tuple[torch.Tensor, list[int], list[int]]:
         """Wait for token counts and materialize CPU split lists.
 
-        Local input splits can copy to CPU non-blocking; remote output splits
-        must be ready before launching the variable-size data all-to-all.
+        Both split tensors must be materialized on CPU before Python reads them.
+        A blocking copy is required here because compiled NPU execution can
+        otherwise read an incomplete asynchronous device-to-host transfer.
         """
         # Need to wait explicitly because it is used by a triton kernel later
         # which doesn't realize that AsyncCollectiveTensor needs unwrapping
@@ -296,7 +297,7 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
         input_splits = (
             num_local_tokens_per_expert_E.view(ep_size, -1)
             .sum(dim=1)
-            .to(torch.device("cpu"), non_blocking=True)
+            .to(torch.device("cpu"), non_blocking=False)
         )
         # NOTE: this would incur a device-to-host sync
         output_splits = (
