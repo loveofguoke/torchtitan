@@ -114,6 +114,7 @@ def make_glm5_attention_config(
     index_head_dim: int,
     index_topk: int,
     attention_dropout: float,
+    mla_norm_eps: float,
     rope: ComplexRoPE.Config,
 ) -> Glm5Attention.Config:
     """Build a fully specified GLM-5 MLA plus DSA attention config.
@@ -135,7 +136,9 @@ def make_glm5_attention_config(
             in_features=dim, out_features=q_lora_rank, param_init=_LINEAR_INIT
         ),
         q_norm=RMSNorm.Config(
-            normalized_shape=q_lora_rank, eps=1e-6, param_init=_RMS_NORM_INIT
+            normalized_shape=q_lora_rank,
+            eps=mla_norm_eps,
+            param_init=_RMS_NORM_INIT,
         ),
         wq_b=Linear.Config(
             in_features=q_lora_rank,
@@ -148,7 +151,9 @@ def make_glm5_attention_config(
             param_init=_LINEAR_INIT,
         ),
         kv_norm=RMSNorm.Config(
-            normalized_shape=kv_lora_rank, eps=1e-6, param_init=_RMS_NORM_INIT
+            normalized_shape=kv_lora_rank,
+            eps=mla_norm_eps,
+            param_init=_RMS_NORM_INIT,
         ),
         wkv_b=Linear.Config(
             in_features=kv_lora_rank,
@@ -221,6 +226,8 @@ def build_glm5_layers(
     index_head_dim: int,
     index_topk: int,
     attention_dropout: float,
+    mla_norm_eps: float = 1e-6,
+    norm_eps: float = 1e-5,
     rope: ComplexRoPE.Config,
 ) -> list[TransformerBlock.Config]:
     """Build GLM-5 dense and MoE block configurations for every layer."""
@@ -259,6 +266,7 @@ def build_glm5_layers(
             index_head_dim=index_head_dim,
             index_topk=index_topk,
             attention_dropout=attention_dropout,
+            mla_norm_eps=mla_norm_eps,
             rope=rope,
         )
         if layer_id < n_dense_layers:
@@ -304,10 +312,10 @@ def build_glm5_layers(
             Glm5TransformerBlock.Config(
                 attention=attention,
                 attention_norm=RMSNorm.Config(
-                    normalized_shape=dim, param_init=_RMS_NORM_INIT
+                    normalized_shape=dim, eps=norm_eps, param_init=_RMS_NORM_INIT
                 ),
                 ffn_norm=RMSNorm.Config(
-                    normalized_shape=dim, param_init=_RMS_NORM_INIT
+                    normalized_shape=dim, eps=norm_eps, param_init=_RMS_NORM_INIT
                 ),
                 feed_forward=feed_forward,
                 moe=moe,
@@ -316,7 +324,11 @@ def build_glm5_layers(
     return layers
 
 
-def _debugmodel() -> Glm5Model.Config:
+def _debugmodel(
+    *,
+    n_dense_layers: int = 1,
+    index_sources: tuple[int, ...] = (),
+) -> Glm5Model.Config:
     dim = 256
     vocab_size = 2048
     rope = ComplexRoPE.Config(
@@ -328,6 +340,7 @@ def _debugmodel() -> Glm5Model.Config:
     return Glm5Model.Config(
         vocab_size=vocab_size,
         dim=dim,
+        index_sources=index_sources,
         tok_embeddings=Embedding.Config(
             num_embeddings=vocab_size,
             embedding_dim=dim,
@@ -341,7 +354,7 @@ def _debugmodel() -> Glm5Model.Config:
         ),
         layers=build_glm5_layers(
             n_layers=8,
-            n_dense_layers=1,
+            n_dense_layers=n_dense_layers,
             dim=dim,
             n_heads=8,
             q_lora_rank=128,
@@ -367,14 +380,169 @@ def _debugmodel() -> Glm5Model.Config:
 
 
 def _shared_dsa_debugmodel() -> Glm5Model.Config:
-    config = _debugmodel()
-    config.index_sources = (0, 0, 2, 2, 4, 4, 6, 6)
-    return config
+    return _debugmodel(index_sources=(0, 0, 2, 2, 4, 4, 6, 6))
+
+
+def _glm5_2_debugmodel() -> Glm5Model.Config:
+    """Build a small model that preserves GLM-5.2 layer-type transitions."""
+    return _debugmodel(
+        n_dense_layers=3,
+        index_sources=(0, 1, 2, 2, 2, 2, 6, 6),
+    )
+
+
+def _glm5_2_scaled_debugmodel() -> Glm5Model.Config:
+    """Build a larger GLM-5.2 validation model with the released structure.
+
+    This flavor is sized for single-device training on the smaller validation
+    accelerator while retaining enough depth for every eight-way topology.
+    Width, vocabulary, and routed-expert count are reduced because one released
+    256-expert MoE layer alone cannot fit the single-device validation contract.
+    """
+    dim = 768
+    vocab_size = 32768
+    num_layers = 16
+    index_sources = tuple(
+        layer_id
+        if layer_id < 3 or (layer_id - 2) % 4 == 0
+        else max(
+            source
+            for source in range(layer_id)
+            if source < 3 or (source - 2) % 4 == 0
+        )
+        for layer_id in range(num_layers)
+    )
+    rope = ComplexRoPE.Config(
+        dim=64,
+        max_context_length=4096,
+        theta=8_000_000,
+        scaling="none",
+    )
+    return Glm5Model.Config(
+        vocab_size=vocab_size,
+        dim=dim,
+        index_sources=index_sources,
+        tok_embeddings=Embedding.Config(
+            num_embeddings=vocab_size,
+            embedding_dim=dim,
+            param_init=_EMBEDDING_INIT,
+        ),
+        norm=RMSNorm.Config(
+            normalized_shape=dim,
+            eps=1e-5,
+            param_init=_RMS_NORM_INIT,
+        ),
+        lm_head=Linear.Config(
+            in_features=dim,
+            out_features=vocab_size,
+            param_init=_output_linear_init(dim),
+        ),
+        layers=build_glm5_layers(
+            n_layers=num_layers,
+            n_dense_layers=3,
+            dim=dim,
+            n_heads=8,
+            q_lora_rank=384,
+            kv_lora_rank=192,
+            qk_nope_head_dim=192,
+            qk_rope_head_dim=64,
+            v_head_dim=256,
+            dense_hidden_dim=1536,
+            moe_hidden_dim=384,
+            num_experts=24,
+            num_shared_experts=1,
+            router_top_k=8,
+            router_num_expert_groups=1,
+            router_num_limited_groups=1,
+            router_route_scale=2.5,
+            index_n_heads=8,
+            index_head_dim=128,
+            index_topk=512,
+            attention_dropout=0.0,
+            mla_norm_eps=1e-5,
+            norm_eps=1e-5,
+            rope=rope,
+        ),
+    )
+
+
+def _glm5_2_744b_a40b() -> Glm5Model.Config:
+    """Build the released GLM-5.2 744B-A40B decoder architecture.
+
+    The values mirror zai-org/GLM-5.2 ``config.json``. TorchTitan currently
+    models the 78-layer language-model decoder and records the released
+    cross-layer index-sharing schedule. The checkpoint's additional MTP layer
+    remains outside this decoder config and is skipped by the state adapter.
+    """
+    dim = 6144
+    vocab_size = 154880
+    num_layers = 78
+    index_sources = tuple(
+        layer_id
+        if max(layer_id - 2, 0) % 4 == 0
+        else max(source for source in range(layer_id) if max(source - 2, 0) % 4 == 0)
+        for layer_id in range(num_layers)
+    )
+    rope = ComplexRoPE.Config(
+        dim=64,
+        max_context_length=1_048_576,
+        theta=8_000_000,
+        scaling="none",
+    )
+    return Glm5Model.Config(
+        vocab_size=vocab_size,
+        dim=dim,
+        index_sources=index_sources,
+        tok_embeddings=Embedding.Config(
+            num_embeddings=vocab_size,
+            embedding_dim=dim,
+            param_init=_EMBEDDING_INIT,
+        ),
+        norm=RMSNorm.Config(
+            normalized_shape=dim,
+            eps=1e-5,
+            param_init=_RMS_NORM_INIT,
+        ),
+        lm_head=Linear.Config(
+            in_features=dim,
+            out_features=vocab_size,
+            param_init=_output_linear_init(dim),
+        ),
+        layers=build_glm5_layers(
+            n_layers=num_layers,
+            n_dense_layers=3,
+            dim=dim,
+            n_heads=64,
+            q_lora_rank=2048,
+            kv_lora_rank=512,
+            qk_nope_head_dim=192,
+            qk_rope_head_dim=64,
+            v_head_dim=256,
+            dense_hidden_dim=12288,
+            moe_hidden_dim=2048,
+            num_experts=256,
+            num_shared_experts=1,
+            router_top_k=8,
+            router_num_expert_groups=1,
+            router_num_limited_groups=1,
+            router_route_scale=2.5,
+            index_n_heads=32,
+            index_head_dim=128,
+            index_topk=2048,
+            attention_dropout=0.0,
+            mla_norm_eps=1e-5,
+            norm_eps=1e-5,
+            rope=rope,
+        ),
+    )
 
 
 glm5_configs = {
+    "744B-A40B": _glm5_2_744b_a40b,
     "debugmodel": _debugmodel,
     "dsa_debugmodel": _debugmodel,
+    "glm5_2_debugmodel": _glm5_2_debugmodel,
+    "glm5_2_scaled_debugmodel": _glm5_2_scaled_debugmodel,
     "shared_dsa_debugmodel": _shared_dsa_debugmodel,
 }
 

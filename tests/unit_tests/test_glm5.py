@@ -28,7 +28,11 @@ from torchtitan.distributed.pipeline_parallel import (
 from torchtitan.models.common import ComplexRoPE, LayerNorm, Linear, RMSNorm
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.glm5 import build_glm5_layers, glm5_configs, Glm5StateDictAdapter
-from torchtitan.models.glm5.config_registry import glm5_debugmodel
+from torchtitan.models.glm5.config_registry import (
+    glm5_2_debugmodel,
+    glm5_2_scaled_debugmodel,
+    glm5_debugmodel,
+)
 from torchtitan.models.glm5.model import (
     DSAIndexerTopK,
     DSAInnerAttention,
@@ -693,6 +697,119 @@ class TestGlm5Model(unittest.TestCase):
                     layer_config.moe.routed_experts.inner_experts.hidden_dim, 256
                 )
                 self.assertEqual(layer_config.moe.shared_experts.w1.out_features, 256)
+
+    def test_glm5_2_744b_a40b_config_matches_released_architecture(self):
+        config = glm5_configs["744B-A40B"]()
+
+        self.assertEqual(config.vocab_size, 154880)
+        self.assertEqual(config.dim, 6144)
+        self.assertEqual(len(config.layers), 78)
+        self.assertEqual(config.max_context_length, 1_048_576)
+        self.assertEqual(config.norm.eps, 1e-5)
+        self.assertEqual(
+            config.index_sources[:11],
+            (0, 1, 2, 2, 2, 2, 6, 6, 6, 6, 10),
+        )
+        self.assertEqual(config.index_sources[-4:], (74, 74, 74, 74))
+
+        attention = config.layers[0].attention
+        self.assertEqual(attention.n_heads, 64)
+        self.assertEqual(attention.q_lora_rank, 2048)
+        self.assertEqual(attention.kv_lora_rank, 512)
+        self.assertEqual(attention.qk_nope_head_dim, 192)
+        self.assertEqual(attention.qk_rope_head_dim, 64)
+        self.assertEqual(attention.v_head_dim, 256)
+        self.assertEqual(attention.q_norm.eps, 1e-5)
+        self.assertEqual(attention.kv_norm.eps, 1e-5)
+        self.assertEqual(attention.indexer.n_heads, 32)
+        self.assertEqual(attention.indexer.head_dim, 128)
+        self.assertEqual(attention.indexer.index_topk, 2048)
+        self.assertEqual(attention.indexer.k_norm.eps, 1e-6)
+        self.assertEqual(attention.rope.theta, 8_000_000)
+
+        for layer_id, layer in enumerate(config.layers):
+            if layer_id < 3:
+                self.assertIsNotNone(layer.feed_forward)
+                self.assertIsNone(layer.moe)
+                self.assertEqual(layer.feed_forward.w1.out_features, 12288)
+            else:
+                self.assertIsNone(layer.feed_forward)
+                self.assertIsNotNone(layer.moe)
+                self.assertEqual(layer.moe.num_experts, 256)
+                self.assertEqual(layer.moe.router.top_k, 8)
+                self.assertEqual(layer.moe.router.route_scale, 2.5)
+                self.assertEqual(
+                    layer.moe.routed_experts.inner_experts.hidden_dim,
+                    2048,
+                )
+
+    def test_glm5_2_debugmodel_preserves_released_layer_patterns(self):
+        config = glm5_configs["glm5_2_debugmodel"]()
+
+        self.assertEqual(len(config.layers), 8)
+        self.assertEqual(config.index_sources, (0, 1, 2, 2, 2, 2, 6, 6))
+        for layer_id, layer in enumerate(config.layers):
+            if layer_id < 3:
+                self.assertIsNotNone(layer.feed_forward)
+                self.assertIsNone(layer.moe)
+            else:
+                self.assertIsNone(layer.feed_forward)
+                self.assertIsNotNone(layer.moe)
+
+        trainer_config = glm5_2_debugmodel()
+        self.assertEqual(trainer_config.model_spec.flavor, "glm5_2_debugmodel")
+
+    def test_glm5_2_scaled_debugmodel_preserves_validation_contract(self):
+        config = glm5_configs["glm5_2_scaled_debugmodel"]()
+
+        self.assertEqual(config.vocab_size, 32768)
+        self.assertEqual(config.dim, 768)
+        self.assertEqual(len(config.layers), 16)
+        self.assertEqual(config.max_context_length, 4096)
+        self.assertEqual(
+            config.index_sources,
+            (0, 1, 2, 2, 2, 2, 6, 6, 6, 6, 10, 10, 10, 10, 14, 14),
+        )
+
+        attention = config.layers[0].attention
+        self.assertEqual(attention.n_heads, 8)
+        self.assertEqual(attention.q_lora_rank, 384)
+        self.assertEqual(attention.kv_lora_rank, 192)
+        self.assertEqual(attention.qk_nope_head_dim, 192)
+        self.assertEqual(attention.qk_rope_head_dim, 64)
+        self.assertEqual(attention.v_head_dim, 256)
+        self.assertEqual(attention.indexer.n_heads, 8)
+        self.assertEqual(attention.indexer.head_dim, 128)
+        self.assertEqual(attention.indexer.index_topk, 512)
+        self.assertEqual(attention.rope.theta, 8_000_000)
+
+        for layer_id, layer in enumerate(config.layers):
+            if layer_id < 3:
+                self.assertIsNotNone(layer.feed_forward)
+                self.assertIsNone(layer.moe)
+                self.assertEqual(layer.feed_forward.w1.out_features, 1536)
+            else:
+                self.assertIsNone(layer.feed_forward)
+                self.assertIsNotNone(layer.moe)
+                self.assertEqual(layer.moe.num_experts, 24)
+                self.assertEqual(layer.moe.router.top_k, 8)
+                self.assertEqual(
+                    layer.moe.routed_experts.inner_experts.hidden_dim,
+                    384,
+                )
+
+        trainer_config = glm5_2_scaled_debugmodel()
+        self.assertEqual(
+            trainer_config.model_spec.flavor,
+            "glm5_2_scaled_debugmodel",
+        )
+
+        with torch.device("meta"):
+            model = config.build()
+        num_parameters = sum(parameter.numel() for parameter in model.parameters())
+        self.assertGreater(num_parameters, 400_000_000)
+        self.assertLess(num_parameters, 450_000_000)
+        self.assertLess(num_parameters * 4, 2 * 1024**3)
 
     def test_dense_mask_enforces_causality_and_document_boundaries(self):
         model = _build_debug_model()

@@ -77,3 +77,13 @@ def glm5_debugmodel() -> Trainer.Config:
 def glm5_shared_dsa_debugmodel() -> Trainer.Config:
     """Short configuration that reuses DSA indices across adjacent layers."""
     return _glm5_debugmodel("shared_dsa_debugmodel")
+
+
+def glm5_2_debugmodel() -> Trainer.Config:
+    """Short configuration preserving GLM-5.2 layer and IndexShare patterns."""
+    return _glm5_debugmodel("glm5_2_debugmodel")
+
+
+def glm5_2_scaled_debugmodel() -> Trainer.Config:
+    """Larger GLM-5.2 validation config for long numerical runs."""
+    return _glm5_debugmodel("glm5_2_scaled_debugmodel")

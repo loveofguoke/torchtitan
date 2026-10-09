@@ -368,6 +368,41 @@ class TestConfigManager(unittest.TestCase):
         assert config.model_spec.name == "glm5"
         assert config.model_spec.flavor == "debugmodel"
 
+    def test_glm5_2_debug_config(self):
+        """Test that the GLM-5.2 structural debug config is registered."""
+        config = ConfigManager().parse_args(
+            ["--module", "glm5", "--config", "glm5_2_debugmodel"]
+        )
+
+        assert config.model_spec.name == "glm5"
+        assert config.model_spec.flavor == "glm5_2_debugmodel"
+
+    def test_glm5_2_scaled_debug_config(self):
+        """Test that the larger GLM-5.2 validation config is registered."""
+        config = ConfigManager().parse_args(
+            ["--module", "glm5", "--config", "glm5_2_scaled_debugmodel"]
+        )
+        assert config.model_spec.name == "glm5"
+        assert config.model_spec.flavor == "glm5_2_scaled_debugmodel"
+        assert config.model_spec.model.index_sources == (
+            0,
+            1,
+            2,
+            2,
+            2,
+            2,
+            6,
+            6,
+            6,
+            6,
+            10,
+            10,
+            10,
+            10,
+            14,
+            14,
+        )
+
     def test_glm5_shared_dsa_config(self):
         """Test that the shared-index DSA trainer configuration is registered."""
         config_manager = ConfigManager()
