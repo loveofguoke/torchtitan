@@ -506,7 +506,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                         lm_head is not None
                     ), "Last PP stage must have lm_head for ChunkedLossWrapper"
                     self.loss_fn.set_lm_head(
-                        lm_head  # pyrefly: ignore[bad-argument-type]
+                        lm_head,  # pyrefly: ignore[bad-argument-type]
+                        reshard_after_forward=(
+                            config.parallelism.fsdp_reshard_after_forward == "always"
+                        ),
                     )
                     self.model_parts[
                         -1
@@ -517,7 +520,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 assert (
                     lm_head is not None
                 ), "Model must have lm_head for ChunkedLossWrapper"
-                self.loss_fn.set_lm_head(lm_head)  # pyrefly: ignore[bad-argument-type]
+                self.loss_fn.set_lm_head(  # pyrefly: ignore[bad-argument-type]
+                    lm_head,
+                    reshard_after_forward=(
+                        config.parallelism.fsdp_reshard_after_forward == "always"
+                    ),
+                )
                 self.model_parts[
                     0
                 ]._skip_lm_head = True  # pyrefly: ignore[bad-argument-type]

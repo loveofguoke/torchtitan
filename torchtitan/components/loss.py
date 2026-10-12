@@ -556,10 +556,17 @@ class ChunkedLossWrapper(BaseLoss):
         self.num_chunks = config.num_chunks
         self.loss_fn: BaseLoss = config.loss_fn.build(compile_config=compile_config)
         self.lm_head: nn.Module | None = None
+        self._lm_head_reshard_after_forward = True
 
-    def set_lm_head(self, lm_head: nn.Module) -> None:
-        """Set the lm_head module. Must be called before the first __call__."""
+    def set_lm_head(
+        self,
+        lm_head: nn.Module,
+        *,
+        reshard_after_forward: bool = True,
+    ) -> None:
+        """Set the lm_head and its configured FSDP forward reshard policy."""
         self.lm_head = lm_head
+        self._lm_head_reshard_after_forward = reshard_after_forward
 
     def __call__(
         self,
@@ -700,7 +707,9 @@ class ChunkedLossWrapper(BaseLoss):
                         h_chunk.grad = None
 
             if fsdp_enabled:
-                lm_head.set_reshard_after_forward(True)
+                lm_head.set_reshard_after_forward(
+                    self._lm_head_reshard_after_forward
+                )
                 lm_head.set_reshard_after_backward(True)
                 lm_head.set_requires_gradient_sync(True, recurse=False)
                 lm_head.reshard()

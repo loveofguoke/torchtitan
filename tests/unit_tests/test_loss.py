@@ -587,7 +587,7 @@ class TestChunkedLossWrapper(unittest.TestCase):
             model_chunked.output.weight.grad, model_ref.output.weight.grad
         )
 
-    def test_fsdp_unshards_once_before_chunk_forwards(self):
+    def test_fsdp_restores_configured_reshard_policy_across_steps(self):
         events: list[str] = []
 
         class FakeFSDPLinear(nn.Linear):
@@ -611,17 +611,51 @@ class TestChunkedLossWrapper(unittest.TestCase):
                 return super().forward(input)
 
         chunked_loss = ChunkedLossWrapper(ChunkedLossWrapper.Config(num_chunks=2))
-        chunked_loss.lm_head = FakeFSDPLinear(4, 8, bias=False)
+        lm_head = FakeFSDPLinear(4, 8, bias=False)
+        chunked_loss.set_lm_head(lm_head, reshard_after_forward=False)
+        hidden_states = torch.randn(4, 4)
+        labels = torch.randint(0, 8, (4,))
+
+        with patch("torch.distributed._composable.fsdp.FSDPModule", FakeFSDPLinear):
+            chunked_loss(hidden_states, labels)
+            chunked_loss(hidden_states, labels)
+
+        self.assertEqual(events.count("unshard"), 2)
+        self.assertEqual(events.count("forward"), 4)
+        self.assertLess(events.index("unshard"), events.index("forward"))
+        self.assertEqual(events[-1], "reshard")
+        self.assertEqual(events.count("set_reshard_after_forward(True)"), 0)
+        self.assertEqual(events.count("set_reshard_after_forward(False)"), 4)
+
+    def test_fsdp_restores_always_reshard_policy(self):
+        forward_reshard_policies: list[bool] = []
+
+        class FakeFSDPLinear(nn.Linear):
+            def set_reshard_after_forward(self, enabled):
+                forward_reshard_policies.append(enabled)
+
+            def set_reshard_after_backward(self, enabled):
+                pass
+
+            def set_requires_gradient_sync(self, enabled, *, recurse):
+                pass
+
+            def unshard(self):
+                pass
+
+            def reshard(self):
+                pass
+
+        chunked_loss = ChunkedLossWrapper(ChunkedLossWrapper.Config(num_chunks=2))
+        lm_head = FakeFSDPLinear(4, 8, bias=False)
+        chunked_loss.set_lm_head(lm_head, reshard_after_forward=True)
         hidden_states = torch.randn(4, 4)
         labels = torch.randint(0, 8, (4,))
 
         with patch("torch.distributed._composable.fsdp.FSDPModule", FakeFSDPLinear):
             chunked_loss(hidden_states, labels)
 
-        self.assertEqual(events.count("unshard"), 1)
-        self.assertEqual(events.count("forward"), 2)
-        self.assertLess(events.index("unshard"), events.index("forward"))
-        self.assertEqual(events[-1], "reshard")
+        self.assertEqual(forward_reshard_policies, [False, True])
 
     def test_numerical_equivalence(self):
         """ChunkedLossWrapper must produce the same loss and gradients as the standard path."""
