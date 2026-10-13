@@ -655,9 +655,31 @@ class TestDenseStorageAxes(DTensorTestBase):
         with patch(
             "torchtitan.distributed.parallel_dims.device_type", self.device_type
         ):
-            axes = self._build("partial_dtensor").get_all_one_dimensional_meshes()
+            parallel_dims = self._build("partial_dtensor")
+            axes = parallel_dims.get_all_one_dimensional_meshes()
             self.assertIn("fsdp", axes)
             self.assertNotIn("dp_shard", axes)
+            fsdp_tp_mesh = parallel_dims._global_meshes["fsdp_tp"]
+            self.assertEqual(fsdp_tp_mesh.mesh_dim_names, ("fsdp_tp",))
+            self.assertEqual(fsdp_tp_mesh.size(), 4)
+
+    @with_comms
+    def test_partial_dtensor_skips_fsdp_tp_flatten_without_both_axes(self):
+        with patch(
+            "torchtitan.distributed.parallel_dims.device_type", self.device_type
+        ):
+            parallel_dims = ParallelDims(
+                dp_replicate=1,
+                dp_shard=1,
+                cp=1,
+                tp=8,
+                pp=1,
+                ep=1,
+                world_size=8,
+                spmd_backend="partial_dtensor",
+            )
+            parallel_dims.build_mesh()
+            self.assertNotIn("fsdp_tp", parallel_dims._global_meshes)
 
     @with_comms
     def test_spmd_types_keeps_dp_shard_separate(self):

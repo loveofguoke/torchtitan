@@ -317,6 +317,15 @@ class ParallelDims:
                 (self.pp, self.dp_replicate, fsdp, self.tp),
             )
 
+        fsdp_tp_mesh = None
+        if self.spmd_backend == "partial_dtensor" and fsdp > 1 and self.tp > 1:
+            # Register the flattened layout that DTensor's redistribution planner
+            # uses to merge Partial -> Replicate reductions over FSDP and TP into
+            # one collective. This does not change parameter placements.
+            fsdp_tp_mesh = full_dense_mesh_for_fsdp["fsdp", "tp"]._flatten(
+                "fsdp_tp"
+            )
+
         full_sparse_mesh = unflatten_mesh(
             self._world_mesh,
             ("pp", "dp_replicate", "efsdp", "ep"),
@@ -329,6 +338,8 @@ class ParallelDims:
             "dense": full_dense_mesh_for_fsdp,
             "sparse": full_sparse_mesh,
         }
+        if fsdp_tp_mesh is not None:
+            self._global_meshes["fsdp_tp"] = fsdp_tp_mesh
         if spmd_dense_mesh_for_fwdbwd is not None:
             self._global_meshes["spmd_dense_for_fwdbwd"] = spmd_dense_mesh_for_fwdbwd
         if self.spmd_backend == "spmd_types" and self.ep > 1:
