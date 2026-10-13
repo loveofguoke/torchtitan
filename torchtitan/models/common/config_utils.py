@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Shared config builder helpers for model registries.
+"""Shared helpers for building model configurations.
 
 These helpers construct fully-specified sub-configs with all dimensional
 fields set at config creation time.
@@ -18,54 +18,73 @@ import torch
 from torch.distributed.tensor import DTensor
 
 from torchtitan.distributed.spmd_types import current_spmd_mesh, spmd_mesh_size
+from torchtitan.models.base.module import Module
+from torchtitan.models.common.activation import UnaryActivationFn
 from torchtitan.models.common.attention import (
-    FlexAttention,
-    FusedQKVLinear,
+    FlexInnerAttention,
     GQAttention,
     QKVLinear,
-    VarlenAttention,
+    VarlenInnerAttention,
 )
 from torchtitan.models.common.decoder import Decoder
-from torchtitan.models.common.dist_gemm import (
-    AllGatherFusedFeedForward,
-    AllGatherFusedQKVLinear,
-    RowParallelLinear,
+from torchtitan.models.common.decoder_sharding import (
+    colwise_sharding_config,
+    feed_forward_sharding_config,
+    gqa_attention_sharding_config,
+    head_norm_sharding_config,
+    inner_attention_local_spmd_sharding_config,
+    residual_activation_placement,
+    rope_cache_sharding_config,
+    rowwise_sharding_config,
+    stacked_colwise_sharding_config,
 )
 from torchtitan.models.common.feed_forward import FeedForward
-from torchtitan.models.common.linear import Linear
+from torchtitan.models.common.hi_mid_lo_linear import HiMidLoLinear
+from torchtitan.models.common.linear import (
+    ColumnParallelLinear,
+    GroupedLinear,
+    Linear,
+    RowParallelLinear,
+)
 from torchtitan.models.common.moe import (
-    GroupedExperts,
+    BatchWiseLoadBalanceLoss,
+    MicrobatchWiseLoadBalanceLoss,
     MoE,
     RoutedExperts,
     TokenChoiceTopKRouter,
 )
+from torchtitan.models.common.moe_sharding import (
+    moe_sharding_config,
+    routed_expert_linear_sharding_config,
+    routed_experts_sharding_config,
+    router_gate_sharding_config,
+    router_sharding_config,
+    shared_expert_rowwise_sharding_config,
+    shared_experts_output_placement,
+    shared_experts_sharding_config,
+)
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import RoPE
-from torchtitan.models.common.token_dispatcher import (
-    AllToAllTokenDispatcher,
-    DeepEPTokenDispatcher,
-    HybridEPTokenDispatcher,
-    LocalTokenDispatcher,
-    MinimalAsyncEPTokenDispatcher,
-)
-from torchtitan.protocols.model_spec import ModelSpec
-from torchtitan.protocols.module import Module
+from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
 
 
-def decoder_vocab_size(model_spec: ModelSpec) -> int:
+DEFAULT_DEBUG_MODEL_SEQ_LEN = 2048
+
+
+def _make_fused_linear_init(gate_init: Callable, up_init: Callable) -> Callable:
+    """Build an initializer for a stacked gate/up linear weight."""
+
+    def _init(t: torch.Tensor) -> None:
+        gate_init(t[0])
+        up_init(t[1])
+
+    return _init
+
+
+def decoder_vocab_size(model_config: Module.Config) -> int:
     """Assert Decoder.Config type so lint is not annoyed."""
-    model_config = model_spec.model
     assert isinstance(model_config, Decoder.Config)
     return model_config.vocab_size
-
-
-# Which implementation runs the TP-parallel linear layers. "default" leaves the
-# collectives to the framework, as separate all-gather / reduce-scatter either side
-# of an ordinary GEMM. "dist_gemm" folds each collective into its adjacent GEMM
-# over symmetric memory, so communication overlaps compute -- the technique
-# Megatron exposes as --tp-comm-overlap. Further implementations (CuTeDSL, Triton)
-# would be additional values here.
-TpGemmBackend = Literal["default", "dist_gemm"]
 
 
 def get_attention_config(
@@ -75,25 +94,22 @@ def get_attention_config(
 
     Language models always use block_causal masking (the dataloaders always
     emit per-document positions), so every backend here is a masked attention
-    backend. ``ScaledDotProductAttention`` only supports a boolean ``is_causal``
-    flag and cannot consume per-document positions, so it is not a valid
-    language-model backend (it remains available for Flux, which builds it
-    directly).
+    backend.
     """
     if backend == "flex":
-        return FlexAttention.Config()
+        return FlexInnerAttention.Config()
     elif backend == "flex_flash":
         from torchtitan.tools.utils import has_cuda_capability
 
         if not has_cuda_capability(9, 0):
             raise ValueError(
-                "Flash backend of FlexAttention is only supported on Hopper or Blackwell"
+                "Flash backend of FlexInnerAttention is only supported on Hopper or Blackwell"
             )
-        return FlexAttention.Config(
+        return FlexInnerAttention.Config(
             block_size=(256, 128), kernel_options={"BACKEND": "FLASH"}
         )
     elif backend == "varlen":
-        return VarlenAttention.Config()
+        return VarlenInnerAttention.Config()
     elif backend == "sdpa":
         raise ValueError(
             "sdpa is no longer supported for language models; positions are "
@@ -103,42 +119,38 @@ def get_attention_config(
         raise ValueError(f"Unknown backend: {backend}")
 
 
-def _fused_qkv_param_init(
+def fused_qkv_param_init(
     base_param_init: dict[str, Callable],
     *,
     n_heads: int,
     n_kv_heads: int,
     head_dim: int,
 ) -> dict[str, Callable]:
-    """Init for the fused ``wqkv`` that is bit-identical to the stock separate
-    ``wq``/``wk``/``wv`` and independent of the sharding degree.
+    """Initialize fused ``wqkv`` from logical ``wq``/``wk``/``wv`` draws.
 
-    The non-fused module initializes ``wq``/``wk``/``wv`` as three separate
-    contiguous parameters. This reproduces those exact draws: it initializes q,
-    k, v as three contiguous tensors of the stock-weight shapes (in
-    ``QKVLinear``'s ``wq``/``wk``/``wv`` build order), then assembles them into
-    the fused ``(n_kv_heads, R, head_dim, dim)`` layout (``R = heads_per_kv + 2``)
-    -- the same concatenation ``_merge_qkv_on_load`` uses -- and copies into the
-    buffer.
+    Q, K, and V are initialized as separate contiguous tensors, then packed into
+    the fused ``(n_kv_heads, R, head_dim, dim)`` layout, where
+    ``R = heads_per_kv + 2``. This preserves logical initialization order and
+    matches the packing used when loading separate checkpoint tensors.
 
-    Parallelism-agnostic RNG: at init ``t`` is the (possibly sharded) param --
+    Parallelism-agnostic RNG: at init ``t`` is the (possibly sharded) matrix --
     e.g. a ``Shard(0)`` DTensor for the colwise wqkv. ``t.new_empty(...)``
     returns ``Replicate`` DTensors, so each ``base_init`` runs on the full tensor
     and draws the same values on every rank (the weights do not depend on the
     TP/FSDP degree). ``cat`` of ``Replicate`` stays ``Replicate``, and the final
-    ``copy_`` scatters it into the sharded ``t`` (each rank keeps its shard). So
-    the path is "init replicated, then shard," which both matches the non-fused
-    module and keeps RNG independent of the parallelism.
+    ``copy_`` scatters it into the sharded ``t`` (each rank keeps its shard).
+    This "init replicated, then shard" path keeps RNG independent of the
+    parallelism.
     """
     heads_per_kv = n_heads // n_kv_heads
 
     def _make_init(base_init: Callable) -> Callable:
         # ``tail`` is the per-row shape: () for bias, (in_features,) for weight.
-        # Building q/k/v with the exact stock shapes and drawing them in
-        # wq/wk/wv order keeps the RNG sequence identical to the non-fused module.
+        # Building q/k/v with their logical shapes preserves their independent
+        # initialization order before packing them into wqkv.
         def _init(t):
             tail = t.shape[1:]
-            # If t is a sharded DTensor, new_empty (with the full stock shape)
+            # If t is a sharded DTensor, new_empty (with the full logical shape)
             # returns Replicate DTensors, so base_init runs replicated and draws
             # the same values on every rank (parallelism-agnostic RNG).
             q = t.new_empty(n_heads * head_dim, *tail)
@@ -184,6 +196,33 @@ def _fused_qkv_param_init(
     return out
 
 
+def fused_gate_up_param_init(
+    gate_param_init: dict[str, Callable],
+    up_param_init: dict[str, Callable],
+) -> dict[str, Callable] | None:
+    """Initialize the logical gate and up slices of a fused ``w13`` weight."""
+    gate_init = gate_param_init.get("weight")
+    up_init = up_param_init.get("weight")
+    if gate_init is None or up_init is None:
+        return None
+    return {"weight": _make_fused_linear_init(gate_init, up_init)}
+
+
+def fused_grouped_gate_up_param_init(
+    param_init: dict[str, Callable],
+) -> dict[str, Callable]:
+    """Build ``w13.weight`` initialization from logical expert projections."""
+    missing = {"w1_EFD", "w3_EFD"} - param_init.keys()
+    if missing:
+        raise ValueError(f"Missing routed-expert initializers: {sorted(missing)}")
+
+    def init(weight_E2FD: torch.Tensor) -> None:
+        param_init["w1_EFD"](weight_E2FD[:, 0])
+        param_init["w3_EFD"](weight_E2FD[:, 1])
+
+    return {"weight": init}
+
+
 def make_gqa_config(
     *,
     dim: int,
@@ -191,75 +230,53 @@ def make_gqa_config(
     wqkv_param_init: dict[str, Callable],
     wo_param_init: dict[str, Callable],
     inner_attention: Module.Config,
-    rope: RoPE.Config,
+    rope: RoPE.Config | None,
     n_kv_heads: int | None = None,
     head_dim: int | None = None,
-    fuse_qkv: bool = False,
     qk_norm: RMSNorm.Config | None = None,
-    tp_gemm_backend: TpGemmBackend = "default",
+    enable_sp: bool,
 ) -> GQAttention.Config:
-    """Build a fully-specified GQAttention.Config.
+    """Build a fully-specified, sharded GQAttention.Config.
 
-    ``tp_gemm_backend`` selects which implementation runs the QKV and output
-    projections. ``"default"`` leaves the TP collectives to the framework, either
-    side of an ordinary GEMM. ``"dist_gemm"`` folds each into its adjacent GEMM
-    over symmetric memory.
+    ``rope=None`` builds a NoPE layer (no positional encoding); see
+    :class:`GQAttention`.
 
-    ``"dist_gemm"`` raises here unless ``fuse_qkv=True`` -- the all-gather feeds a
-    single wqkv GEMM, so there is no separate wq/wk/wv schedule. It also needs CUDA
-    and the spmd_types backend; those are rejected by
-    ``validate_dist_gemm_preconditions`` at sharding time, which is the first point
-    that sees the parallelism settings.
+    The projection types make the standard synchronous TP collectives explicit.
+    Without a TP mesh, they execute as ordinary linear modules. The input and
+    output use the residual layout selected by ``enable_sp``.
     """
     n_kv = n_kv_heads if n_kv_heads is not None else n_heads
     per_head_dim = head_dim if head_dim is not None else dim // n_heads
-    rope = dataclasses.replace(rope)
-
-    # The backend picks the classes; everything below builds the same shapes into
-    # whichever was chosen.
-    fused_qkv_cls, wo_cls = FusedQKVLinear, Linear
-    if tp_gemm_backend == "dist_gemm":
-        if not fuse_qkv:
-            raise ValueError(
-                "tp_gemm_backend='dist_gemm' requires fuse_qkv=True: the all-gather "
-                "feeds a single wqkv GEMM, so there is no separate wq/wk/wv "
-                "schedule to fall back on."
-            )
-        fused_qkv_cls = AllGatherFusedQKVLinear
-        wo_cls = RowParallelLinear
-
-    if fuse_qkv:
-        qkv = fused_qkv_cls.Config(
-            head_dim=per_head_dim,
-            n_heads=n_heads,
-            n_kv_heads=n_kv,
-            wqkv=Linear.Config(
-                in_features=dim,
-                out_features=(n_heads + 2 * n_kv) * per_head_dim,
-                # Per-slice init so the fused wqkv is bit-identical to the stock
-                # separate wq/wk/wv (see _fused_qkv_param_init).
-                param_init=_fused_qkv_param_init(
-                    wqkv_param_init,
-                    n_heads=n_heads,
-                    n_kv_heads=n_kv,
-                    head_dim=per_head_dim,
-                ),
-            ),
+    rope = (
+        dataclasses.replace(rope, sharding_config=rope_cache_sharding_config())
+        if rope is not None
+        else None
+    )
+    if qk_norm is not None:
+        qk_norm = dataclasses.replace(
+            qk_norm, sharding_config=head_norm_sharding_config()
         )
-    else:
-        qkv = QKVLinear.Config(
-            head_dim=per_head_dim,
-            wq=Linear.Config(
-                in_features=dim,
-                out_features=n_heads * per_head_dim,
-                param_init=wqkv_param_init,
+    inner_attention = dataclasses.replace(
+        inner_attention, sharding_config=inner_attention_local_spmd_sharding_config()
+    )
+    x_layout = residual_activation_placement(enable_sp=enable_sp)
+
+    qkv = QKVLinear.Config(
+        head_dim=per_head_dim,
+        n_heads=n_heads,
+        n_kv_heads=n_kv,
+        wqkv=ColumnParallelLinear.Config(
+            in_features=dim,
+            out_features=(n_heads + 2 * n_kv) * per_head_dim,
+            param_init=fused_qkv_param_init(
+                wqkv_param_init,
+                n_heads=n_heads,
+                n_kv_heads=n_kv,
+                head_dim=per_head_dim,
             ),
-            wkv=Linear.Config(
-                in_features=dim,
-                out_features=n_kv * per_head_dim,
-                param_init=wqkv_param_init,
-            ),
-        )
+            sharding_config=colwise_sharding_config(input_layout=x_layout),
+        ),
+    )
 
     return GQAttention.Config(
         n_heads=n_heads,
@@ -267,14 +284,16 @@ def make_gqa_config(
         head_dim=head_dim,
         dim=dim,
         qkv_linear=qkv,
-        wo=wo_cls.Config(
+        wo=RowParallelLinear.Config(
             in_features=n_heads * per_head_dim,
             out_features=dim,
             param_init=wo_param_init,
+            sharding_config=rowwise_sharding_config(output_layout=x_layout),
         ),
         qk_norm=qk_norm,
         inner_attention=inner_attention,
         rope=rope,
+        sharding_config=gqa_attention_sharding_config(enable_sp=enable_sp),
     )
 
 
@@ -282,29 +301,89 @@ def make_ffn_config(
     *,
     dim: int,
     hidden_dim: int,
-    w1_param_init: dict[str, Callable],
-    w2w3_param_init: dict[str, Callable],
-    tp_gemm_backend: TpGemmBackend = "default",
+    w13_param_init: dict[str, Callable],
+    w2_param_init: dict[str, Callable],
+    enable_sp: bool,
 ) -> FeedForward.Config:
-    """Build a fully-specified FeedForward.Config.
+    """Build a fully-specified, sharded dense FeedForward.Config.
 
-    ``tp_gemm_backend="dist_gemm"`` overlaps the TP collectives with the GEMMs by
-    folding them in: one all-gather feeds w1 and w3, and w2 reduce-scatters. A bias
-    on w1/w3 is rejected by the config. See make_gqa_config.
+    ``w1`` and ``w3`` are the gate/up projections and share
+    ``w13_param_init``; ``w2`` is the residual output projection. The input
+    and output use the residual layout selected by ``enable_sp``.
     """
-    ffn_cls = (
-        AllGatherFusedFeedForward if tp_gemm_backend == "dist_gemm" else FeedForward
+    x_layout = residual_activation_placement(enable_sp=enable_sp)
+    return FeedForward.Config(
+        w13=ColumnParallelLinear.Config(
+            in_features=dim,
+            out_features=hidden_dim,
+            num_linears=2,
+            param_init=fused_gate_up_param_init(w13_param_init, w13_param_init),
+            sharding_config=stacked_colwise_sharding_config(input_layout=x_layout),
+        ),
+        w2=RowParallelLinear.Config(
+            in_features=hidden_dim,
+            out_features=dim,
+            param_init=w2_param_init,
+            sharding_config=rowwise_sharding_config(output_layout=x_layout),
+        ),
+        sharding_config=feed_forward_sharding_config(enable_sp=enable_sp),
     )
-    return ffn_cls.Config(
-        w1=Linear.Config(
-            in_features=dim, out_features=hidden_dim, param_init=w1_param_init
+
+
+def make_shared_expert_down_proj_config(
+    *,
+    in_features: int,
+    out_features: int,
+    param_init: dict[str, Callable],
+    enable_sp: bool,
+) -> Linear.Config:
+    """Build the down projection (``w2``) of an MoE's shared experts.
+
+    With SP, a ``RowParallelLinear`` reduce-scatters its output to the
+    sequence-parallel layout. Without SP, a plain ``Linear`` keeps its
+    TP-Partial output so the MoE reduces the routed and shared sum once.
+    """
+    projection = RowParallelLinear if enable_sp else Linear
+    return projection.Config(
+        in_features=in_features,
+        out_features=out_features,
+        param_init=param_init,
+        sharding_config=shared_expert_rowwise_sharding_config(
+            output_layout=shared_experts_output_placement(enable_sp=enable_sp)
         ),
-        w2=Linear.Config(
-            in_features=hidden_dim, out_features=dim, param_init=w2w3_param_init
+    )
+
+
+def make_shared_expert_ffn_config(
+    *,
+    dim: int,
+    hidden_dim: int,
+    w13_param_init: dict[str, Callable],
+    w2_param_init: dict[str, Callable],
+    enable_sp: bool,
+) -> FeedForward.Config:
+    """Build a sharded shared-expert FFN for an MoE.
+
+    ``w1`` and ``w3`` are the gate/up projections and share
+    ``w13_param_init``; ``w2`` is the residual output projection (see
+    ``make_shared_expert_down_proj_config``).
+    """
+    x_layout = residual_activation_placement(enable_sp=enable_sp)
+    return FeedForward.Config(
+        w13=ColumnParallelLinear.Config(
+            in_features=dim,
+            out_features=hidden_dim,
+            num_linears=2,
+            param_init=fused_gate_up_param_init(w13_param_init, w13_param_init),
+            sharding_config=stacked_colwise_sharding_config(input_layout=x_layout),
         ),
-        w3=Linear.Config(
-            in_features=dim, out_features=hidden_dim, param_init=w2w3_param_init
+        w2=make_shared_expert_down_proj_config(
+            in_features=hidden_dim,
+            out_features=dim,
+            param_init=w2_param_init,
+            enable_sp=enable_sp,
         ),
+        sharding_config=shared_experts_sharding_config(enable_sp=enable_sp),
     )
 
 
@@ -314,15 +393,38 @@ def make_moe_config(
     router: TokenChoiceTopKRouter.Config,
     routed_experts: RoutedExperts.Config,
     shared_experts: FeedForward.Config | None = None,
-    load_balance_coeff: float | None = 1e-3,
+    load_balance_coeff: float | None = None,
+    aux_loss_coeff: float | None = None,
+    aux_loss_type: Literal["microbatch_wise", "batch_wise"] = "microbatch_wise",
+    enable_sp: bool,
 ) -> MoE.Config:
-    """Build a fully-specified MoE.Config."""
+    """Build a fully-specified, sharded MoE.Config.
+
+    The MoE input and output use the residual layout selected by
+    ``enable_sp``. ``router``, ``routed_experts`` and ``shared_experts`` carry
+    their own sharding.
+    """
+    aux_loss = None
+    if aux_loss_coeff is not None:
+        if aux_loss_type == "microbatch_wise":
+            aux_loss = MicrobatchWiseLoadBalanceLoss.Config(coeff=aux_loss_coeff)
+        elif aux_loss_type == "batch_wise":
+            aux_loss = BatchWiseLoadBalanceLoss.Config(
+                coeff=aux_loss_coeff, num_experts=num_experts
+            )
+        else:
+            raise ValueError(
+                f"Unknown aux_loss_type {aux_loss_type!r}; expected "
+                "'microbatch_wise' or 'batch_wise'."
+            )
+    router = dataclasses.replace(router, aux_loss=aux_loss)
     return MoE.Config(
         num_experts=num_experts,
         load_balance_coeff=load_balance_coeff,
         router=router,
         routed_experts=routed_experts,
         shared_experts=shared_experts,
+        sharding_config=moe_sharding_config(enable_sp=enable_sp),
     )
 
 
@@ -331,98 +433,31 @@ def make_router_config(
     dim: int,
     num_experts: int,
     gate_param_init: dict[str, Callable],
+    score_func: UnaryActivationFn.Config,
     top_k: int = 1,
-    score_func: Literal["sigmoid", "softmax"] = "sigmoid",
     route_norm: bool = False,
+    route_norm_epsilon: float = 1e-20,
     route_scale: float = 1.0,
-    num_expert_groups: int | None = None,
-    num_limited_groups: int | None = None,
     bias: bool = False,
 ) -> TokenChoiceTopKRouter.Config:
-    """Build a fully-specified TokenChoiceTopKRouter.Config."""
+    """Build a fully-specified, sharded TokenChoiceTopKRouter.Config."""
     return TokenChoiceTopKRouter.Config(
         num_experts=num_experts,
-        gate=Linear.Config(
+        gate=HiMidLoLinear.Config(
             in_features=dim,
             out_features=num_experts,
+            backward_mode="hi_mid_lo",
             bias=bias,
             param_init=gate_param_init,
+            sharding_config=router_gate_sharding_config(),
         ),
         top_k=top_k,
         score_func=score_func,
         route_norm=route_norm,
+        route_norm_epsilon=route_norm_epsilon,
         route_scale=route_scale,
-        num_expert_groups=num_expert_groups,
-        num_limited_groups=num_limited_groups,
+        sharding_config=router_sharding_config(),
     )
-
-
-def make_token_dispatcher_config(
-    *,
-    num_experts: int,
-    top_k: int,
-    comm_backend: str,
-    non_blocking_capacity_factor: float | None = None,
-    hidden_dim: int | None = None,
-    num_max_tokens_per_rank: int | None = None,
-    cudagraphable: bool = False,
-) -> LocalTokenDispatcher.Config:
-    """Build the appropriate token dispatcher config.
-
-    Returns the right Config subclass based on comm_backend:
-    - "standard": Uses PyTorch all-to-all collectives (falls back to local
-      dispatch when EP=1, i.e. ep_mesh is None at runtime)
-    - "deepep": Uses DeepEP custom kernels for H100/NVLink Switch
-    - "hybridep": Uses HybridEP with TMA optimization for GB200/NVLink72
-    - "minimal_async_ep": Uses MinimalAsyncEP for constrained DP>=EP
-
-    DeepEP/HybridEP requires installation:
-    https://github.com/deepseek-ai/DeepEP
-
-    For HybridEP, SM configuration can be set via environment variables:
-    - HYBRIDEP_NUM_SMS_DISPATCH (default: 16)
-    - HYBRIDEP_NUM_SMS_COMBINE (default: 16)
-    """
-    # TODO(unify-ep-dispatch-knobs): unify the per-backend static-shape/cudagraph knobs --
-    # HybridEP non_blocking_capacity_factor vs DeepEP cudagraphable + num_max_tokens_per_rank.
-    if comm_backend == "deepep":
-        # DeepEP v2: a single ElasticBuffer handles training and inference. ``hidden_dim``
-        # (model dim) sizes the buffer; wire_meshes creates it eagerly. ``cudagraphable``
-        # selects the static no-host-sync expand layout (set on the generator by the
-        # deepep_override). ``num_max_tokens_per_rank`` is the hard per-rank input-token
-        # bound. Runtime config derives it from the fixed training shape or inference
-        # scheduler/cudagraph limits before the dispatcher is built.
-        return DeepEPTokenDispatcher.Config(
-            num_experts=num_experts,
-            top_k=top_k,
-            hidden_dim=hidden_dim,
-            num_max_tokens_per_rank=num_max_tokens_per_rank,
-            cudagraphable=cudagraphable,
-        )
-    elif comm_backend == "hybridep":
-        return HybridEPTokenDispatcher.Config(
-            num_experts=num_experts,
-            top_k=top_k,
-            non_blocking_capacity_factor=non_blocking_capacity_factor,
-            hidden_dim=hidden_dim,
-            num_max_tokens_per_rank=num_max_tokens_per_rank,
-        )
-    elif comm_backend == "minimal_async_ep":
-        return MinimalAsyncEPTokenDispatcher.Config(
-            num_experts=num_experts,
-            top_k=top_k,
-            num_max_tokens_per_rank=num_max_tokens_per_rank,
-        )
-    elif comm_backend == "standard":
-        return AllToAllTokenDispatcher.Config(
-            num_experts=num_experts,
-            top_k=top_k,
-        )
-    else:
-        raise ValueError(
-            f"Unknown comm_backend: '{comm_backend}'. "
-            "Must be one of 'standard', 'deepep', 'hybridep', 'minimal_async_ep'."
-        )
 
 
 def make_routed_experts_config(
@@ -432,26 +467,38 @@ def make_routed_experts_config(
     num_experts: int,
     top_k: int,
     param_init: dict[str, Callable],
-    comm_backend: str,
-    non_blocking_capacity_factor: float | None = None,
-    num_max_tokens_per_rank: int | None = None,
-    cudagraphable: bool = False,
+    enable_ep: bool,
 ) -> RoutedExperts.Config:
-    """Build a fully-specified RoutedExperts.Config (inner_experts + token_dispatcher)."""
+    """Build sharded routed experts with gate/up and down projections.
+
+    Expert weights use sparse ``{EP}`` placements when ``enable_ep`` and
+    dense replicated placements otherwise.
+    """
+    missing = {"w1_EFD", "w2_EDF", "w3_EFD"} - param_init.keys()
+    if param_init and missing:
+        raise ValueError(f"Missing routed-expert initializers: {sorted(missing)}")
+
     return RoutedExperts.Config(
-        inner_experts=GroupedExperts.Config(
-            dim=dim,
-            hidden_dim=hidden_dim,
-            num_experts=num_experts,
-            param_init=param_init,
+        w13=GroupedLinear.Config(
+            group_size=num_experts,
+            in_features=dim,
+            out_features=hidden_dim,
+            num_linears=2,
+            param_init=(
+                fused_grouped_gate_up_param_init(param_init) if param_init else None
+            ),
+            sharding_config=routed_expert_linear_sharding_config(enable_ep=enable_ep),
         ),
-        token_dispatcher=make_token_dispatcher_config(
+        w2=GroupedLinear.Config(
+            group_size=num_experts,
+            in_features=hidden_dim,
+            out_features=dim,
+            param_init={"weight": param_init["w2_EDF"]} if param_init else None,
+            sharding_config=routed_expert_linear_sharding_config(enable_ep=enable_ep),
+        ),
+        token_dispatcher=AllToAllTokenDispatcher.Config(
             num_experts=num_experts,
             top_k=top_k,
-            comm_backend=comm_backend,
-            non_blocking_capacity_factor=non_blocking_capacity_factor,
-            hidden_dim=dim,
-            num_max_tokens_per_rank=num_max_tokens_per_rank,
-            cudagraphable=cudagraphable,
         ),
+        sharding_config=routed_experts_sharding_config(),
     )

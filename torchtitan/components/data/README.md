@@ -23,10 +23,10 @@ TorchTitan uses one Grain-based data pipeline for text pretraining, SFT, and ima
     config:  GrainDataLoader.Config
     input:  MapDataset | IterDataset
     does:   convert to iterable if needed -> batch -> collate -> prefetch
-    output: TrainerBatch
+    output: TrainingMicrobatch
 
 5. Trainer:
-    input: TrainerBatch
+    input: TrainingMicrobatch
     does:  model forward and backward
 ```
 
@@ -48,7 +48,7 @@ from torchtitan.components.data import (
     IndexedJsonlSource,
     SingleDatasetConfig,
 )
-from torchtitan.hf_datasets.text_datasets import TextProcessor
+from torchtitan.components.data.text_datasets import TextProcessor
 
 
 def article_text(row):
@@ -98,6 +98,63 @@ source = HuggingFaceStreamingSource.Config(
 )
 ```
 
+### Hub rate limits on multi-node jobs
+
+Streaming `allenai/c4` from the Hub happens at trainer init: every rank calls
+`datasets.load_dataset`. A large job (for example 48 nodes) can hit Hugging Face
+HTTP 429.
+
+Download the dataset once onto shared storage, then point `path` at that
+directory. `HuggingFaceStreamingSource.Config.path` and
+`HuggingFaceRandomAccessSource.Config.path` accept a Hub id or a local directory
+that `datasets.load_dataset` accepts.
+
+Recipes use the `en` config. Download that subset (plus `README.md`, which
+declares the config) rather than the full multilingual dump.
+
+```bash
+huggingface-cli download allenai/c4 --repo-type dataset --include "en/*" --include "README.md" --local-dir /datasets/c4
+```
+
+```python
+from huggingface_hub import snapshot_download
+
+snapshot_download(
+    repo_id="allenai/c4",
+    repo_type="dataset",
+    allow_patterns=["en/*", "README.md"],
+    local_dir="/datasets/c4",
+)
+```
+
+Recipes such as `llama3_8b` use `ConcatThenSplitPackingConfig(dataset=DATASETS["c4"])`.
+Replace the source path, or construct the source directly:
+
+```python
+from dataclasses import replace
+
+from torchtitan.components.data import HuggingFaceStreamingSource
+from torchtitan.components.data.text_datasets import DATASETS
+
+c4 = DATASETS["c4"]
+c4 = replace(c4, source=replace(c4.source, path="/datasets/c4"))
+
+source = HuggingFaceStreamingSource.Config(
+    path="/datasets/c4",
+    name="en",
+    split="train",
+)
+```
+
+If the corpus is fully materialized, use `HuggingFaceRandomAccessSource` with the
+same `path`, `name`, and `split`.
+
+Optionally export `HF_TOKEN` or `HUGGING_FACE_HUB_TOKEN` for authenticated Hub
+quota. A token does not remove the need to pre-download on large clusters.
+
+Debug recipes already use `DATASETS["c4_test"]` (local JSON under
+`tests/assets/c4_test/`) and do not hit the Hub.
+
 ## Adding your own source -- Example: Pretokenized data
 
 This example uses token offsets to expose one pretokenized document per index, then reuses the normal processing and packing configs.
@@ -125,13 +182,7 @@ class PretokenizedMemmapSource(Configurable, RandomAccessDataSource):
         tokens_path: str
         document_offsets_path: str
 
-    def __init__(
-        self,
-        config: Config,
-        *,
-        dataset_iteration_policy: DatasetIterationPolicy,
-    ):
-        del dataset_iteration_policy
+    def __init__(self, config: Config):
         self.tokens = np.memmap(config.tokens_path, dtype=np.uint32, mode="r")
         self.offsets = np.load(config.document_offsets_path)
 
@@ -186,7 +237,7 @@ from torchtitan.components.data import (
     HuggingFaceRandomAccessSource,
     SingleDatasetConfig,
 )
-from torchtitan.hf_datasets.text_datasets import ChatProcessor
+from torchtitan.components.data.text_datasets import ChatProcessor
 
 
 def gsm8k_messages(row):
@@ -213,8 +264,39 @@ config.dataloader = GrainDataLoader.Config(
 )
 ```
 
-`ChatProcessor` applies the tokenizer's chat template, creates next-token input
-and label pairs, and sets prompt labels to `IGNORE_INDEX`.
+Without a renderer, `ChatProcessor` applies the tokenizer's chat template to a single-turn
+`[user, assistant]` pair, creates next-token input and label pairs, and sets
+prompt labels to `IGNORE_INDEX`. It locates the prompt/response boundary by
+rendering the prompt with `add_generation_prompt=True` and requiring that to be
+an exact token prefix of the full render, raising a `ValueError` when it is not.
+Templates that rewrite earlier turns, or turn separators that only merge in
+context, break that assumption.
+
+For multi-turn conversations, select the model's renderer explicitly:
+
+```python
+from renderers import Qwen3RendererConfig
+
+from torchtitan.components.renderer import from_renderers
+
+processor = ChatProcessor.Config(
+    messages_fn=lambda row: row["messages"],
+    renderer=from_renderers(Qwen3RendererConfig()),
+)
+```
+
+The renderer uses TorchTitan's loaded tokenizer and returns tokens with a loss
+mask in one pass. The mask supervises model-generated tokens, including turn
+terminators, and excludes prompt tokens and template scaffolding. Conversations
+must end with an assistant message. Each conversation is one sample; packing
+resets positions between conversations, not between turns. Samples exceeding
+`max_context_length` are dropped whole.
+
+Formatting and reasoning retention follow the selected renderer. For example,
+Qwen3 omits reasoning from assistant turns before the last user query. Those
+omitted tokens receive no loss. To train on each turn's reasoning, prepare
+separate conversation prefixes in the source dataset. `thinking_retention`
+controls the renderer's rollout bridging, not the full renders used here.
 
 # Mixing datasets
 
@@ -280,6 +362,8 @@ pretraining_corpus_ds = DatasetConcatConfig(
 
 Every `books_ds` row now appears three times in the combined finite index space. With `shuffle=True`, TorchTitan shuffles that combined index space before DP sharding.
 
+Each child is built with seed `seed + index`, the same as mixed children, so repeated copies make independent draws in random processors (for example augmentation or random cropping). Inserting or reordering a child therefore changes the draws of every later child.
+
 Use mixing instead when the desired behavior is relative source-selection frequency rather than exact finite duplication:
 
 ```python
@@ -306,14 +390,14 @@ from torchtitan.components.data import (
     HuggingFaceStreamingSource,
     SingleDatasetConfig,
 )
-from torchtitan.hf_datasets.multimodal.mm_collator import MultiModalCollator
-from torchtitan.hf_datasets.multimodal.mm_datasets import (
+from torchtitan.components.data.multimodal.mm_collator import MultiModalCollator
+from torchtitan.components.data.multimodal.mm_datasets import (
     MMSamplePackingConfig,
-    MultiModalProcessor,
+    VisionProcessor,
     _process_cc12_wd_sample,
 )
 
-mm_processor = MultiModalProcessor.Config(
+mm_processor = VisionProcessor.Config(
     sample_processor=_process_cc12_wd_sample,
 )
 
@@ -364,7 +448,7 @@ config.dataloader = GrainDataLoader.Config(
         num_threads=16,
         prefetch_buffer_size=500,
     ),
-    num_prefetch_batches=2,
+    num_prefetch_microbatches=2,
 )
 ```
 
@@ -394,7 +478,7 @@ Each conversion has its own threads and buffer. An all-map mix converts once; a 
 
 `streaming_shuffle_buffer_size` is the number of raw rows retained for approximate shuffling. A larger buffer improves mixing but uses more memory.
 
-`num_prefetch_batches` is the number of complete, collated batches allowed to wait for the trainer:
+`num_prefetch_microbatches` is the number of complete, collated microbatches allowed to wait for the trainer:
 
 ```text
 trainer computes batch 10

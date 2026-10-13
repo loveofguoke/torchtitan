@@ -10,9 +10,9 @@ from typing import Literal
 
 import spmd_types as spmd
 import torch
-from torch.distributed.tensor import DTensor, Replicate, Shard
 
-from torchtitan.protocols.module import Module
+from torchtitan.distributed.local_compile import local_compile
+from torchtitan.models.base.module import Module
 
 __all__ = [
     "ComplexRoPE",
@@ -21,7 +21,6 @@ __all__ = [
 ]
 
 
-# pyrefly: ignore [not-callable]
 @spmd.no_typecheck()
 def _maybe_check_max_pos(positions: torch.Tensor, *, max_valid_pos: int) -> None:
     """Async bounds check: verify all position values <= max_valid_pos.
@@ -32,9 +31,8 @@ def _maybe_check_max_pos(positions: torch.Tensor, *, max_valid_pos: int) -> None
     """
     if torch.compiler.is_compiling():
         return
-    pos_local = positions.to_local() if isinstance(positions, DTensor) else positions
     torch._assert_async(
-        torch.all(pos_local <= max_valid_pos),
+        torch.all(positions <= max_valid_pos),
         f"position_ids exceed {max_valid_pos=}",
     )
 
@@ -139,32 +137,38 @@ class RoPE(Module):
     @staticmethod
     def apply_rotary_emb(
         query: torch.Tensor,
-        key: torch.Tensor,
+        key: torch.Tensor | None,
         rope_cache: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Apply a prepared RoPE cache to query and key.
+        *,
+        inverse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Apply a prepared RoPE cache to query and optional key.
 
         Args:
             query: Query tensor with shape ``[T, N, H]``.
-            key: Key tensor with the same leading dimensions as ``query``.
+            key: Optional key tensor with the same leading dimensions as
+                ``query``. If ``None``, only ``query`` is rotated and returned.
             rope_cache: Prepared cache broadcastable to ``query`` and ``key``
                 according to the concrete RoPE format.
+            inverse: Whether to apply the inverse rotation.
 
         Returns:
-            Rotated query and key tensors with the same shapes and dtypes as
-            ``query`` and ``key``.
+            Rotated query tensor when ``key`` is ``None``; otherwise rotated
+            query and key tensors with the same shapes and dtypes as inputs.
         """
         raise NotImplementedError
 
     def forward(
         self,
         query: torch.Tensor,
-        key: torch.Tensor,
+        key: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Apply rotary embeddings to query and key tensors."""
+        *,
+        inverse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Apply rotary embeddings to query and optional key tensors."""
         reshaped_cache = self._reshape_cache(query, positions)
-        return self.apply_rotary_emb(query, key, reshaped_cache)
+        return self.apply_rotary_emb(query, key, reshaped_cache, inverse=inverse)
 
     def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
         # TODO: In long-term we need to have buffer abstraction in `Module`` class to infer the buffer_device
@@ -242,7 +246,6 @@ class ComplexRoPE(RoPE):
         Returns:
             Cache of shape ``(T, 1, dim / 2)``.
         """
-        positions = _maybe_wrap_positions(positions, query)
         if positions is not None:
             _maybe_check_max_pos(positions, max_valid_pos=self.cache.shape[0] - 1)
         # Complex RoPE cache has width dim / 2 because each complex value
@@ -253,21 +256,40 @@ class ComplexRoPE(RoPE):
     @staticmethod
     def apply_rotary_emb(
         query: torch.Tensor,
-        key: torch.Tensor,
+        key: torch.Tensor | None,
         rope_cache: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        *,
+        inverse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Apply complex RoPE using adjacent-dim pairs."""
+        if inverse:
+            rope_cache = rope_cache.conj()
+
         xq_ = torch.view_as_complex(query.float().reshape(*query.shape[:-1], -1, 2))
+        query_out = torch.view_as_real(xq_ * rope_cache).flatten(-2).type_as(query)
+        if key is None:
+            return query_out
+
         xk_ = torch.view_as_complex(key.float().reshape(*key.shape[:-1], -1, 2))
-        xq_out = torch.view_as_real(xq_ * rope_cache).flatten(-2)
-        xk_out = torch.view_as_real(xk_ * rope_cache).flatten(-2)
-        return xq_out.type_as(query), xk_out.type_as(key)
+        key_out = torch.view_as_real(xk_ * rope_cache).flatten(-2).type_as(key)
+        return query_out, key_out
 
 
 class CosSinRoPE(RoPE):
     @dataclass(kw_only=True, slots=True)
     class Config(RoPE.Config):
         pass
+
+    @local_compile("cos_sin_rope", batch_invariant=True)
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        *,
+        inverse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        return super().forward(query, key, positions, inverse=inverse)
 
     def _precompute_cache(self) -> torch.Tensor:
         """Precompute cos/sin values.
@@ -318,7 +340,6 @@ class CosSinRoPE(RoPE):
         Returns:
             Cache of shape ``(T, 1, dim * 2)``.
         """
-        positions = _maybe_wrap_positions(positions, query)
         if positions is not None:
             _maybe_check_max_pos(positions, max_valid_pos=self.cache.shape[0] - 1)
         return _reshape_for_broadcast(self.cache, query.shape, positions)
@@ -326,16 +347,24 @@ class CosSinRoPE(RoPE):
     @staticmethod
     def apply_rotary_emb(
         query: torch.Tensor,
-        key: torch.Tensor,
+        key: torch.Tensor | None,
         rope_cache: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        *,
+        inverse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Apply cos/sin RoPE using the rotate-half convention."""
+        if inverse:
+            raise NotImplementedError("CosSinRoPE does not support inverse rotation.")
+
         head_dim = query.shape[-1]
         cos = rope_cache[..., :head_dim]
         sin = rope_cache[..., head_dim:]
         query_f = query.float()
-        key_f = key.float()
         xq_out = (query_f * cos) + (CosSinRoPE._rotate_half(query_f) * sin)
+        if key is None:
+            return xq_out.type_as(query)
+
+        key_f = key.float()
         xk_out = (key_f * cos) + (CosSinRoPE._rotate_half(key_f) * sin)
         return xq_out.type_as(query), xk_out.type_as(key)
 
@@ -366,40 +395,3 @@ def _reshape_for_broadcast(
     else:
         rope_cache = rope_cache[positions]
     return rope_cache.view(num_tokens, 1, cache_width)
-
-
-def _maybe_wrap_positions(
-    positions: torch.Tensor | None,
-    x: torch.Tensor,
-) -> torch.Tensor | None:
-    """Wrap positions as a DTensor deriving mesh and placements from x (xq/xk).
-
-    TODO: positions should be wrapped in/right after dataloading, together
-    with inputs and labels, so this helper can go away.
-
-    When TP uses use_local_output=False (DeepSeek V3, Qwen3, GPT-OSS),
-    x is a DTensor but positions is a plain tensor. The downstream
-    torch.gather requires both operands to be the same type.
-
-    Positions (tokens,) has fewer dimensions than x (tokens, n_heads,
-    head_dim), so we only preserve Shard placements for shared dimensions.
-    Shard dims beyond positions' rank (e.g. Shard(1) for TP
-    on heads) become Replicate.
-    """
-    if (
-        positions is not None
-        and isinstance(x, DTensor)
-        and not isinstance(positions, DTensor)
-    ):
-        ndim = positions.ndim
-        placements = tuple(
-            p if not isinstance(p, Shard) or p.dim < ndim else Replicate()
-            for p in x.placements
-        )
-        positions = DTensor.from_local(
-            positions,
-            x.device_mesh,
-            placements,
-            run_check=False,
-        )
-    return positions

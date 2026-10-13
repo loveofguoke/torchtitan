@@ -41,8 +41,8 @@ extended for new models. Expected changes include:
   under TP (the `_assert_all_states_sharded` backstop now makes that a loud
   setup-time error for any param/buffer-bearing dense-path module — root
   modules and every decoder layer, excluding the Titan-swapped MoE). For a genuinely new module, shard it
-  (`colwise_config`/`rowwise_config`) if it has a clear TP layout, otherwise
-  default to `_replicate_config(module)` (replicate weights, no TP). If a new
+  (`colwise_sharding_config`/`rowwise_sharding_config`) if it has a clear TP layout, otherwise
+  default to `_replicate_sharding_config(module)` (replicate weights, no TP). If a new
   module type doesn't fit any existing helper, that's a signal to stop and think
   (or escalate) rather than leave it unconfigured.
 - `model.py` — handle alternative submodule names: HF models name the same
@@ -167,13 +167,13 @@ works (e.g. DeepSeek-V2-Lite has full-rank `q_proj` + low-rank KV):
 
 | Pattern | Projections | Already supported? |
 |---------|-------------|--------------------|
-| Full-rank Q | `q_proj` | Yes (`colwise_config`) |
-| Low-rank Q (MLA) | `q_a_proj`, `q_b_proj` | Yes (`_replicate_config`/`colwise_config`) |
-| Standard KV (GQA) | `k_proj`, `v_proj` | Yes (`colwise_config`) |
-| Low-rank KV (MLA) | `kv_a_proj_with_mqa`, `kv_b_proj` | Yes (`_replicate_config`/`colwise_config`) |
-| Output | `o_proj` or `dense` | Yes (`rowwise_config`) |
-| Q/K norms | `q_norm`, `k_norm` | Yes (`_replicate_config`, each independent) |
-| V-norm | `v_norm` | Yes (`_replicate_config`) |
+| Full-rank Q | `q_proj` | Yes (`colwise_sharding_config`) |
+| Low-rank Q (MLA) | `q_a_proj`, `q_b_proj` | Yes (`_replicate_sharding_config`/`colwise_sharding_config`) |
+| Standard KV (GQA) | `k_proj`, `v_proj` | Yes (`colwise_sharding_config`) |
+| Low-rank KV (MLA) | `kv_a_proj_with_mqa`, `kv_b_proj` | Yes (`_replicate_sharding_config`/`colwise_sharding_config`) |
+| Output | `o_proj` or `dense` | Yes (`rowwise_sharding_config`) |
+| Q/K norms | `q_norm`, `k_norm` | Yes (`_replicate_sharding_config`, each independent) |
+| V-norm | `v_norm` | Yes (`_replicate_sharding_config`) |
 | DSA indexer | `indexer` | FSDP/EP only — **NOT under TP** (fails loud; the indexer's scatter_/index ops need the `spmd_types` backend, see `hf_sharding.py`) |
 
 The `_assert_all_states_sharded` backstop will fail loud at setup if any
@@ -482,33 +482,55 @@ nvidia-smi -L | wc -l
 ### 4b. Run parallelism configs
 
 Test the new model with at least these configurations (adapt GPU counts
-to what is available). Use `--training.steps 2` to keep runs short — the
-goal is to verify the model initializes, parallelizes, and runs
-forward/backward without errors, not to converge.
+to what is available). Add three temporary Python recipes to
+`config_registry.py`; configuration flags are not accepted by the launcher:
+
+```python
+def _new_model_test_config(*, tp: int = 1, ep: int = 1) -> Trainer.Config:
+    config = transformers_modeling_backend_debugmodel_moe()
+    model_config = model_registry(
+        "debugmodel_moe",
+        seq_len=config.training.max_context_length,
+        hf_model="<model_id>",
+    )
+    config.model = model_config
+    config.loss = CrossEntropyLoss.Config(global_vocab_size=model_config.vocab_size)
+    config.training.steps = 2
+    config.parallelism.data_parallel_shard_degree = -1
+    config.parallelism.tensor_parallel_degree = tp
+    config.parallelism.expert_parallel_degree = ep
+    return config
+
+
+def new_model_fsdp() -> Trainer.Config:
+    return _new_model_test_config()
+
+
+def new_model_fsdp_ep() -> Trainer.Config:
+    return _new_model_test_config(ep=<EP>)
+
+
+def new_model_fsdp_tp_ep() -> Trainer.Config:
+    return _new_model_test_config(tp=2, ep=<EP>)
+```
+
+Set `config.hf_assets_path` in the helper as well if the test needs the new
+model's tokenizer assets. Keep `training.steps = 2`: the goal is to verify the
+model initializes, parallelizes, and runs forward/backward without errors, not
+to converge.
 
 ```bash
 # FSDP only (minimum viable test)
-torchrun --nproc-per-node <NGPU> --module transformers_modeling_backend \
-    --config transformers_modeling_backend_debugmodel_moe \
-    --hf_model <model_id> \
-    --training.steps 2
+NGPU=<NGPU> MODULE=transformers_modeling_backend CONFIG=new_model_fsdp \
+    ./run_train.sh
 
 # FSDP + EP
-torchrun --nproc-per-node <NGPU> --module transformers_modeling_backend \
-    --config transformers_modeling_backend_debugmodel_moe \
-    --hf_model <model_id> \
-    --parallelism.data_parallel_shard_degree -1 \
-    --parallelism.expert_parallel_degree <EP> \
-    --training.steps 2
+NGPU=<NGPU> MODULE=transformers_modeling_backend CONFIG=new_model_fsdp_ep \
+    ./run_train.sh
 
 # FSDP + TP + EP (if NGPU >= 4)
-torchrun --nproc-per-node <NGPU> --module transformers_modeling_backend \
-    --config transformers_modeling_backend_debugmodel_moe \
-    --hf_model <model_id> \
-    --parallelism.data_parallel_shard_degree -1 \
-    --parallelism.tensor_parallel_degree 2 \
-    --parallelism.expert_parallel_degree <EP> \
-    --training.steps 2
+NGPU=<NGPU> MODULE=transformers_modeling_backend CONFIG=new_model_fsdp_tp_ep \
+    ./run_train.sh
 ```
 
 **Every config must be run.** There are only three — run all of them.
@@ -538,13 +560,13 @@ handles all DTensor distribution and forward wrapping. Available
 helpers from ``torchtitan/models/common/decoder_sharding.py`` and
 ``torchtitan/experiments/transformers_modeling_backend/hf_sharding.py``:
 
-- ``colwise_config()`` — for linear projections (weight Shard(0),
+- ``colwise_sharding_config()`` — for linear projections (weight Shard(0),
   output Shard(-1))
-- ``rowwise_config(output_sp=True)`` — for output projections (weight
+- ``rowwise_sharding_config(output_sp=True)`` — for output projections (weight
   Shard(1), output Shard(1) for SP)
-- ``_hf_norm_config(enable_sp=True)`` — for norms (weight Replicate,
+- ``_hf_norm_sharding_config(enable_sp=True)`` — for norms (weight Replicate,
   activations Shard(1) when SP enabled)
-- ``_replicate_config(module)`` — for modules that should have
+- ``_replicate_sharding_config(module)`` — for modules that should have
   Replicate params/buffers without TP sharding (dynamically enumerates
   params and buffers to avoid ``_shard_states`` errors)
 - ``ShardingConfig(in_src_shardings=..., in_dst_shardings=...)`` —
@@ -556,23 +578,22 @@ to manually convert DTensor ↔ local tensors. Do NOT use
 ``parallelize_module`` from ``torch.distributed.tensor.parallel``.
 Use ``_sharding_config`` exclusively.
 
-The `--hf_model <model_id>` flag overrides the default model in the
-base config. If the base config has incompatible defaults for the new
-model (e.g. wrong tokenizer path), override those too with additional
-`--` flags. Do NOT give up because "the config is incompatible" — fix
-the incompatibility with overrides.
+Pass `<model_id>` to `model_registry` in the temporary recipes. If the base
+config has incompatible defaults for the new model (e.g. wrong tokenizer
+path), update those config fields in the helper as well. Do NOT give up because
+"the config is incompatible" -- fix the recipe.
 
 Common failure modes and fixes:
 - TP failures from unsupported attention projections — fix in
   `hf_sharding.py` by adding ShardingConfig in `_set_layer_sharding_configs`
 - EP failures from expert weight sharding — check FSDP `shard_placement_fn`
 - Shape mismatches from model-specific layer structure — fix in experiment code
-- Config incompatibility — add more `--override.flags` to the command
-- Tokenizer mismatch — override `--hf_assets_path` to point to the model
+- Config incompatibility -- update the temporary recipe
+- Tokenizer mismatch -- set `config.hf_assets_path` to the model assets
 - Custom attention with no standard Q/K/V/O projections — FAIL, not fixable
   without redundant compute
 - Mixed DTensor / plain Tensor — a module has buffers not declared in its
-  ShardingConfig's ``state_shardings``. Fix by using ``_replicate_config(module)``
+  ShardingConfig's ``state_shardings``. Fix by using ``_replicate_sharding_config(module)``
   which dynamically enumerates all params and buffers
 
 **Note:** If no GPUs are available, skip this phase and note it in the
@@ -634,13 +655,13 @@ experts is a true blocker requiring upstream changes.
 | Router key `router.weight` not converted | `state_dict_adapter.py` | Add regex pattern in `_build_hf_to_titan_patterns()` |
 | Shared expert round-trip broken | `state_dict_adapter.py` | Fix reverse patterns in `_build_titan_to_hf_patterns()` |
 | MoE layer attr is `feed_forward` not `mlp` | `model.py`, `moe_replacement.py` | Handle alternative attribute name |
-| Attention projection not in ShardingConfig | `hf_sharding.py` | Add case to `_set_layer_sharding_configs` using `colwise_config()`/`_replicate_config()` |
+| Attention projection not in ShardingConfig | `hf_sharding.py` | Add case to `_set_layer_sharding_configs` using `colwise_sharding_config()`/`_replicate_sharding_config()` |
 | Model rejects `grouped_mm` | `scripts/numerical_equivalence.py` | Skip `_experts_implementation` for this model |
 | `trust_remote_code` import error | Config loading | Try without `trust_remote_code` first |
 | `num_hidden_layers=1` has no MoE layer | Test config | Set `first_k_dense_replace=0` or increase layers |
 | State dict keys missing after round-trip | `state_dict_adapter.py` | Add patterns in `_build_hf_to_titan_patterns()` / `_build_titan_to_hf_patterns()` |
 | Layer-level MoE (router/experts are siblings of dense MLP) | `moe_replacement.py` | Treat dense MLP as shared expert inside the Titan MoE; replace `layer.mlp` with full MoE block containing router + experts + shared_experts(=dense MLP) |
-| TP fails with mixed DTensor/Tensor | `hf_sharding.py` | Module has undeclared buffers — use `_replicate_config(module)` which dynamically enumerates all params and buffers |
+| TP fails with mixed DTensor/Tensor | `hf_sharding.py` | Module has undeclared buffers — use `_replicate_sharding_config(module)` which dynamically enumerates all params and buffers |
 | Embedding has extra buffers (e.g. `embed_scale`) | `hf_sharding.py` | Already handled — `set_hf_sharding_configs` enumerates embedding buffers dynamically |
 
 ## Files touched (experiment folder only)

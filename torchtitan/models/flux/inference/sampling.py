@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import logging
 import math
 import os
 from collections.abc import Callable
@@ -12,9 +13,9 @@ import torch
 from einops import rearrange
 from PIL import ExifTags, Image
 from torch import Tensor
-from torchtitan.models.flux.model.autoencoder import AutoEncoder
-from torchtitan.models.flux.model.hf_embedder import FluxEmbedder
-from torchtitan.models.flux.model.model import FluxModel
+from torchtitan.models.flux.autoencoder import AutoEncoder
+from torchtitan.models.flux.hf_embedder import FluxEmbedder
+from torchtitan.models.flux.model import FluxModel
 from torchtitan.models.flux.tokenizer import FluxTokenizerContainer
 from torchtitan.models.flux.utils import (
     create_position_encoding_for_latents,
@@ -23,12 +24,14 @@ from torchtitan.models.flux.utils import (
     preprocess_data,
     unpack_latents,
 )
-from torchtitan.tools.logging import logger
 
 
 # ----------------------------------------
 #       Util functions for Sampling
 # ----------------------------------------
+
+
+logger = logging.getLogger(__name__)
 
 
 def time_shift(mu: float, sigma: float, t: Tensor):

@@ -59,6 +59,11 @@ jobs:
             sleep 15
           done
 
+      - name: Install CPU unit test dependencies
+        run: |
+          "$RUNNER_TEMP/validate-rc-venv/bin/python" -m pip install \
+            -r requirements-dev.txt
+
       - name: Verify installed package
         working-directory: ${{ runner.temp }}
         run: |
@@ -85,15 +90,15 @@ jobs:
           "$RUNNER_TEMP/validate-rc-venv/bin/python" - <<'PY'
           import torch
           import torch.nn.functional as F
-          from torchtitan.models.common.attention import ScaledDotProductAttention
-          from torchtitan.models.llama3 import model_registry
+          from torchtitan.models.common.attention import ScaledDotProductInnerAttention
+          from torchtitan.models.llama3 import build_model_config
 
           torch.manual_seed(42)
-          model_spec = model_registry("debugmodel")
-          for layer_config in model_spec.model.layers:
-              layer_config.attention.inner_attention = ScaledDotProductAttention.Config()
+          model_config = build_model_config("debugmodel")
+          for layer_config in model_config.layers:
+              layer_config.attention.inner_attention = ScaledDotProductInnerAttention.Config()
 
-          model = model_spec.model.build()
+          model = model_config.build()
           model.init_states(buffer_device=torch.device("cpu"))
           model.train()
           optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
@@ -116,3 +121,17 @@ jobs:
           assert losses[-1] < losses[0], losses
           print(f"losses={losses}")
           PY
+
+      - name: Run CPU unit tests against installed RC
+        run: |
+          test_root="$RUNNER_TEMP/validate-rc-tests"
+          mkdir -p "$test_root"
+          cp -R tests "$test_root/tests"
+          cp -R scripts "$test_root/scripts"
+          cp pyproject.toml "$test_root/pyproject.toml"
+          cd "$test_root"
+          unset PYTHONPATH
+          "$RUNNER_TEMP/validate-rc-venv/bin/python" -m pytest \
+            tests/unit_tests/cpu \
+            --durations=20 \
+            -vv

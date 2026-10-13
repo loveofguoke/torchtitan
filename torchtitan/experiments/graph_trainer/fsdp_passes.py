@@ -14,6 +14,7 @@ collectives.  They are no-ops when the graph contains no FSDP collectives.
 from __future__ import annotations
 
 import heapq
+import logging
 import operator
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable
@@ -24,15 +25,23 @@ import torch
 import torch.fx as fx
 from torch._dynamo.graph_deduplication import _stable_topological_sort
 from torch._inductor.fx_passes.bucketing import (
+    _resolve_group_name,
     BucketMode,
     is_all_gather_into_tensor as is_all_gather,
+    is_all_reduce_tensor,
+    is_reduce_scatter_tensor,
     is_wait_tensor,
+    merge_all_gather_bucket,
+    merge_all_reduce_bucket,
+    merge_reduce_scatter_bucket,
 )
+from torch._prims_common import clone_preserve_strides
 
 try:
     from torch._inductor.fx_passes.overlap_manual_scheduling import _move_overlap_nodes
 except ImportError:
     _move_overlap_nodes = None
+
 from torch._inductor.fx_passes.overlap_manual_scheduling import (
     manual_overlap_bucketing,
     ManualOverlapPreservingBucketer,
@@ -48,8 +57,20 @@ from torchtitan.experiments.graph_trainer.common_utils import (
     _is_backward_node,
     _MODULE_FQN,
 )
-from torchtitan.experiments.graph_trainer.fsdp_patterns import find_fsdp_unshard_outputs
-from torchtitan.tools.logging import logger
+from torchtitan.experiments.graph_trainer.ep_pass_utils import (
+    _chunk_owner,
+    _clear_chunk_ownership,
+)
+from torchtitan.experiments.graph_trainer.fsdp_patterns import (
+    annotate_fsdp_unshard_outputs,
+    find_fsdp_unshard_outputs_by_param,
+    fsdp_param_fqns,
+)
+from torchtitan.experiments.graph_trainer.mutation_utils import mutation_target_nodes
+from torchtitan.experiments.graph_trainer.simple_fsdp import FSDP_PARAM_FQNS_META
+
+
+logger = logging.getLogger(__name__)
 
 
 _FSDP_BUCKET_META = "fsdp_bucket"
@@ -82,39 +103,59 @@ def deduplicate_fsdp_unshard_chains_pass(
     chain from the same flat parameter placeholder. Downstream FSDP passes
     assume one unsharded value per flat parameter, so this pass rewrites all
     duplicate chains to the first chain and removes the now-dead duplicate
-    collective infrastructure.
+    collective infrastructure. It then annotates the canonical unshard
+    boundaries so later collective bucketing can replace the launch/wait nodes
+    without hiding the parameter reconstruction chain from downstream passes.
+
+    When deduplication makes one unshard chain serve multiple EP chunks, remove
+    its chunk ownership so EP scheduling treats it as shared infrastructure.
+    Prefer an output with consumers because dead-code elimination intentionally
+    retains effectful collectives after removing their unused preparation tail.
     """
     del example_inputs
 
     removable_nodes: set[fx.Node] = set()
     num_duplicate_chains = 0
-    for placeholder in gm.graph.find_nodes(op="placeholder"):
-        unshard_outputs = find_fsdp_unshard_outputs(placeholder)
+    placeholders = gm.graph.find_nodes(op="placeholder")
+    outputs_by_param = find_fsdp_unshard_outputs_by_param(placeholders)
+    for placeholder, unshard_outputs in outputs_by_param.items():
         if len(unshard_outputs) <= 1:
             continue
-        canonical_output = unshard_outputs[0]
-        for duplicate_output in unshard_outputs[1:]:
+        live_outputs = tuple(output for output in unshard_outputs if output.users)
+        canonical_output = live_outputs[0] if live_outputs else unshard_outputs[0]
+        shared_across_chunk_scopes = (
+            len({_chunk_owner(output) for output in live_outputs}) > 1
+        )
+        for duplicate_output in unshard_outputs:
+            if duplicate_output is canonical_output:
+                continue
             removable_nodes.update(
                 _chain_nodes_to_placeholder(duplicate_output, placeholder)
             )
-            duplicate_output.replace_all_uses_with(canonical_output)
+            if duplicate_output.users:
+                duplicate_output.replace_all_uses_with(canonical_output)
             num_duplicate_chains += 1
+        if shared_across_chunk_scopes:
+            _clear_chunk_ownership(
+                _chain_nodes_to_placeholder(canonical_output, placeholder)
+            )
 
-    if num_duplicate_chains == 0:
-        return gm
+    if num_duplicate_chains:
 
-    def _is_impure_for_fsdp_dedup(node: fx.Node) -> bool:
-        if node in removable_nodes:
-            return False
-        return node.is_impure()
+        def _is_impure_for_fsdp_dedup(node: fx.Node) -> bool:
+            if node in removable_nodes:
+                return False
+            return node.is_impure()
 
-    gm.graph.eliminate_dead_code(is_impure_node=_is_impure_for_fsdp_dedup)
-    gm.graph.lint()
-    gm.recompile()
-    logger.info(
-        "Canonicalized %d duplicate FSDP unshard chain(s)",
-        num_duplicate_chains,
-    )
+        gm.graph.eliminate_dead_code(is_impure_node=_is_impure_for_fsdp_dedup)
+        gm.graph.lint()
+        gm.recompile()
+        logger.info(
+            "Canonicalized %d duplicate FSDP unshard chain(s)",
+            num_duplicate_chains,
+        )
+
+    annotate_fsdp_unshard_outputs(gm)
     return gm
 
 
@@ -232,6 +273,250 @@ def reassign_collective_pgs_pass(
     return gm
 
 
+@dataclass(frozen=True)
+class _HSDPGradCollectiveChain:
+    all_reduce: fx.Node
+    all_reduce_wait: fx.Node
+    layout_input: fx.Node
+    layout_nodes: tuple[fx.Node, ...]
+    reduce_scatter: fx.Node
+    reduce_scatter_wait: fx.Node
+    grad_input: fx.Node
+
+
+def _match_hsdp_grad_collective_chain(
+    all_reduce: fx.Node,
+    *,
+    active_hsdp_process_group_pairs: set[tuple[str, int, str]],
+) -> _HSDPGradCollectiveChain | None:
+    c10d = torch.ops._c10d_functional
+    if len(all_reduce.users) != 1:
+        return None
+    all_reduce_wait = next(iter(all_reduce.users))
+    if (
+        all_reduce_wait.op != "call_function"
+        or all_reduce_wait.target is not c10d.wait_tensor.default
+        or len(all_reduce_wait.users) != 1
+    ):
+        return None
+
+    layout_input = next(iter(all_reduce_wait.users))
+    layout_nodes: tuple[fx.Node, ...] = ()
+    reduce_scatter = layout_input
+    if not is_reduce_scatter_tensor(reduce_scatter):
+        split = layout_input
+        if (
+            split.op != "call_function"
+            or split.target is not torch.ops.aten.split.Tensor
+            or not split.users
+        ):
+            return None
+        getitems = tuple(split.users)
+        if not all(
+            node.op == "call_function"
+            and node.target is operator.getitem
+            and len(node.users) == 1
+            for node in getitems
+        ):
+            return None
+        cats = {next(iter(node.users)) for node in getitems}
+        if len(cats) != 1:
+            return None
+        (cat,) = cats
+        if (
+            cat.op != "call_function"
+            or cat.target is not torch.ops.aten.cat.default
+            or set(cat.all_input_nodes) != set(getitems)
+            or len(cat.users) != 1
+        ):
+            return None
+        reduce_scatter = next(iter(cat.users))
+        layout_nodes = (split, *getitems, cat)
+
+        param_fqns = fsdp_param_fqns(all_reduce)
+        if not param_fqns or any(
+            fsdp_param_fqns(node) != param_fqns
+            for node in (all_reduce_wait, *layout_nodes, reduce_scatter)
+        ):
+            return None
+
+    if (
+        reduce_scatter.op != "call_function"
+        or reduce_scatter.target is not c10d.reduce_scatter_tensor.default
+        or not reduce_scatter.meta.get("autograd_backward", False)
+        or len(reduce_scatter.args) != 4
+        or reduce_scatter.args[1] != "sum"
+        or (
+            _resolve_group_name(all_reduce.args[2]),
+            reduce_scatter.args[2],
+            _resolve_group_name(reduce_scatter.args[3]),
+        )
+        not in active_hsdp_process_group_pairs
+        or len(reduce_scatter.users) != 1
+    ):
+        return None
+    reduce_scatter_wait = next(iter(reduce_scatter.users))
+    if (
+        reduce_scatter_wait.op != "call_function"
+        or reduce_scatter_wait.target is not c10d.wait_tensor.default
+    ):
+        return None
+
+    grad_input = all_reduce.args[0]
+    if not isinstance(grad_input, fx.Node):
+        return None
+    if not all(
+        isinstance(node.meta.get("val"), torch.Tensor)
+        for node in (
+            all_reduce,
+            all_reduce_wait,
+            reduce_scatter,
+            reduce_scatter_wait,
+        )
+    ):
+        return None
+    return _HSDPGradCollectiveChain(
+        all_reduce,
+        all_reduce_wait,
+        layout_input,
+        layout_nodes,
+        reduce_scatter,
+        reduce_scatter_wait,
+        grad_input,
+    )
+
+
+def reorder_hsdp_grad_collectives_pass(
+    gm: torch.fx.GraphModule,
+    example_inputs: tuple | None = None,
+    *,
+    hsdp_process_group_pairs: tuple[tuple[str, int, str], ...],
+) -> torch.fx.GraphModule:
+    """Reduce-scatter HSDP gradients before the replicate-axis all-reduce.
+
+    DTensor lowers the HSDP backward redistribution from ``(Partial, Partial)``
+    to ``(Replicate, Shard)`` in mesh-axis order. For both the dense
+    ``(dp_replicate, dp_shard)`` mesh and the routed-expert
+    ``(dp_replicate, edp_shard)`` mesh this produces the following chain::
+
+        all_reduce(dp_replicate) -> wait -> reduce_scatter(shard_axis) -> wait
+
+    The two sum reductions commute because they operate on distinct mesh axes.
+    Reversing them makes the all-reduce operate on the already-sharded gradient,
+    reducing its payload by the shard-axis degree. Each process-group pair is
+    ``(replicate_group_name, shard_degree, shard_group_name)``. The dense and
+    routed-expert meshes can have distinct process groups for their respective
+    ``dp_replicate`` axes.
+
+    For strided parameter shards, DTensor inserts a provenance-annotated
+    split/getitem/cat layout conversion between the all-reduce wait and the
+    reduce-scatter. This local linear permutation commutes with a sum
+    all-reduce, so the layout conversion and reduce-scatter can move ahead of
+    the all-reduce together.
+
+    All matching all-reduces are validated before the graph is changed. If any
+    target chain is unsupported, none are reordered; this prevents later
+    bucketing from seeing a mix of RS -> AR and AR -> RS chains.
+    """
+    del example_inputs
+    active_hsdp_process_group_pairs = {
+        process_group_pair
+        for process_group_pair in hsdp_process_group_pairs
+        if process_group_pair[1] > 1
+    }
+    if not active_hsdp_process_group_pairs:
+        return gm
+
+    c10d = torch.ops._c10d_functional
+    replicate_group_names = {
+        replicate_group_name
+        for replicate_group_name, _, _ in active_hsdp_process_group_pairs
+    }
+    target_all_reduces = tuple(
+        node
+        for node in gm.graph.nodes
+        if node.op == "call_function"
+        and node.target is c10d.all_reduce.default
+        and node.meta.get("autograd_backward", False)
+        and len(node.args) == 3
+        and node.args[1] == "sum"
+        and _resolve_group_name(node.args[2]) in replicate_group_names
+    )
+    chains = tuple(
+        _match_hsdp_grad_collective_chain(
+            all_reduce,
+            active_hsdp_process_group_pairs=active_hsdp_process_group_pairs,
+        )
+        for all_reduce in target_all_reduces
+    )
+    if any(chain is None for chain in chains):
+        logger.warning(
+            "Skipped HSDP gradient collective reordering because not every "
+            "target all-reduce has a supported HSDP reduction chain"
+        )
+        return gm
+
+    matched_chains = tuple(chain for chain in chains if chain is not None)
+    chain_nodes = [
+        node
+        for chain in matched_chains
+        for node in (
+            chain.all_reduce,
+            chain.all_reduce_wait,
+            *chain.layout_nodes,
+            chain.reduce_scatter,
+            chain.reduce_scatter_wait,
+        )
+    ]
+    if len(chain_nodes) != len(set(chain_nodes)):
+        logger.warning(
+            "Skipped HSDP gradient collective reordering because target "
+            "reduction chains overlap"
+        )
+        return gm
+
+    for chain in matched_chains:
+        all_reduce = chain.all_reduce
+        all_reduce_wait = chain.all_reduce_wait
+        reduce_scatter = chain.reduce_scatter
+        reduce_scatter_wait = chain.reduce_scatter_wait
+
+        # Redirect existing consumers before making the all-reduce a consumer
+        # of reduce_scatter_wait; replacing uses afterward would create a cycle.
+        reduce_scatter_wait.replace_all_uses_with(all_reduce_wait)
+        chain.layout_input.replace_input_with(all_reduce_wait, chain.grad_input)
+        all_reduce.args = (reduce_scatter_wait, *all_reduce.args[1:])
+        # Preserve each operation's provenance metadata, but update the
+        # all-reduce value metadata because it now carries the sharded tensor.
+        for dst, src in (
+            (all_reduce, reduce_scatter),
+            (all_reduce_wait, reduce_scatter_wait),
+        ):
+            for key in ("val", "tensor_meta", "example_value"):
+                if key not in src.meta:
+                    dst.meta.pop(key, None)
+                    continue
+                value = src.meta[key]
+                dst.meta[key] = (
+                    clone_preserve_strides(value)
+                    if isinstance(value, torch.Tensor)
+                    else value
+                )
+
+        # Move the all-reduce launch and wait after the reduce-scatter. Layout
+        # nodes, when present, remain immediately before the reduce-scatter.
+        reduce_scatter_wait.append(all_reduce)
+        all_reduce.append(all_reduce_wait)
+
+    if matched_chains:
+        gm.graph.lint()
+        gm.recompile()
+        logger.info(
+            "Reordered %d HSDP gradient collective chain(s)", len(matched_chains)
+        )
+    return gm
+
+
 def autobucketing_reordering_pass(
     gm: torch.fx.GraphModule, example_inputs: tuple | None = None
 ) -> torch.fx.GraphModule:
@@ -290,7 +575,9 @@ class FSDPParamOrderBucketer(ManualOverlapPreservingBucketer):
         param_idx = self.fsdp_param_module_order.get(module_fqn, len(self.node_idx))
         return (param_idx, self.node_idx[node])
 
-    def _bucket_group(self, coll_nodes: list[fx.Node]) -> None:
+    def _bucket_group(
+        self, coll_nodes: list[fx.Node]
+    ) -> tuple[dict[fx.Node, fx.Node], dict[fx.Node, list[fx.Node]]]:
         if self.fsdp_param_module_order:
             coll_nodes = sorted(coll_nodes, key=self._param_order_key)
         return super()._bucket_group(coll_nodes)
@@ -332,6 +619,7 @@ class JointManualOverlapScheduler(ManualOverlapScheduler):
         module_stack_fn: Callable[[fx.Node], list[tuple[str, type[Any]]]],
         bucket_mode: BucketMode | None = None,
         fsdp_param_module_order: dict[str, int] | None = None,
+        should_bucket_collective: Callable[[fx.Node], bool] | None = None,
     ) -> None:
         super().__init__(
             gm,
@@ -342,16 +630,23 @@ class JointManualOverlapScheduler(ManualOverlapScheduler):
         )
         self._is_backward_fn = is_backward_fn
         effective_bucket_mode = self.bucketer.bucket_mode
+        collective_info = self.collective_info
+        if should_bucket_collective is not None:
+            collective_info = {
+                node: info
+                for node, info in collective_info.items()
+                if should_bucket_collective(node)
+            }
         self.bucketer = FSDPParamOrderBucketer(
             graph=self.graph,
-            collective_info=self.collective_info,
+            collective_info=collective_info,
             scheduled=OrderedSet(self.graph.nodes),
             bucket_mode=effective_bucket_mode,
             fsdp_param_module_order=fsdp_param_module_order,
         )
 
     def _manual_bucket_collectives(self) -> None:
-        """Bucket per module, splitting by direction to keep fwd/bwd buckets disjoint."""
+        """Bucket per module, splitting by direction to keep buckets disjoint."""
         self._obtain_nodes_in_subgraph()
         for bucket_plan, nodes in zip(
             self.module_bucket_plans, self.nodes_in_subgraph, strict=True
@@ -373,6 +668,7 @@ class JointManualOverlapScheduler(ManualOverlapScheduler):
 
         self.graph.lint()
         self.nodes = list(self.graph.nodes)
+        self.node_ancestors = self._collect_node_ancestors()
         self.in_degree = Counter(user for node in self.nodes for user in node.users)
 
     def _annotate_new_bucket_nodes(
@@ -397,8 +693,8 @@ class JointManualOverlapScheduler(ManualOverlapScheduler):
 
     def _manual_reorder_graph(self) -> None:
         """Reorder pass with separate fwd/bwd buffers so AG pairing never
-        crosses the fwd/bwd boundary. RS pairing is unchanged — RSs only
-        occur in backward and are already direction-scoped.
+        crosses the fwd/bwd boundary. Gradient-collective pairing is unchanged;
+        those collectives only occur in backward and are already direction-scoped.
         """
         overlap_deps: dict[fx.Node, OrderedSet[fx.Node]] = defaultdict(OrderedSet)
 
@@ -427,11 +723,14 @@ class JointManualOverlapScheduler(ManualOverlapScheduler):
         self,
         overlap_deps: dict[fx.Node, OrderedSet[fx.Node]],
     ) -> None:
-        """Top-down scheduling loop that emits RS prefetch edges.
+        """Top-down scheduling loop that emits reduce-scatter prefetch edges.
 
-        RSs only occur in backward, so no direction tracking is needed.
-        Populates ``self.scheduled`` in topological order for the
-        subsequent reversed walk.
+        Reduce-scatters only occur in backward, so no direction tracking is
+        needed. A reordered HSDP all-reduce is the second stage of its
+        reduce-scatter, not a separate prefetch boundary. Its data dependency
+        keeps it after the reduce-scatter while the reduce-scatter scheduling
+        moves the complete reduction chain. Populates ``self.scheduled`` in
+        topological order for the subsequent reversed walk.
         """
         delayed_rs_wait_nodes: list[fx.Node] = []
         current_rs_start_nodes: list[fx.Node] = []
@@ -456,7 +755,8 @@ class JointManualOverlapScheduler(ManualOverlapScheduler):
                 if current_rs_start_nodes:
                     for delayed in delayed_rs_wait_nodes:
                         for rs_start in current_rs_start_nodes:
-                            overlap_deps[delayed].add(rs_start)
+                            if not self.node_ancestors.is_ancestor(delayed, rs_start):
+                                overlap_deps[delayed].add(rs_start)
                     delayed_rs_wait_nodes.clear()
                     current_rs_start_nodes.clear()
                 delayed_rs_wait_nodes.append(node)
@@ -548,6 +848,9 @@ def joint_transformer_block_bucketing_reordering_pass(
     insert_overlap_deps: bool = False,
     bucket_mode: BucketMode | None = None,
     fsdp_param_module_order: dict[str, int] | None = None,
+    bucket_all_gathers: bool = True,
+    bucket_reduce_scatters: bool = True,
+    bucket_all_reduces: bool = True,
 ) -> torch.fx.GraphModule:
     """Run joint-graph manual bucketing and reordering.
 
@@ -571,6 +874,9 @@ def joint_transformer_block_bucketing_reordering_pass(
             defaults to ``"custom_ops"`` via the parent class.
         fsdp_param_module_order: module order derived from traced parameter
             FQNs, used to pack FSDP buckets like Eager FSDP2.
+        bucket_all_gathers: whether to bucket all-gather collectives.
+        bucket_reduce_scatters: whether to bucket reduce-scatter collectives.
+        bucket_all_reduces: whether to bucket all-reduce collectives.
     """
 
     def _stack_fn(node: torch.fx.Node) -> list[tuple[str, type]]:
@@ -578,6 +884,15 @@ def joint_transformer_block_bucketing_reordering_pass(
         if not fqn:
             return []
         return [(fqn, torch.nn.Module)]
+
+    def _should_bucket_collective(node: fx.Node) -> bool:
+        if is_all_gather(node):
+            return bucket_all_gathers
+        if is_reduce_scatter_tensor(node):
+            return bucket_reduce_scatters
+        if is_all_reduce_tensor(node):
+            return bucket_all_reduces
+        return False
 
     scheduler = JointManualOverlapScheduler(
         gm,
@@ -587,10 +902,84 @@ def joint_transformer_block_bucketing_reordering_pass(
         module_stack_fn=_stack_fn,
         bucket_mode=bucket_mode,
         fsdp_param_module_order=fsdp_param_module_order,
+        should_bucket_collective=_should_bucket_collective,
     )
     overlapped_gm = scheduler.run()
     overlapped_gm.recompile()
     return overlapped_gm
+
+
+def merge_all_all_gathers(
+    gm: torch.fx.GraphModule,
+    example_inputs: tuple | None = None,
+) -> torch.fx.GraphModule:
+    """Merge each compatible group of all-gathers into one collective."""
+    all_gathers = [node for node in gm.graph.nodes if is_all_gather(node)]
+    all_gather_nodes_by_group_key: dict[tuple[Any, ...], list[fx.Node]] = defaultdict(
+        list
+    )
+    for node in all_gathers:
+        all_gather_nodes_by_group_key[(node.args[1], node.args[2])].append(node)
+    for group_nodes in all_gather_nodes_by_group_key.values():
+        if len(group_nodes) > 1:
+            merge_all_gather_bucket(
+                gm.graph,
+                group_nodes,
+                mode="custom_ops",
+            )
+    _stable_topological_sort(gm.graph, {})
+    gm.recompile()
+    return gm
+
+
+def merge_all_reduce_scatters(
+    gm: torch.fx.GraphModule,
+    example_inputs: tuple | None = None,
+) -> torch.fx.GraphModule:
+    """Merge each compatible group of reduce-scatters into one collective."""
+    reduce_scatters = [
+        node for node in gm.graph.nodes if is_reduce_scatter_tensor(node)
+    ]
+    reduce_scatter_nodes_by_group_key: dict[
+        tuple[Any, ...], list[fx.Node]
+    ] = defaultdict(list)
+    for node in reduce_scatters:
+        value = node.meta["val"]
+        reduce_scatter_nodes_by_group_key[
+            (node.args[1], node.args[2], node.args[3], value.device, value.dtype)
+        ].append(node)
+    for group_nodes in reduce_scatter_nodes_by_group_key.values():
+        if len(group_nodes) > 1:
+            merge_reduce_scatter_bucket(
+                gm.graph,
+                group_nodes,
+                mode="custom_ops",
+            )
+    _stable_topological_sort(gm.graph, {})
+    gm.recompile()
+    return gm
+
+
+def merge_all_all_reduces(
+    gm: torch.fx.GraphModule,
+    example_inputs: tuple | None = None,
+) -> torch.fx.GraphModule:
+    """Merge each compatible group of all-reduces into one collective."""
+    all_reduces = [node for node in gm.graph.nodes if is_all_reduce_tensor(node)]
+    all_reduce_nodes_by_group_key: dict[tuple[Any, ...], list[fx.Node]] = defaultdict(
+        list
+    )
+    for node in all_reduces:
+        value = node.meta["val"]
+        all_reduce_nodes_by_group_key[
+            (node.args[1], node.args[2], value.device, value.dtype)
+        ].append(node)
+    for group_nodes in all_reduce_nodes_by_group_key.values():
+        if len(group_nodes) > 1:
+            merge_all_reduce_bucket(gm.graph, group_nodes)
+    _stable_topological_sort(gm.graph, {})
+    gm.recompile()
+    return gm
 
 
 # --- EP-aware FSDP dense-region scheduling ---
@@ -657,6 +1046,23 @@ def get_transformer_block_bucket_counts(
     return bucket_counts
 
 
+def get_transformer_block_layer_ids(
+    state_fqns: Iterable[str], *, n_layers: int
+) -> frozenset[int]:
+    """Return transformer layer IDs owned by the traced model state."""
+    layer_ids = frozenset(
+        layer_id
+        for fqn in state_fqns
+        if (layer_id := _layer_id_from_fqn(fqn)) is not None
+    )
+    invalid = sorted(layer_id for layer_id in layer_ids if layer_id >= n_layers)
+    if invalid:
+        raise ValueError(
+            f"Traced state references layers {invalid}, but n_layers={n_layers}."
+        )
+    return layer_ids
+
+
 def _is_moe_layer_dense_fqn(fqn: str) -> bool:
     """Return whether an MoE-layer FQN belongs to the dense attention region."""
     parts = fqn.split(".")
@@ -702,6 +1108,10 @@ def _fsdp_bucket_logical_index(
     return None
 
 
+def _is_fsdp_chain_node(node: fx.Node) -> bool:
+    return bool(node.meta.get("custom", {}).get(FSDP_PARAM_FQNS_META, ()))
+
+
 def _is_dense_region_target_node(node: fx.Node) -> bool:
     """Return whether ``node`` is useful dense compute, not FSDP plumbing.
 
@@ -711,6 +1121,8 @@ def _is_dense_region_target_node(node: fx.Node) -> bool:
     compute window and can make them interfere with MoE token exchange.
     """
     if node.op != "call_function":
+        return False
+    if _is_fsdp_chain_node(node):
         return False
     if is_wait_tensor(node) or is_all_gather(node):
         return False
@@ -955,6 +1367,8 @@ def _validate_transformer_block_bucket_counts(
     *,
     n_layers: int,
     expected_bucket_counts: dict[int, int],
+    local_layer_ids: frozenset[int],
+    require_backward_all_gathers: bool,
 ) -> None:
     missing_expected = [
         layer_id
@@ -972,12 +1386,19 @@ def _validate_transformer_block_bucket_counts(
     if extra_expected:
         errors.append(f"unexpected expected-count layers {sorted(extra_expected)}")
 
+    unexpected_actual = sorted(set(comms) - local_layer_ids)
+    if unexpected_actual:
+        errors.append(
+            "found transformer-block collectives outside local layers "
+            f"{unexpected_actual}"
+        )
+
     empty_layer_comms: dict[str, list[tuple[fx.Node, fx.Node]]] = {
         "fwd_ag": [],
         "bwd_ag": [],
         "bwd_rs": [],
     }
-    for layer_id in range(n_layers):
+    for layer_id in sorted(local_layer_ids):
         expected = expected_bucket_counts.get(layer_id)
         if expected is None:
             continue
@@ -987,12 +1408,28 @@ def _validate_transformer_block_bucket_counts(
             "bwd_ag": len(layer_comms["bwd_ag"]),
             "bwd_rs": len(layer_comms["bwd_rs"]),
         }
+        expected_by_kind = {"fwd_ag": expected, "bwd_rs": expected}
         mismatches = {
-            kind: count for kind, count in actual.items() if count != expected
+            kind: count
+            for kind, count in actual.items()
+            if kind in expected_by_kind and count != expected_by_kind[kind]
         }
+        valid_backward_all_gathers = (
+            actual["bwd_ag"] == expected
+            if require_backward_all_gathers
+            else actual["bwd_ag"] <= expected
+        )
+        if not valid_backward_all_gathers:
+            mismatches["bwd_ag"] = actual["bwd_ag"]
         if mismatches:
+            expected_bwd_ag = (
+                str(expected) if require_backward_all_gathers else f"0..{expected}"
+            )
             errors.append(
-                f"layer {layer_id}: expected {expected} buckets per kind, "
+                f"layer {layer_id}: expected "
+                f"fwd_ag={expected_by_kind['fwd_ag']} "
+                f"bwd_ag={expected_bwd_ag} "
+                f"bwd_rs={expected_by_kind['bwd_rs']}, "
                 f"got fwd_ag={actual['fwd_ag']} bwd_ag={actual['bwd_ag']} "
                 f"bwd_rs={actual['bwd_rs']}"
             )
@@ -1012,6 +1449,8 @@ def schedule_fsdp_comms_to_dense_regions_pass(
     moe_layer_ids: frozenset[int],
     n_layers: int,
     transformer_bucket_counts_by_layer: dict[int, int] | None = None,
+    local_layer_ids: frozenset[int] | None = None,
+    require_backward_all_gathers: bool = True,
     strict: bool = False,
 ) -> torch.fx.GraphModule:
     """Schedule bucketed FSDP comms to overlap with dense (attention) regions.
@@ -1052,20 +1491,27 @@ def schedule_fsdp_comms_to_dense_regions_pass(
             comms,
             n_layers=n_layers,
             expected_bucket_counts=transformer_bucket_counts_by_layer,
+            local_layer_ids=(
+                frozenset(range(n_layers))
+                if local_layer_ids is None
+                else local_layer_ids
+            ),
+            require_backward_all_gathers=require_backward_all_gathers,
         )
 
     order = {node: i for i, node in enumerate(gm.graph.nodes)}
-
     _FSDP_INFRA_OPS = {
         torch.ops.bucketing._pre_bucket_all_gather.default,
         torch.ops.bucketing._pre_bucket_reduce_scatter.default,
         torch.ops._c10d_functional.all_gather_into_tensor.default,
         torch.ops._c10d_functional.all_gather_into_tensor_out.default,
         torch.ops._c10d_functional.reduce_scatter_tensor.default,
+        torch.ops.aten.constant_pad_nd.default,
         torch.ops.aten.slice.Tensor,
     }
     _FSDP_WAIT_OUTPUT_OPS = {
         operator.getitem,
+        torch.ops.aten.alias.default,
         torch.ops.aten._to_copy.default,
         torch.ops.aten._unsafe_view.default,
         torch.ops.aten.clone.default,
@@ -1089,9 +1535,14 @@ def schedule_fsdp_comms_to_dense_regions_pass(
         if node.target is not torch.ops.aten.add_.Tensor:
             return False, f"{wait.name} has non-output user {node.name} ({node.target})"
 
-        mutated_arg = node.args[0] if node.args else None
-        if not isinstance(mutated_arg, fx.Node):
-            return False, f"{node.name} has non-node mutated input"
+        mutation_targets = mutation_target_nodes(node)
+        if len(mutation_targets) != 1:
+            return (
+                False,
+                f"{node.name} has {len(mutation_targets)} schema-declared "
+                "mutation targets; expected one",
+            )
+        (mutated_arg,) = mutation_targets
 
         # Chunked loss can accumulate multiple reduce-scattered grad shards via
         # an in-place add chain before returning the detached final shard. That
@@ -1111,15 +1562,19 @@ def schedule_fsdp_comms_to_dense_regions_pass(
         return True, None
 
     def _collect_launch_chain(launch: fx.Node) -> list[fx.Node]:
-        """Collect the FSDP infrastructure chain rooted at ``launch``."""
+        """Collect the FSDP preparation chain rooted at ``launch``."""
         chain: list[fx.Node] = []
         work = [launch]
         visited: set[fx.Node] = set()
+        annotated_all_gather = is_all_gather(launch) and _is_fsdp_chain_node(launch)
         while work:
             n = work.pop()
             if n in visited or n.op in ("placeholder", "get_attr"):
                 continue
-            if n.target not in _FSDP_INFRA_OPS:
+            if annotated_all_gather:
+                if not _is_fsdp_chain_node(n):
+                    continue
+            elif n.target not in _FSDP_INFRA_OPS:
                 continue
             visited.add(n)
             chain.append(n)
@@ -1168,9 +1623,9 @@ def schedule_fsdp_comms_to_dense_regions_pass(
     def _move_chain_before(launch: fx.Node, target: fx.Node) -> tuple[bool, list[str]]:
         """Move an AG/RS launch and its FSDP infrastructure chain before ``target``.
 
-        Only moves FSDP-specific infrastructure nodes. In particular, RS
-        gradient producers such as casts or adds stay where autograd produced
-        them; target selection ensures the launch moves after those producers.
+        Annotated AG chains include all parameter preparation. RS gradient
+        producers such as casts or adds stay where autograd produced them;
+        target selection ensures the launch moves after those producers.
         """
         target_pos = order[target]
 
@@ -1304,17 +1759,23 @@ def schedule_fsdp_comms_to_dense_regions_pass(
             + "\n".join(f"- {blocker}" for blocker in blockers)
         )
 
-    failed_moves: list[str] = []
     for comm in all_comms:
         if comm.kind != "rs":
             continue
         moved_wait, reason = _sink_output_only_wait_closure(comm.wait)
         wait_closures_sunk += int(moved_wait)
-        if not moved_wait and strict:
-            failed_moves.append(
+        if not moved_wait and strict and comm.logical_index is not None:
+            blockers.append(
                 f"RS wait sink for {comm.plan_fqns!r} {comm.wait.name}: {reason}"
             )
 
+    if blockers and strict:
+        raise ValueError(
+            "Could not finish FSDP dense-region scheduling:\n"
+            + "\n".join(f"- {blocker}" for blocker in blockers)
+        )
+
+    failed_moves: list[str] = []
     for launch, _wait, target, description in moves:
         # Recompute order before each move to account for prior moves.
         order = {node: i for i, node in enumerate(gm.graph.nodes)}

@@ -15,7 +15,11 @@ from typing import Any, cast, Protocol, TypeAlias
 import grain.python as grain
 import numpy as np
 
-from torchtitan.components.data.sources import RandomAccessDataSource, SourceConfig
+from torchtitan.components.data.sources import (
+    RandomAccessDataSource,
+    SourceConfig,
+    StreamingDataSource,
+)
 from torchtitan.components.data.types import DatasetBuildContext, DatasetIterationPolicy
 from torchtitan.config import Configurable
 
@@ -49,6 +53,19 @@ class TextSequence:
     """Target for each input token, with `IGNORE_INDEX` where loss is disabled."""
     positions: np.ndarray | None = None
     """Per-token positions; `None` until packing or collation materializes them."""
+    padding_mask: np.ndarray | None = None
+    """Per-token mask that is true for padding; `None` before padding."""
+
+    def __post_init__(self) -> None:
+        lengths = [len(self.input_ids), len(self.labels)]
+        if self.positions is not None:
+            lengths.append(len(self.positions))
+        if self.padding_mask is not None:
+            lengths.append(len(self.padding_mask))
+        if len(set(lengths)) != 1:
+            raise ValueError(
+                f"TextSequence fields must have equal lengths, got {lengths}"
+            )
 
 
 class SampleProcessor(Configurable, ABC):
@@ -86,16 +103,16 @@ class SingleDatasetConfig:
         context: DatasetBuildContext,
         dataset_iteration_policy: DatasetIterationPolicy,
     ) -> GrainDataset:
-        source = self.source.build(
-            dataset_iteration_policy=dataset_iteration_policy,
-        )
+        source = self.source.build()
         if isinstance(source, RandomAccessDataSource):
             dataset: GrainDataset = grain.MapDataset.source(source)
-        elif isinstance(source, grain.IterDataset):
-            dataset = source
+        elif isinstance(source, StreamingDataSource):
+            dataset = source.build_iter_dataset(
+                dataset_iteration_policy=dataset_iteration_policy
+            )
         else:
             raise TypeError(
-                "source must be a RandomAccessDataSource or grain.IterDataset"
+                "source must build a RandomAccessDataSource or StreamingDataSource"
             )
 
         if isinstance(dataset, grain.MapDataset):
@@ -272,9 +289,15 @@ class DatasetConcatConfig:
         children = [
             dataset.build(
                 context=context,
-                dataset_iteration_policy=child_iteration_policy,
+                # As in DatasetMixConfig, each child gets its own seed so that
+                # a repeated child does not repeat its random draws.
+                # Inserting or reordering a child reseeds every later child.
+                dataset_iteration_policy=replace(
+                    child_iteration_policy,
+                    seed=dataset_iteration_policy.seed + index,
+                ),
             )
-            for dataset in self.datasets
+            for index, dataset in enumerate(self.datasets)
         ]
 
         if not children or not all(

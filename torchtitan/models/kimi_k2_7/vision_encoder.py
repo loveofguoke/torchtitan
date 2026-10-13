@@ -18,22 +18,21 @@ Shape suffixes:
 """
 
 from dataclasses import dataclass, field
-from typing import cast
 
 import spmd_types as spmd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from torchtitan.distributed.utils import get_spmd_backend
+from torchtitan.models.base.module import Module, ModuleDict
+
 from torchtitan.models.common import Linear
-from torchtitan.models.common.nn_modules import GELU, LayerNorm
-from torchtitan.models.common.rope import _maybe_wrap_positions, ComplexRoPE
+from torchtitan.models.common.nn_modules import GELU, LayerNorm, RMSNorm
+from torchtitan.models.common.rope import ComplexRoPE
 from torchtitan.models.common.vision_encoder import (
     create_block_diagonal_mask,
     VisionTransformerBlock,
 )
-from torchtitan.protocols.module import Module, ModuleDict
 
 
 def _get_temporal_pos_embed(
@@ -119,10 +118,10 @@ def _compute_learned_pos_embeds(
                 pos[i] = frames.reshape(t * h * w, dim)
 
     packed_pos = torch.cat([pos[i] for i in range(len(grids))], dim=0)
-    if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
-        packed_pos = spmd.mutate_type(
-            packed_pos, src=spmd.R, dst={"dp": spmd.V, "tp": spmd.I}
-        )
+    if spmd.is_type_checking():
+        # `packed_pos` is inferred as DP-replicated from `pos_embed`, but it varies
+        # across DP ranks because each rank has different `grids`.
+        packed_pos = spmd.mutate_type(packed_pos, "dp", src=spmd.R, dst=spmd.V)
     return packed_pos
 
 
@@ -168,9 +167,9 @@ def _compute_2d_rope_cache(
         # Raster order: position p -> (row = p // w, col = p % w). Gather each
         # axis's angles from the precomputed table (freq_table[pos] = pos*inv_freq).
         flat = torch.arange(h * w, device=device)
-        flat = cast(torch.Tensor, _maybe_wrap_positions(flat, freq_table))
-        if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
+        if spmd.is_type_checking():
             flat = spmd.mutate_type(flat, "tp", src=spmd.R, dst=spmd.I)
+            flat = spmd.mutate_type(flat, "cp", src=spmd.R, dst=spmd.I)
         x_ang = freq_table[flat % w]  # (h*w, head_dim/4) column
         y_ang = freq_table[flat // w]  # (h*w, head_dim/4) row
         # Interleave x/y so pair 2k uses x-position, pair 2k+1 uses y-position.
@@ -181,10 +180,8 @@ def _compute_2d_rope_cache(
 
     # Complex unit-modulus cache; unsqueeze the head axis for broadcast.
     packed_angles = torch.cat([angles[i] for i in range(len(grids))], dim=0)
-    if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
-        packed_angles = spmd.mutate_type(
-            packed_angles, src=spmd.R, dst={"dp": spmd.V, "tp": spmd.I}
-        )
+    if spmd.is_type_checking():
+        packed_angles = spmd.mutate_type(packed_angles, "dp", src=spmd.R, dst=spmd.V)
     return torch.polar(torch.ones_like(packed_angles), packed_angles).unsqueeze(1)
 
 
@@ -278,9 +275,9 @@ class VisionRotaryEmbedding2D(Module):
         seq = torch.arange(
             seqlen, device=self.inv_freq.device, dtype=self.inv_freq.dtype
         )
-        seq = cast(torch.Tensor, _maybe_wrap_positions(seq, self.inv_freq))
-        if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
+        if spmd.is_type_checking():
             seq = spmd.mutate_type(seq, "tp", src=spmd.R, dst=spmd.I)
+            seq = spmd.mutate_type(seq, "cp", src=spmd.R, dst=spmd.I)
         return torch.outer(seq, self.inv_freq)
 
 
@@ -325,31 +322,26 @@ class VisionProjector(Module):
         return self.linear_2(x)
 
 
-class KimiK25VisionEncoder(Module):
-    """MoonViT3d vision tower + multimodal projector for Kimi K2.5."""
+class MoonViTEncoder(Module):
+    """MoonViT3d vision tower + multimodal projector."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
-        dim: int = 1152
-        num_layers: int = 27
-        num_heads: int = 16
-
-        patch_size: int = 14
-        in_channels: int = 3
-        merge_kernel_size: list[int] = field(default_factory=lambda: [2, 2])
-        text_hidden_size: int = 7168
+        dim: int
+        num_layers: int
+        merge_kernel_size: list[int]
 
         # Learnable 2D spatial position table, shape (height, width, dim).
-        init_pos_emb_height: int = 64
-        init_pos_emb_width: int = 64
-        interpolation_mode: str = "bicubic"
+        init_pos_emb_height: int
+        init_pos_emb_width: int
+        interpolation_mode: str
 
         # Sub-modules.
         patch_embed_proj: Linear.Config
         rotary_pos_emb: VisionRotaryEmbedding2D.Config
         block: VisionTransformerBlock.Config
-        final_norm: LayerNorm.Config
-        projector: VisionProjector.Config
+        final_norm: LayerNorm.Config | RMSNorm.Config
+        projector: Module.Config
 
     def __init__(self, config: Config):
         super().__init__()
@@ -449,7 +441,7 @@ class KimiK25VisionEncoder(Module):
         learned_pos, rope_cache = self.compute_position_embeddings(grids)
         x = self.patch_embed(pixel_values) + learned_pos
 
-        # BlockMask creation and use in FlexAttention are blackboxed from
+        # BlockMask creation and use in FlexInnerAttention are blackboxed from
         # typechecking.
         with spmd.no_typecheck():
             attention_mask = create_block_diagonal_mask(
@@ -472,3 +464,25 @@ class KimiK25VisionEncoder(Module):
         # pyrefly: ignore [bad-argument-type]
         merged = _tpool_patch_merger(x, grids, self.merge_kernel_size)
         return self.projector(merged)
+
+
+class KimiK25VisionEncoder(MoonViTEncoder):
+    """MoonViT3d vision tower + multimodal projector for Kimi K2.5."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(MoonViTEncoder.Config):
+        dim: int = 1152
+        num_layers: int = 27
+        num_heads: int = 16
+
+        patch_size: int = 14
+        in_channels: int = 3
+        merge_kernel_size: list[int] = field(default_factory=lambda: [2, 2])
+        text_hidden_size: int = 7168
+
+        init_pos_emb_height: int = 64
+        init_pos_emb_width: int = 64
+        interpolation_mode: str = "bicubic"
+
+        final_norm: LayerNorm.Config  # pyrefly: ignore [bad-override]
+        projector: VisionProjector.Config  # pyrefly: ignore [bad-override]
