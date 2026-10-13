@@ -24,8 +24,12 @@ from torchtitan.trainer import Trainer
 from . import model_registry
 
 
-def _glm5_debugmodel(flavor: str) -> Trainer.Config:
-    model_spec = model_registry(flavor)
+def _glm5_debugmodel(
+    flavor: str,
+    *,
+    moe_comm_backend: str = "standard",
+) -> Trainer.Config:
+    model_spec = model_registry(flavor, moe_comm_backend=moe_comm_backend)
     return Trainer.Config(
         loss=ChunkedLossWrapper.Config(
             loss_fn=CrossEntropyLoss.Config(
@@ -72,6 +76,18 @@ def _glm5_debugmodel(flavor: str) -> Trainer.Config:
 def glm5_debugmodel() -> Trainer.Config:
     """Short, local-assets configuration for independent DSA indexers."""
     return _glm5_debugmodel("debugmodel")
+
+
+def glm5_debugmodel_deepep() -> Trainer.Config:
+    """GPU DeepEP v2 config that exercises dispatch/combine with EP=4."""
+    config = _glm5_debugmodel("debugmodel", moe_comm_backend="deepep")
+    config.parallelism = ParallelismConfig(
+        expert_parallel_degree=4,
+        enable_sequence_parallel=True,
+        context_parallel_load_balancer=None,
+        spmd_backend="partial_dtensor",
+    )
+    return config
 
 
 def glm5_shared_dsa_debugmodel() -> Trainer.Config:

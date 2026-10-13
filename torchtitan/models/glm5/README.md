@@ -103,6 +103,17 @@ For the repository launcher, request exactly one process/device:
 NGPU=1 MODULE=glm5 CONFIG=glm5_debugmodel ./run_train.sh
 ```
 
+The default configuration uses TorchTitan's standard PyTorch all-to-all token
+dispatcher. A separate opt-in configuration exercises the GPU DeepEP v2
+backend with EP=4:
+
+```bash
+NGPU=4 MODULE=glm5 CONFIG=glm5_debugmodel_deepep ./run_train.sh
+```
+
+This requires a compatible `deep_ep` v2 installation and supported NVIDIA
+hardware. It does not select the separate DeepEP-Ascend prototype.
+
 The shared-index DSA debug configuration reuses one Top-K selection across
 each adjacent pair of layers:
 

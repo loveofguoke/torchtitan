@@ -27,11 +27,16 @@ from torchtitan.distributed.pipeline_parallel import (
 )
 from torchtitan.models.common import ComplexRoPE, LayerNorm, Linear, RMSNorm
 from torchtitan.models.common.decoder import Decoder
+from torchtitan.models.common.token_dispatcher import (
+    AllToAllTokenDispatcher,
+    DeepEPTokenDispatcher,
+)
 from torchtitan.models.glm5 import build_glm5_layers, glm5_configs, Glm5StateDictAdapter
 from torchtitan.models.glm5.config_registry import (
     glm5_2_debugmodel,
     glm5_2_scaled_debugmodel,
     glm5_debugmodel,
+    glm5_debugmodel_deepep,
 )
 from torchtitan.models.glm5.model import (
     DSAIndexerTopK,
@@ -985,6 +990,41 @@ class TestGlm5Registration(unittest.TestCase):
         self.assertIs(spec.state_dict_adapter, Glm5StateDictAdapter)
         self.assertIs(spec.pipelining_fn, pipeline_llm)
         self.assertIs(spec.post_optimizer_build_fn, register_moe_load_balancing_hook)
+
+    def test_model_registry_defaults_to_standard_moe_dispatch(self):
+        spec = glm5.model_registry("debugmodel")
+        moe_layers = [layer.moe for layer in spec.model.layers if layer.moe is not None]
+
+        self.assertTrue(moe_layers)
+        self.assertTrue(
+            all(
+                isinstance(
+                    moe.routed_experts.token_dispatcher,
+                    AllToAllTokenDispatcher.Config,
+                )
+                for moe in moe_layers
+            )
+        )
+
+    def test_deepep_training_config_is_explicit_and_uses_ep4(self):
+        config = glm5_debugmodel_deepep()
+        moe_layers = [
+            layer.moe
+            for layer in config.model_spec.model.layers
+            if layer.moe is not None
+        ]
+
+        self.assertEqual(config.parallelism.expert_parallel_degree, 4)
+        self.assertTrue(moe_layers)
+        self.assertTrue(
+            all(
+                isinstance(
+                    moe.routed_experts.token_dispatcher,
+                    DeepEPTokenDispatcher.Config,
+                )
+                for moe in moe_layers
+            )
+        )
 
     def test_debug_training_config_uses_single_device_defaults(self):
         config = glm5_debugmodel()

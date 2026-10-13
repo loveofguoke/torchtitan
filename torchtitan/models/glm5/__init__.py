@@ -226,6 +226,7 @@ def build_glm5_layers(
     index_head_dim: int,
     index_topk: int,
     attention_dropout: float,
+    moe_comm_backend: str = "standard",
     mla_norm_eps: float = 1e-6,
     norm_eps: float = 1e-5,
     rope: ComplexRoPE.Config,
@@ -298,7 +299,7 @@ def build_glm5_layers(
                     num_experts=num_experts,
                     top_k=router_top_k,
                     param_init=_depth_experts_init(layer_id),
-                    comm_backend="standard",
+                    comm_backend=moe_comm_backend,
                 ),
                 shared_experts=make_ffn_config(
                     dim=dim,
@@ -328,6 +329,7 @@ def _debugmodel(
     *,
     n_dense_layers: int = 1,
     index_sources: tuple[int, ...] = (),
+    moe_comm_backend: str = "standard",
 ) -> Glm5Model.Config:
     dim = 256
     vocab_size = 2048
@@ -374,24 +376,31 @@ def _debugmodel(
             index_head_dim=64,
             index_topk=8,
             attention_dropout=0.0,
+            moe_comm_backend=moe_comm_backend,
             rope=rope,
         ),
     )
 
 
-def _shared_dsa_debugmodel() -> Glm5Model.Config:
-    return _debugmodel(index_sources=(0, 0, 2, 2, 4, 4, 6, 6))
+def _shared_dsa_debugmodel(*, moe_comm_backend: str = "standard") -> Glm5Model.Config:
+    return _debugmodel(
+        index_sources=(0, 0, 2, 2, 4, 4, 6, 6),
+        moe_comm_backend=moe_comm_backend,
+    )
 
 
-def _glm5_2_debugmodel() -> Glm5Model.Config:
+def _glm5_2_debugmodel(*, moe_comm_backend: str = "standard") -> Glm5Model.Config:
     """Build a small model that preserves GLM-5.2 layer-type transitions."""
     return _debugmodel(
         n_dense_layers=3,
         index_sources=(0, 1, 2, 2, 2, 2, 6, 6),
+        moe_comm_backend=moe_comm_backend,
     )
 
 
-def _glm5_2_scaled_debugmodel() -> Glm5Model.Config:
+def _glm5_2_scaled_debugmodel(
+    *, moe_comm_backend: str = "standard"
+) -> Glm5Model.Config:
     """Build a larger GLM-5.2 validation model with the released structure.
 
     This flavor is sized for single-device training on the smaller validation
@@ -459,6 +468,7 @@ def _glm5_2_scaled_debugmodel() -> Glm5Model.Config:
             index_head_dim=128,
             index_topk=512,
             attention_dropout=0.0,
+            moe_comm_backend=moe_comm_backend,
             mla_norm_eps=1e-5,
             norm_eps=1e-5,
             rope=rope,
@@ -466,7 +476,7 @@ def _glm5_2_scaled_debugmodel() -> Glm5Model.Config:
     )
 
 
-def _glm5_2_744b_a40b() -> Glm5Model.Config:
+def _glm5_2_744b_a40b(*, moe_comm_backend: str = "standard") -> Glm5Model.Config:
     """Build the released GLM-5.2 744B-A40B decoder architecture.
 
     The values mirror zai-org/GLM-5.2 ``config.json``. TorchTitan currently
@@ -530,6 +540,7 @@ def _glm5_2_744b_a40b() -> Glm5Model.Config:
             index_head_dim=128,
             index_topk=2048,
             attention_dropout=0.0,
+            moe_comm_backend=moe_comm_backend,
             mla_norm_eps=1e-5,
             norm_eps=1e-5,
             rope=rope,
@@ -547,12 +558,15 @@ glm5_configs = {
 }
 
 
-def model_registry(flavor: str = "debugmodel") -> ModelSpec:
+def model_registry(
+    flavor: str = "debugmodel",
+    moe_comm_backend: str = "standard",
+) -> ModelSpec:
     """Return every framework callback required to train one GLM-5 flavor."""
     return ModelSpec(
         name="glm5",
         flavor=flavor,
-        model=glm5_configs[flavor](),
+        model=glm5_configs[flavor](moe_comm_backend=moe_comm_backend),
         parallelize_fn=parallelize_glm5,
         pipelining_fn=pipeline_llm,
         post_optimizer_build_fn=register_moe_load_balancing_hook,

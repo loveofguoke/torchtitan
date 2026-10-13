@@ -23,6 +23,7 @@ test the exact three source revisions used by an experiment.
 |---|---|---|
 | `Glm5Model.forward`, token/position/mask shapes | parity traces, fixed-token input, CP/PP smoke and precision capture | parity CPU tests, single/PP/CP smoke, fixed-input contract |
 | `glm5_configs`, `glm5_debugmodel`, model config fields | Turbo GLM patch, every test launcher | Turbo config conversion, command generation, all topology validation |
+| `model_registry(..., moe_comm_backend=...)`, `glm5_debugmodel_deepep` | GPU DeepEP experiments; standard GPU/NPU launchers | config parsing, dispatcher-type contract, EP4 GPU correctness/performance A/B |
 | `make_router_config`, `TokenChoiceTopKRouter` behavior | `NpuGlm5TokenChoiceTopKRouter` | reference-vs-NPU router contract test, EP smoke/parity |
 | `Glm5StateDictAdapter` keys and placements | HF parity, checkpoint conversion, TP-sharded export | adapter unit tests, HF round trip, TP distributed adapter test |
 | `parallelize.py` and `sharding.py` | smoke, precision, graph and performance topology suites | single plus every affected topology; inspect TP/CP/PP/EP combinations |

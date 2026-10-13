@@ -368,6 +368,15 @@ class TestConfigManager(unittest.TestCase):
         assert config.model_spec.name == "glm5"
         assert config.model_spec.flavor == "debugmodel"
 
+    def test_glm5_deepep_config(self):
+        """Test that the opt-in GLM-5 GPU DeepEP config is registered."""
+        config = ConfigManager().parse_args(
+            ["--module", "glm5", "--config", "glm5_debugmodel_deepep"]
+        )
+        assert config.model_spec.name == "glm5"
+        assert config.model_spec.flavor == "debugmodel"
+        assert config.parallelism.expert_parallel_degree == 4
+
     def test_glm5_2_debug_config(self):
         """Test that the GLM-5.2 structural debug config is registered."""
         config = ConfigManager().parse_args(
