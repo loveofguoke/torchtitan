@@ -13,6 +13,7 @@ from torchtitan.models.glm5.dsa import (
     Glm5KVAllGatherCPFlexAttention,
 )
 from torchtitan.models.glm5.model import Glm5Attention
+from torchtitan.models.glm5.mtp import Glm5MTPTransformerBlock
 
 
 class TestGlm5Config(unittest.TestCase):
@@ -57,6 +58,27 @@ class TestGlm5Config(unittest.TestCase):
         model = config.build()
         model.init_states()
         self.assertGreater(sum(parameter.numel() for parameter in model.parameters()), 0)
+
+    def test_mtp_flavor_builds_full_nextn_block(self) -> None:
+        config = build_model_config(
+            "glm5_2_debugmodel_mtp",
+            parallelism=ParallelismConfig(),
+            seq_len=8,
+        )
+        self.assertEqual(len(config.mtp_layers), 1)
+        self.assertIsInstance(
+            config.mtp_layers[0], Glm5MTPTransformerBlock.Config
+        )
+        self.assertTrue(all(layer.preserve_output_for_mtp for layer in config.layers))
+        model = config.build()
+        model.init_states()
+        self.assertEqual(len(model.mtp_layers), 1)
+
+    def test_mtp_recipe_propagates_depth_to_dataloader(self) -> None:
+        from torchtitan_recipes.tests.models.glm5 import glm5_2_debugmodel_mtp
+
+        config = glm5_2_debugmodel_mtp()
+        self.assertEqual(config.dataloader.num_mtp_layers, 1)
 
     def test_cp_selects_official_kv_all_gather_attention(self) -> None:
         eager_config = build_model_config(

@@ -30,20 +30,21 @@ import torch
 import torch_remat as remat
 from torch import nn
 
+from torchtitan.components.loss import IGNORE_INDEX
+from torchtitan.distributed.spmd_types import annotate_input_spmd_types
+from torchtitan.models.base.module import Module
 from torchtitan.models.common import ComplexRoPE, Linear, RMSNorm
 from torchtitan.models.common.attention import BaseAttention
 from torchtitan.models.common.aux_loss import AuxLoss
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.models.common.decoder_sharding import decoder_input_sharding
-from torchtitan.models.base.module import Module
 from torchtitan.models.common.flops import get_nparams_and_active_nparams
-from torchtitan.distributed.spmd_types import annotate_input_spmd_types
-
-from .state_dict_adapter import Glm5StateDictAdapter
+from torchtitan.models.deepseek_v3.mtp import MTPDecoder, roll_mtp_sequence
 
 from .dsa import DSAIndexerTopK, Glm5DsaIndexer, create_dsa_causal_mask
 from .dsa import Glm5FlexAttention as DSAInnerAttention
 from .sharding import dsa_mask_placement
+from .state_dict_adapter import Glm5StateDictAdapter
 
 # Tensor dimensions used in this file:
 # T/Q/K: token, query-token, and key-token dimensions.
@@ -190,13 +191,14 @@ class Glm5TransformerBlock(TransformerBlock):
 
     @dataclass(kw_only=True, slots=True)
     class Config(TransformerBlock.Config):
-        pass
+        preserve_output_for_mtp: bool = False
 
     def __init__(self, config: Config):
         super().__init__()
         self.attention = config.attention.build()
         self.attention_norm = config.attention_norm.build()
         self.ffn_norm = config.ffn_norm.build()
+        self.preserve_output_for_mtp = config.preserve_output_for_mtp
         self.moe_enabled = config.moe is not None
         if self.moe_enabled:
             assert config.moe is not None
@@ -238,15 +240,27 @@ class Glm5TransformerBlock(TransformerBlock):
             )
         else:
             ffn_output_TD = self.feed_forward(normalized_TD)
+        if self.preserve_output_for_mtp:
+            # The saved residual add is a bare consumer of the MoE/FFN result.
+            # MTP's auxiliary backward branch replays this boundary, so declare
+            # the input dependency before entering the non-recomputed region.
+            remat.recompute_needs_tensor(ffn_output_TD)
         # Trailing add, always saved: it saves nothing for backward, so replay skips
         # it and its inputs need no persisting, matching checkpoint early stop.
         output_TD = remat.region(
             torch.add, self.remat_region_name("ffn_residual"), recompute=False
         )(x_TD, ffn_output_TD)
+        if self.preserve_output_for_mtp:
+            # MTP adds an extra backward branch through the main decoder. Keep
+            # each saved residual boundary materialized for MTP flavors so
+            # selective-AC replay never exposes a metadata placeholder to a
+            # bare consumer. Non-MTP flavors leave this disabled.
+            remat.recompute_needs_tensor(output_TD)
+            output_TD = output_TD.clone()
         return (output_TD, topk_indices_TS) if return_indices else output_TD
 
 
-class Glm5Model(Decoder):
+class Glm5Model(MTPDecoder):
     """GLM-5 decoder with FlexAttention DSA attention.
 
     The inherited decoder accepts token ids on the first PP stage and hidden
@@ -257,7 +271,7 @@ class Glm5Model(Decoder):
     state_dict_adapter_cls = Glm5StateDictAdapter
 
     @dataclass(kw_only=True, slots=True)
-    class Config(Decoder.Config):
+    class Config(MTPDecoder.Config):
         dim: int = 6144
         vocab_size: int = 154880
         index_sources: tuple[int, ...] = ()
@@ -354,6 +368,43 @@ class Glm5Model(Decoder):
 
         input_shardings = decoder_input_sharding()
         input_shardings["attention_masks"] = dsa_mask_placement()
+        depths = (
+            range(1, len(self.mtp_layers) + 1)
+            if self.mtp_layers is not None
+            else range(0)
+        )
+        if self.mtp_layers is not None and positions is None:
+            raise ValueError("GLM-5 MTP input preprocessing requires positions.")
+        for depth in depths:
+            mtp_tokens, mtp_valid = roll_mtp_sequence(
+                input_dict["input"],
+                shift=depth,
+                positions=positions,
+                padding_mask=input_dict.get("padding_mask"),
+                fill_value=0,
+                return_valid_mask=True,
+            )
+            mtp_labels = roll_mtp_sequence(
+                input_dict["labels"],
+                shift=depth,
+                positions=positions,
+                padding_mask=input_dict.get("padding_mask"),
+                fill_value=IGNORE_INDEX,
+                return_valid_mask=False,
+            )
+            mtp_padding = ~mtp_valid
+            if input_dict.get("padding_mask") is not None:
+                mtp_padding = mtp_padding | input_dict["padding_mask"]
+            input_dict[f"mtp_tokens_{depth}"] = mtp_tokens
+            input_dict[f"mtp_labels_{depth}"] = mtp_labels
+            input_dict[f"mtp_valid_{depth}"] = mtp_valid
+            input_dict[f"mtp_attention_masks_{depth}"] = self.get_attention_masks(
+                positions, mtp_padding
+            )
+            input_shardings[f"mtp_tokens_{depth}"] = input_shardings["input"]
+            input_shardings[f"mtp_labels_{depth}"] = input_shardings["labels"]
+            input_shardings[f"mtp_valid_{depth}"] = input_shardings["input"]
+            input_shardings[f"mtp_attention_masks_{depth}"] = dsa_mask_placement()
         if parallelism_context.cp_enabled:
             input_dict = self._cp_shard(
                 input_dict,
@@ -367,16 +418,28 @@ class Glm5Model(Decoder):
 
         inputs = input_dict.pop("input")
         labels = input_dict.pop("labels")
-        if next(self.config.traverse(AuxLoss.Config), None) is not None:
+        has_aux_loss = next(self.config.traverse(AuxLoss.Config), None) is not None
+        if has_aux_loss or self.mtp_layers:
             input_dict["aux_loss_denominators"] = None
+        if self.mtp_layers is not None:
+            inputs = (inputs, *(input_dict.pop(f"mtp_tokens_{d}") for d in depths))
+            labels = (labels, *(input_dict.pop(f"mtp_labels_{d}") for d in depths))
+            input_dict["mtp_input_valid_masks"] = tuple(
+                input_dict.pop(f"mtp_valid_{d}") for d in depths
+            )
+            input_dict["mtp_attention_masks"] = tuple(
+                input_dict.pop(f"mtp_attention_masks_{d}") for d in depths
+            )
         return inputs, labels, input_dict
 
     def forward(
         self,
-        tokens: torch.Tensor,
+        tokens: torch.Tensor | tuple[torch.Tensor, ...],
         pipeline_indices_TS: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,
         attention_masks: torch.Tensor | None = None,
+        mtp_input_valid_masks: tuple[torch.Tensor, ...] | None = None,
+        mtp_attention_masks: tuple[torch.Tensor, ...] | None = None,
         *,
         padding_mask: torch.Tensor | None = None,
         aux_loss_denominators: torch.Tensor | None = None,
@@ -388,14 +451,15 @@ class Glm5Model(Decoder):
                 raise ValueError("positions were provided twice")
             positions = pipeline_indices_TS
             pipeline_indices_TS = None
+        main_tokens = tokens[0] if isinstance(tokens, tuple) else tokens
         if positions is None:
-            positions = torch.arange(tokens.shape[0], device=tokens.device)
+            positions = torch.arange(main_tokens.shape[0], device=main_tokens.device)
         if attention_masks is None:
             attention_masks = self.get_attention_masks(positions, padding_mask)
         hidden_TD = (
-            self.tok_embeddings(tokens)
+            self.tok_embeddings(main_tokens)
             if self.tok_embeddings is not None
-            else tokens
+            else main_tokens
         )
         index_sources = self.index_sources or tuple(range(len(self.config.layers)))
         local_layers = {int(name) for name in self.layers}
@@ -427,7 +491,51 @@ class Glm5Model(Decoder):
             )
             if source == layer_id:
                 indices_by_source[source] = indices_TS
+        pre_norm_hidden_TD = hidden_TD
         hidden_TD = self.norm(hidden_TD) if self.norm is not None else hidden_TD
+        if self.mtp_layers is not None:
+            if not isinstance(tokens, tuple) or len(tokens) != len(self.mtp_layers) + 1:
+                raise ValueError(
+                    "GLM-5 MTP requires one shifted token tensor per depth."
+                )
+            if mtp_input_valid_masks is None or mtp_attention_masks is None:
+                raise ValueError("GLM-5 MTP requires validity masks and DSA masks.")
+            if self.tok_embeddings is None or self.lm_head is None:
+                raise ValueError("GLM-5 MTP is not supported on a pipeline partition.")
+            mtp_outputs: list[torch.Tensor] = []
+            prev_hidden = pre_norm_hidden_TD
+            depth_inputs = zip(
+                self.mtp_layers,
+                tokens[1:],
+                mtp_input_valid_masks,
+                mtp_attention_masks,
+                strict=True,
+            )
+            for depth, (
+                layer,
+                depth_tokens,
+                valid_mask,
+                depth_attention_mask,
+            ) in enumerate(depth_inputs, 1):
+                aux_denom = (
+                    None
+                    if aux_loss_denominators is None
+                    else aux_loss_denominators[depth]
+                )
+                prev_hidden = layer(
+                    self.tok_embeddings(depth_tokens),
+                    prev_hidden,
+                    valid_mask,
+                    depth_attention_mask,
+                    positions,
+                    padding_mask=padding_mask,
+                    aux_loss_denominator=aux_denom,
+                )
+                mtp_outputs.append(prev_hidden)
+            outputs = (hidden_TD, *mtp_outputs)
+            if self._skip_lm_head:
+                return outputs
+            return tuple(self.lm_head(item) for item in outputs)
         if self._skip_lm_head or self.lm_head is None:
             if local_layers:
                 next_layer = max(local_layers) + 1

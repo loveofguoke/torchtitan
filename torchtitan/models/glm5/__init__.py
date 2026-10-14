@@ -6,5 +6,12 @@
 
 from .flavors import MODEL_FLAVORS, build_model_config
 from .model import Glm5Model
+from .mtp import Glm5MTPTransformerBlock, MTPLoss
 
-__all__ = ["Glm5Model", "MODEL_FLAVORS", "build_model_config"]
+__all__ = [
+    "Glm5Model",
+    "Glm5MTPTransformerBlock",
+    "MODEL_FLAVORS",
+    "MTPLoss",
+    "build_model_config",
+]

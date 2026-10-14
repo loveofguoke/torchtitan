@@ -10,6 +10,7 @@
 objects, initialization policies, and the dense/MoE layer schedule.
 """
 
+import copy
 import dataclasses
 from collections.abc import Callable
 from functools import partial
@@ -48,12 +49,17 @@ from torchtitan.models.common.moe_sharding import (
     router_sharding_config,
 )
 from torchtitan.models.common.param_init import depth_scaled_std
+from torchtitan.models.deepseek_v3.sharding import (
+    mtp_block_sharding_config,
+    mtp_projection_sharding_config,
+)
 
 from .model import (
     Glm5Attention,
     Glm5Model,
     Glm5TransformerBlock,
 )
+from .mtp import Glm5MTPTransformerBlock
 from .dsa import (
     DSAIndexerTopK,
     Glm5DsaIndexer,
@@ -77,11 +83,60 @@ __all__ = [
     "Glm5DsaIndexer",
     "Glm5Model",
     "Glm5TransformerBlock",
+    "Glm5MTPTransformerBlock",
     "build_glm5_layers",
     "MODEL_FLAVORS",
     "build_model_config",
     "make_glm5_attention_config",
 ]
+
+
+def build_glm5_mtp_layers(
+    inner_cfg: Glm5TransformerBlock.Config,
+    *,
+    dim: int,
+    num_mtp_layers: int,
+    norm_eps: float,
+    enable_sp: bool,
+) -> list[Glm5MTPTransformerBlock.Config]:
+    """Build GLM NextN blocks from the released decoder-block structure."""
+    norm_sharding = norm_sharding_config(enable_sp=enable_sp)
+    return [
+        Glm5MTPTransformerBlock.Config(
+            attention=copy.deepcopy(inner_cfg.attention),
+            feed_forward=copy.deepcopy(inner_cfg.feed_forward),
+            moe=copy.deepcopy(inner_cfg.moe),
+            attention_norm=copy.deepcopy(inner_cfg.attention_norm),
+            ffn_norm=copy.deepcopy(inner_cfg.ffn_norm),
+            enorm=RMSNorm.Config(
+                normalized_shape=dim,
+                eps=norm_eps,
+                param_init=_RMS_NORM_INIT,
+                sharding_config=norm_sharding,
+            ),
+            hnorm=RMSNorm.Config(
+                normalized_shape=dim,
+                eps=norm_eps,
+                param_init=_RMS_NORM_INIT,
+                sharding_config=norm_sharding,
+            ),
+            eh_proj=Linear.Config(
+                in_features=2 * dim,
+                out_features=dim,
+                bias=False,
+                param_init=_LINEAR_INIT,
+                sharding_config=mtp_projection_sharding_config(enable_sp=enable_sp),
+            ),
+            mtp_norm=RMSNorm.Config(
+                normalized_shape=dim,
+                eps=norm_eps,
+                param_init=_RMS_NORM_INIT,
+                sharding_config=pre_lm_head_norm_sharding_config(enable_sp=enable_sp),
+            ),
+            sharding_config=mtp_block_sharding_config(enable_sp=enable_sp),
+        )
+        for _ in range(num_mtp_layers)
+    ]
 
 
 _LINEAR_INIT = {
@@ -547,6 +602,31 @@ def _glm5_2_debugmodel(
     )
 
 
+def _glm5_2_debugmodel_mtp(
+    *,
+    seq_len: int = 128,
+    parallelism: ParallelismConfig | None = None,
+) -> Glm5Model.Config:
+    """Small GLM-5.2 training model with one faithful NextN/MTP block."""
+    config = _glm5_2_debugmodel(seq_len=seq_len, parallelism=parallelism)
+    enable_sp = bool(parallelism and parallelism.enable_sequence_parallel)
+    layers = [
+        dataclasses.replace(layer, preserve_output_for_mtp=True)
+        for layer in config.layers
+    ]
+    return dataclasses.replace(
+        config,
+        layers=layers,
+        mtp_layers=build_glm5_mtp_layers(
+            layers[-1],
+            dim=config.dim,
+            num_mtp_layers=1,
+            norm_eps=1e-5,
+            enable_sp=enable_sp,
+        ),
+    )
+
+
 def _glm5_2_scaled_debugmodel(
     *,
     seq_len: int = 4096,
@@ -644,10 +724,9 @@ def _glm5_2_744b_a40b(
 ) -> Glm5Model.Config:
     """Build the released GLM-5.2 744B-A40B decoder architecture.
 
-    The values mirror zai-org/GLM-5.2 ``config.json``. TorchTitan currently
-    models the 78-layer language-model decoder and records the released
-    cross-layer index-sharing schedule. The checkpoint's additional MTP layer
-    remains outside this decoder config and is skipped by the state adapter.
+    The values mirror zai-org/GLM-5.2 ``config.json``: 78 main decoder layers,
+    the released cross-layer index-sharing schedule, and one full NextN/MTP
+    block that shares token embeddings and the language-model head.
     """
     dim = 6144
     vocab_size = 154880
@@ -664,6 +743,38 @@ def _glm5_2_744b_a40b(
         theta=8_000_000,
         scaling="none",
     )
+    layers = build_glm5_layers(
+        n_layers=num_layers,
+        n_dense_layers=3,
+        dim=dim,
+        n_heads=64,
+        q_lora_rank=2048,
+        kv_lora_rank=512,
+        qk_nope_head_dim=192,
+        qk_rope_head_dim=64,
+        v_head_dim=256,
+        dense_hidden_dim=12288,
+        moe_hidden_dim=2048,
+        num_experts=256,
+        num_shared_experts=1,
+        router_top_k=8,
+        router_num_expert_groups=1,
+        router_num_limited_groups=1,
+        router_route_scale=2.5,
+        index_n_heads=32,
+        index_head_dim=128,
+        index_topk=2048,
+        attention_dropout=0.0,
+        mla_norm_eps=1e-5,
+        norm_eps=1e-5,
+        rope=rope,
+        enable_sp=bool(parallelism and parallelism.enable_sequence_parallel),
+        enable_cp=bool(parallelism and parallelism.context_parallel_degree > 1),
+        enable_ep=bool(parallelism and parallelism.expert_parallel_degree > 1),
+    )
+    layers = [
+        dataclasses.replace(layer, preserve_output_for_mtp=True) for layer in layers
+    ]
     return Glm5Model.Config(
         max_context_length=seq_len,
         vocab_size=vocab_size,
@@ -691,34 +802,13 @@ def _glm5_2_744b_a40b(
             param_init=_output_linear_init(dim),
             sharding_config=lm_head_sharding_config(),
         ),
-        layers=build_glm5_layers(
-            n_layers=num_layers,
-            n_dense_layers=3,
+        layers=layers,
+        mtp_layers=build_glm5_mtp_layers(
+            layers[-1],
             dim=dim,
-            n_heads=64,
-            q_lora_rank=2048,
-            kv_lora_rank=512,
-            qk_nope_head_dim=192,
-            qk_rope_head_dim=64,
-            v_head_dim=256,
-            dense_hidden_dim=12288,
-            moe_hidden_dim=2048,
-            num_experts=256,
-            num_shared_experts=1,
-            router_top_k=8,
-            router_num_expert_groups=1,
-            router_num_limited_groups=1,
-            router_route_scale=2.5,
-            index_n_heads=32,
-            index_head_dim=128,
-            index_topk=2048,
-            attention_dropout=0.0,
-            mla_norm_eps=1e-5,
+            num_mtp_layers=1,
             norm_eps=1e-5,
-            rope=rope,
             enable_sp=bool(parallelism and parallelism.enable_sequence_parallel),
-            enable_cp=bool(parallelism and parallelism.context_parallel_degree > 1),
-            enable_ep=bool(parallelism and parallelism.expert_parallel_degree > 1),
         ),
     )
 
@@ -728,6 +818,7 @@ MODEL_FLAVORS = {
     "debugmodel": _debugmodel,
     "dsa_debugmodel": _debugmodel,
     "glm5_2_debugmodel": _glm5_2_debugmodel,
+    "glm5_2_debugmodel_mtp": _glm5_2_debugmodel_mtp,
     "glm5_2_scaled_debugmodel": _glm5_2_scaled_debugmodel,
     "shared_dsa_debugmodel": _shared_dsa_debugmodel,
 }

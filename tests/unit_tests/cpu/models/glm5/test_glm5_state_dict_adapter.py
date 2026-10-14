@@ -14,9 +14,9 @@ from torchtitan.models.glm5.state_dict_adapter import Glm5StateDictAdapter
 
 
 class TestGlm5StateDictAdapter(unittest.TestCase):
-    def test_debug_model_hf_roundtrip(self) -> None:
+    def _assert_hf_roundtrip(self, flavor: str) -> None:
         config = build_model_config(
-            "glm5_2_debugmodel",
+            flavor,
             parallelism=ParallelismConfig(),
             seq_len=8,
         )
@@ -30,6 +30,12 @@ class TestGlm5StateDictAdapter(unittest.TestCase):
         self.assertEqual(native.keys(), restored.keys())
         for key in native:
             torch.testing.assert_close(native[key], restored[key], rtol=0, atol=0)
+
+    def test_debug_model_hf_roundtrip(self) -> None:
+        self._assert_hf_roundtrip("glm5_2_debugmodel")
+
+    def test_mtp_debug_model_hf_roundtrip(self) -> None:
+        self._assert_hf_roundtrip("glm5_2_debugmodel_mtp")
 
 
 if __name__ == "__main__":

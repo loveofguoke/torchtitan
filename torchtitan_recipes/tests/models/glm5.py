@@ -19,7 +19,7 @@ from torchtitan.config import TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.models.common.config_utils import decoder_vocab_size
-from torchtitan.models.glm5 import build_model_config
+from torchtitan.models.glm5 import build_model_config, MTPLoss
 from torchtitan.observability.metrics import MetricsProcessor
 from torchtitan.trainer import Trainer
 
@@ -38,18 +38,26 @@ def glm5_debugmodel(
         parallelism=parallelism,
         seq_len=seq_len,
     )
+    num_mtp_layers = len(model_config.mtp_layers or ())
     num_tokens = 8 * seq_len
+    loss_config = (
+        MTPLoss.Config(
+            global_vocab_size=decoder_vocab_size(model_config),
+            mtp_scale=0.3,
+        )
+        if model_config.mtp_layers
+        else CrossEntropyLoss.Config(
+            global_vocab_size=decoder_vocab_size(model_config),
+        )
+    )
     return Trainer.Config(
-        loss=ChunkedLossWrapper.Config(
-            loss_fn=CrossEntropyLoss.Config(
-                global_vocab_size=decoder_vocab_size(model_config),
-            ),
-        ),
+        loss=ChunkedLossWrapper.Config(loss_fn=loss_config),
         hf_assets_path="./tests/assets/tokenizer",
         metrics=MetricsProcessor.Config(log_freq=1),
         model=model_config,
         dataloader=GrainDataLoader.Config(
             dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4_test"]),
+            num_mtp_layers=num_mtp_layers,
         ),
         optim=Optim.Config(
             optimizer=OptimizersContainer.Config(
@@ -83,4 +91,16 @@ def glm5_2_scaled_debugmodel(
         seq_len,
         parallelism=parallelism,
         flavor="glm5_2_scaled_debugmodel",
+    )
+
+
+def glm5_2_debugmodel_mtp(
+    seq_len: int = 128,
+    *,
+    parallelism: ParallelismConfig | None = None,
+) -> Trainer.Config:
+    return glm5_debugmodel(
+        seq_len,
+        parallelism=parallelism,
+        flavor="glm5_2_debugmodel_mtp",
     )

@@ -23,7 +23,6 @@ safetensors without first materializing one full model on every rank.
 from __future__ import annotations
 
 import re
-import warnings
 from typing import Any, TYPE_CHECKING
 
 import torch
@@ -79,12 +78,19 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
         "input_layernorm.weight": "attention_norm.weight",
         "post_attention_layernorm.weight": "ffn_norm.weight",
     }
+    HF_TO_TITAN_MTP = {
+        "enorm.weight": "enorm.weight",
+        "hnorm.weight": "hnorm.weight",
+        "eh_proj.weight": "eh_proj.weight",
+        "shared_head.norm.weight": "mtp_norm.weight",
+    }
     _IGNORED_HF_KEYS = {
         "model.rotary_emb.inv_freq",
         "model.rotary_emb.original_inv_freq",
     }
     _HF_LAYER_KEY = re.compile(r"^model\.layers\.(\d+)\.(.+)$")
     _TITAN_LAYER_KEY = re.compile(r"^layers\.(\d+)\.(.+)$")
+    _TITAN_MTP_KEY = re.compile(r"^mtp_layers\.(\d+)\.(.+)$")
     _FUSED_GATE_UP = "mlp.experts.gate_up_proj"
     _FUSED_DOWN = "mlp.experts.down_proj"
     _TITAN_GATE = "moe.routed_experts.w1_EFD"
@@ -106,11 +112,15 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
         }
         self._to_hf_top_level = {v: k for k, v in self.HF_TO_TITAN_TOP_LEVEL.items()}
         self._to_hf_layer = {v: k for k, v in self.HF_TO_TITAN_LAYER.items()}
+        self._to_hf_mtp = {v: k for k, v in self.HF_TO_TITAN_MTP.items()}
 
     def _layer_config(self, layer_index: int):
-        if not 0 <= layer_index < len(self.model_config.layers):
-            raise KeyError(f"unmapped HF key: layer index {layer_index} is unsupported")
-        return self.model_config.layers[layer_index]
+        if 0 <= layer_index < len(self.model_config.layers):
+            return self.model_config.layers[layer_index]
+        mtp_index = layer_index - len(self.model_config.layers)
+        if 0 <= mtp_index < len(self.model_config.mtp_layers):
+            return self.model_config.mtp_layers[mtp_index]
+        raise KeyError(f"unmapped HF key: layer index {layer_index} is unsupported")
 
     @staticmethod
     def _norm_shape(normalized_shape: int | tuple[int, ...]) -> tuple[int, ...]:
@@ -136,11 +146,29 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
             return self._linear_shape(self.model_config.lm_head)
 
         match = self._TITAN_LAYER_KEY.fullmatch(titan_key)
-        if match is None:
+        mtp_match = self._TITAN_MTP_KEY.fullmatch(titan_key)
+        if match is None and mtp_match is None:
             raise KeyError(f"unmapped TorchTitan key: {titan_key}")
-        layer_index = int(match.group(1))
-        suffix = match.group(2)
+        if mtp_match is not None:
+            mtp_index = int(mtp_match.group(1))
+            layer_index = len(self.model_config.layers) + mtp_index
+            suffix = mtp_match.group(2)
+        else:
+            assert match is not None
+            layer_index = int(match.group(1))
+            suffix = match.group(2)
         layer = self._layer_config(layer_index)
+        if mtp_match is not None:
+            mtp_configs = {
+                "enorm.weight": layer.enorm,
+                "hnorm.weight": layer.hnorm,
+                "eh_proj.weight": layer.eh_proj,
+                "mtp_norm.weight": layer.mtp_norm,
+            }
+            if suffix in {"enorm.weight", "hnorm.weight", "mtp_norm.weight"}:
+                return self._norm_shape(mtp_configs[suffix].normalized_shape)
+            if suffix == "eh_proj.weight":
+                return self._linear_shape(mtp_configs[suffix])
         attention = layer.attention
 
         linear_configs = {
@@ -232,7 +260,12 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
             )
 
     def _validate_fused_down(self, layer_index: int, value: Any) -> None:
-        titan_key = f"layers.{layer_index}.{self._TITAN_DOWN}"
+        num_main_layers = len(self.model_config.layers)
+        titan_key = (
+            f"layers.{layer_index}.{self._TITAN_DOWN}"
+            if layer_index < num_main_layers
+            else f"mtp_layers.{layer_index - num_main_layers}.{self._TITAN_DOWN}"
+        )
         self._validate_tensor_shape(titan_key, value)
 
     @staticmethod
@@ -453,33 +486,32 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
                 raise KeyError(f"unmapped HF key: {hf_key}")
             layer_index = int(match.group(1))
             suffix = match.group(2)
-            if layer_index == len(self.model_config.layers):
-                warnings.warn(
-                    "Skipping unsupported GLM-5 next MTP layer namespace "
-                    f"model.layers.{layer_index}.",
-                    UserWarning,
-                    stacklevel=2,
-                )
-                continue
-            self._layer_config(layer_index)
+            layer = self._layer_config(layer_index)
+            mtp_index = layer_index - len(self.model_config.layers)
+            is_mtp = mtp_index >= 0
+            prefix = f"mtp_layers.{mtp_index}" if is_mtp else f"layers.{layer_index}"
 
             if suffix == self._FUSED_GATE_UP:
                 self._validate_fused_experts(layer_index, value)
                 gate, up = self._split_gate_up(value)
-                gate_key = f"layers.{layer_index}.{self._TITAN_GATE}"
-                up_key = f"layers.{layer_index}.{self._TITAN_UP}"
+                gate_key = f"{prefix}.{self._TITAN_GATE}"
+                up_key = f"{prefix}.{self._TITAN_UP}"
                 state_dict[gate_key] = gate
                 state_dict[up_key] = up
                 continue
             if suffix == self._FUSED_DOWN:
                 self._validate_fused_down(layer_index, value)
-                state_dict[f"layers.{layer_index}.{self._TITAN_DOWN}"] = value
+                state_dict[f"{prefix}.{self._TITAN_DOWN}"] = value
                 continue
 
-            titan_suffix = self.HF_TO_TITAN_LAYER.get(suffix)
+            titan_suffix = (
+                self.HF_TO_TITAN_MTP.get(suffix)
+                if is_mtp and suffix in self.HF_TO_TITAN_MTP
+                else self.HF_TO_TITAN_LAYER.get(suffix)
+            )
             if titan_suffix is None:
                 raise KeyError(f"unmapped HF key: {hf_key}")
-            titan_key = f"layers.{layer_index}.{titan_suffix}"
+            titan_key = f"{prefix}.{titan_suffix}"
             self._validate_tensor_shape(titan_key, value)
             state_dict[titan_key] = value
 
@@ -505,10 +537,17 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
                 continue
 
             match = self._TITAN_LAYER_KEY.fullmatch(titan_key)
-            if match is None:
+            mtp_match = self._TITAN_MTP_KEY.fullmatch(titan_key)
+            if match is None and mtp_match is None:
                 raise KeyError(f"unmapped TorchTitan key: {titan_key}")
-            layer_index = int(match.group(1))
-            suffix = match.group(2)
+            if mtp_match is not None:
+                mtp_index = int(mtp_match.group(1))
+                layer_index = len(self.model_config.layers) + mtp_index
+                suffix = mtp_match.group(2)
+            else:
+                assert match is not None
+                layer_index = int(match.group(1))
+                suffix = match.group(2)
             self._layer_config(layer_index)
 
             if suffix in {self._TITAN_GATE, self._TITAN_UP, self._TITAN_DOWN}:
@@ -516,7 +555,11 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
                 fused_experts.setdefault(layer_index, {})[suffix] = value
                 continue
 
-            hf_suffix = self._to_hf_layer.get(suffix)
+            hf_suffix = (
+                self._to_hf_mtp.get(suffix)
+                if mtp_match is not None and suffix in self._to_hf_mtp
+                else self._to_hf_layer.get(suffix)
+            )
             if hf_suffix is None:
                 raise KeyError(f"unmapped TorchTitan key: {titan_key}")
             self._validate_tensor_shape(titan_key, value)
