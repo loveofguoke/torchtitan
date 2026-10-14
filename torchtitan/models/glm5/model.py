@@ -226,6 +226,8 @@ class Glm5TransformerBlock(TransformerBlock):
                 self.attention_norm(x_TD), attention_masks, positions,
                 topk_indices_TS,
             )
+        # The residual add reads the attention output with bare ops.
+        remat.recompute_needs_tensor(attention_TD)
         x_TD = x_TD + attention_TD
         normalized_TD = self.ffn_norm(x_TD)
         if self.moe_enabled:
@@ -236,7 +238,11 @@ class Glm5TransformerBlock(TransformerBlock):
             )
         else:
             ffn_output_TD = self.feed_forward(normalized_TD)
-        output_TD = x_TD + ffn_output_TD
+        # Trailing add, always saved: it saves nothing for backward, so replay skips
+        # it and its inputs need no persisting, matching checkpoint early stop.
+        output_TD = remat.region(
+            torch.add, self.remat_region_name("ffn_residual"), recompute=False
+        )(x_TD, ffn_output_TD)
         return (output_TD, topk_indices_TS) if return_indices else output_TD
 
 
