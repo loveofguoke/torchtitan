@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+import torch_remat as remat
 from torch import nn
 
 from torchtitan.models.common import ComplexRoPE, Linear, RMSNorm
@@ -123,8 +124,14 @@ class Glm5Attention(BaseAttention):
 
         # Query path: compress to LoRA rank R, normalize, then expand to N
         # heads. Split content (NoPE) from position-sensitive (RoPE) features.
-        q_resid_TR = self.q_norm(self.wq_a(x_TD))
-        q_TNH = self.wq_b(q_resid_TR).view(T, self.n_heads, self.qk_head_dim)
+        q_resid_TR = self.wq_a(x_TD)
+        # RMSNorm reads the saved projection output with bare ops.
+        remat.recompute_needs_tensor(q_resid_TR)
+        q_resid_TR = self.q_norm(q_resid_TR)
+        q_TNH = self.wq_b(q_resid_TR)
+        # The head view/split reads the saved projection output with bare ops.
+        remat.recompute_needs_tensor(q_TNH)
+        q_TNH = q_TNH.view(T, self.n_heads, self.qk_head_dim)
         q_nope_TNP, q_rope_TNR = torch.split(
             q_TNH, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
         )
@@ -132,6 +139,8 @@ class Glm5Attention(BaseAttention):
         # one shared rotary key. The expensive per-head expansion happens only
         # after normalization.
         compressed_kv_TC = self.wkv_a(x_TD)
+        # The latent split and RMSNorm read this projection with bare ops.
+        remat.recompute_needs_tensor(compressed_kv_TC)
         kv_TR, k_rope_TR = torch.split(
             compressed_kv_TC,
             [self.kv_lora_rank, self.qk_rope_head_dim],
@@ -142,7 +151,10 @@ class Glm5Attention(BaseAttention):
             q_rope_TNR, k_rope_TR.unsqueeze(1), positions
         )
         q_TNH = torch.cat((q_nope_TNP, q_rope_TNR), dim=-1)
-        kv_TNX = self.wkv_b(kv_TR).view(
+        kv_TNX = self.wkv_b(kv_TR)
+        # The head view/split reads the saved projection output with bare ops.
+        remat.recompute_needs_tensor(kv_TNX)
+        kv_TNX = kv_TNX.view(
             T, self.n_heads, self.qk_nope_head_dim + self.v_head_dim
         )
         k_nope_TNP, v_TNV = torch.split(
@@ -167,6 +179,8 @@ class Glm5Attention(BaseAttention):
             topk_indices_TS,
             scale=self.softmax_scale,
         )
+        # The contiguous view reads the attention output with bare ops.
+        remat.recompute_needs_tensor(output_TNV)
         output_TD = self.wo(output_TNV.contiguous().view(T, -1))
         return (output_TD, topk_indices_TS) if return_indices else output_TD
 
