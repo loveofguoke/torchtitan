@@ -14,6 +14,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
+import torch_remat as remat
 from torch.nn.attention.flex_attention import BlockMask
 
 from torchtitan.models.common import ComplexRoPE, LayerNorm, Linear
@@ -158,19 +159,26 @@ class Glm5DsaIndexer(Module):
         # Build query and key features in the same indexer space. The key has a
         # singleton head dimension because every query head searches one shared
         # global key sequence.
-        q_TNH = self.wq_b(q_resid_TR).view(T, self.n_heads, self.head_dim)
+        q_TNH = self.wq_b(q_resid_TR)
+        remat.recompute_needs_tensor(q_TNH)
+        q_TNH = q_TNH.view(T, self.n_heads, self.head_dim)
         q_rot_TNR, q_pass_TNP = torch.split(
             q_TNH,
             [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim],
             dim=-1,
         )
-        k_T1H = self.k_norm(self.wk(hidden_states_TD)).unsqueeze(1)
+        k_TH = self.wk(hidden_states_TD)
+        remat.recompute_needs_tensor(k_TH)
+        k_TH = self.k_norm(k_TH)
+        remat.recompute_needs_tensor(k_TH)
+        k_T1H = k_TH.unsqueeze(1)
         k_rot_T1R, k_pass_T1P = torch.split(
             k_T1H,
             [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim],
             dim=-1,
         )
         q_rot_TNR, k_rot_T1R = self.rope(q_rot_TNR, k_rot_T1R, positions_T)
+        remat.recompute_needs_tensor(q_rot_TNR, k_rot_T1R)
         q_TNH = torch.cat((q_rot_TNR, q_pass_TNP), dim=-1)
         k_TH = torch.cat((k_rot_T1R, k_pass_T1P), dim=-1).squeeze(1)
 
@@ -178,7 +186,9 @@ class Glm5DsaIndexer(Module):
         # into the scalar [T,T] ranking consumed by top-k.
         weights_TN = self.weights_proj(
             hidden_states_TD.to(self.weights_proj.weight.dtype)
-        ).float() * (self.n_heads**-0.5)
+        )
+        remat.recompute_needs_tensor(weights_TN)
+        weights_TN = weights_TN.float() * (self.n_heads**-0.5)
         if attention_mask_TK is None:
             attention_mask_TK = create_dsa_causal_mask(
                 positions_T, dtype=torch.float32
