@@ -23,19 +23,26 @@ separately in ``sharding.py``; the formulas below describe global logical
 shapes. Distributed adaptation of this sparse path is a separate step.
 """
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
+from typing import Any
 
 import torch
 from torch import nn
 
 from torchtitan.models.common import ComplexRoPE, Linear, RMSNorm
 from torchtitan.models.common.attention import BaseAttention
+from torchtitan.models.common.aux_loss import AuxLoss
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
-from torchtitan.models.utils import get_moe_model_nparams_and_flops
-from torchtitan.protocols.module import Module
+from torchtitan.models.common.decoder_sharding import decoder_input_sharding
+from torchtitan.models.base.module import Module
+from torchtitan.models.common.flops import get_nparams_and_active_nparams
+from torchtitan.distributed.spmd_types import annotate_input_spmd_types
+
+from .state_dict_adapter import Glm5StateDictAdapter
 
 from .dsa import DSAIndexerTopK, Glm5DsaIndexer, create_dsa_causal_mask
 from .dsa import Glm5FlexAttention as DSAInnerAttention
+from .sharding import dsa_mask_placement
 
 # Tensor dimensions used in this file:
 # T/Q/K: token, query-token, and key-token dimensions.
@@ -107,6 +114,8 @@ class Glm5Attention(BaseAttention):
         topk_indices_TS: torch.Tensor | None = None,
         *,
         return_indices: bool = False,
+        padding_mask: torch.Tensor | None = None,
+        aux_loss_denominator: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         T = x_TD.shape[0]
         if positions is None:
@@ -190,6 +199,8 @@ class Glm5TransformerBlock(TransformerBlock):
         topk_indices_TS: torch.Tensor | None = None,
         *,
         return_indices: bool = False,
+        padding_mask: torch.Tensor | None = None,
+        aux_loss_denominator: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if return_indices:
             attention_TD, topk_indices_TS = self.attention(
@@ -204,7 +215,11 @@ class Glm5TransformerBlock(TransformerBlock):
         x_TD = x_TD + attention_TD
         normalized_TD = self.ffn_norm(x_TD)
         if self.moe_enabled:
-            ffn_output_TD = self.moe(normalized_TD)
+            ffn_output_TD = self.moe(
+                normalized_TD,
+                padding_mask_T=padding_mask,
+                aux_loss_denominator=aux_loss_denominator,
+            )
         else:
             ffn_output_TD = self.feed_forward(normalized_TD)
         output_TD = x_TD + ffn_output_TD
@@ -219,56 +234,21 @@ class Glm5Model(Decoder):
     mask construction and forward preserve embedding-only/output-only stages.
     """
 
+    state_dict_adapter_cls = Glm5StateDictAdapter
+
     @dataclass(kw_only=True, slots=True)
     class Config(Decoder.Config):
         dim: int = 6144
         vocab_size: int = 154880
         index_sources: tuple[int, ...] = ()
 
-        def update_from_config(self, *, config, **kwargs) -> None:
-            # This import is deliberately local: the sharding module pulls in
-            # the runtime validation, while config construction remains
-            # usable standalone.
-            from torchtitan.models.glm5.sharding import (
-                set_glm5_sharding_config,
-                validate_glm5_parallelism,
-            )
-
-            validate_glm5_parallelism(config.parallelism)
-            # Generic Decoder CP uses SPMD sharding and therefore requires the
-            # spmd_types backend. GLM-5 owns a model-specific partial-DTensor
-            # DSA CP path, so run generic setup with CP disabled and apply the
-            # GLM sharding contract below.
-            generic_config = replace(
-                config,
-                parallelism=replace(
-                    config.parallelism,
-                    context_parallel_degree=1,
-                ),
-            )
-            Decoder.Config.update_from_config(
-                self,
-                config=generic_config,
-                **kwargs,
-            )
-            set_glm5_sharding_config(
-                self,
-                enable_sp=config.parallelism.enable_sequence_parallel,
-                enable_ep=config.parallelism.expert_parallel_degree > 1,
-            )
-
         def get_nparams_and_flops(
             self, model: nn.Module, seq_len: int
         ) -> tuple[int, int]:
             attention = self.layers[0].attention
             assert isinstance(attention, Glm5Attention.Config)
-            nparams, base_flops = get_moe_model_nparams_and_flops(
-                self,
-                model,
-                attention.n_heads,
-                attention.qk_head_dim + attention.v_head_dim,
-                seq_len,
-            )
+            nparams, active_nparams = get_nparams_and_active_nparams(model)
+            base_flops = 6 * active_nparams
             # The common parameter-based estimate charges every parameter for
             # forward and backward matmuls (6 FLOPs per parameter). GLM-5's
             # pretrained indexer is frozen and runs under no_grad, so it only
@@ -292,7 +272,19 @@ class Glm5Model(Decoder):
             )
             return nparams, base_flops + dsa_flops
 
-    def get_attention_masks(self, positions: torch.Tensor) -> torch.Tensor | None:
+    @classmethod
+    def _register_optimizer_hooks(
+        cls, optimizers, model_parts, parallelism_context
+    ) -> None:
+        from torchtitan.models.common.moe import register_moe_load_balancing_hook
+
+        register_moe_load_balancing_hook(optimizers, model_parts, parallelism_context)
+
+    def get_attention_masks(
+        self,
+        positions: torch.Tensor,
+        padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
         # Pipeline partitioning may create an embedding-only or output-only
         # stage. Such a stage has no attention operation and needs no mask.
         if len(self.layers) == 0:
@@ -311,7 +303,11 @@ class Glm5Model(Decoder):
             token_dtype = self.tok_embeddings.weight.dtype
         else:
             token_dtype = next(iter(self.layers.values())).attention_norm.weight.dtype
-        return create_dsa_causal_mask(positions, dtype=token_dtype)
+        return create_dsa_causal_mask(
+            positions,
+            dtype=token_dtype,
+            padding_mask_T=padding_mask,
+        )
 
     def __init__(self, config):
         super().__init__(config)
@@ -321,7 +317,39 @@ class Glm5Model(Decoder):
                 raise ValueError("index_sources must contain one source per layer")
             for layer, source in enumerate(self.index_sources):
                 if not 0 <= source <= layer or self.index_sources[source] != source:
-                    raise ValueError("index source must be a current/earlier producer layer")
+                    raise ValueError(
+                        "index source must be a current/earlier producer layer"
+                    )
+
+    def preprocess_inputs(self, input_dict: dict[str, Any], **kwargs):
+        """Build the global DSA mask, then CP-shard only its query dimension."""
+        parallelism_context = kwargs["parallelism_context"]
+        parallelism = kwargs["parallelism"]
+        positions = input_dict.get("positions")
+        if positions is not None:
+            input_dict["attention_masks"] = self.get_attention_masks(
+                positions,
+                input_dict.get("padding_mask"),
+            )
+
+        input_shardings = decoder_input_sharding()
+        input_shardings["attention_masks"] = dsa_mask_placement()
+        if parallelism_context.cp_enabled:
+            input_dict = self._cp_shard(
+                input_dict,
+                input_shardings=input_shardings,
+                parallelism_context=parallelism_context,
+                parallelism=parallelism,
+            )
+        input_dict = annotate_input_spmd_types(
+            parallelism_context, input_dict, input_shardings
+        )
+
+        inputs = input_dict.pop("input")
+        labels = input_dict.pop("labels")
+        if next(self.config.traverse(AuxLoss.Config), None) is not None:
+            input_dict["aux_loss_denominators"] = None
+        return inputs, labels, input_dict
 
     def forward(
         self,
@@ -329,6 +357,9 @@ class Glm5Model(Decoder):
         pipeline_indices_TS: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,
         attention_masks: torch.Tensor | None = None,
+        *,
+        padding_mask: torch.Tensor | None = None,
+        aux_loss_denominators: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # Preserve Decoder's positional ``model(tokens, positions)`` API. PP
         # metadata is [T, S], while GLM positions are required to be [T].
@@ -340,21 +371,23 @@ class Glm5Model(Decoder):
         if positions is None:
             positions = torch.arange(tokens.shape[0], device=tokens.device)
         if attention_masks is None:
-            attention_masks = self.get_attention_masks(positions)
-        if not self.index_sources:
-            return super().forward(tokens, positions, attention_masks)
+            attention_masks = self.get_attention_masks(positions, padding_mask)
         hidden_TD = (
             self.tok_embeddings(tokens)
             if self.tok_embeddings is not None
             else tokens
         )
+        index_sources = self.index_sources or tuple(range(len(self.config.layers)))
         local_layers = {int(name) for name in self.layers}
         external_sources = {
-            self.index_sources[layer]
+            index_sources[layer]
             for layer in local_layers
-            if self.index_sources[layer] not in local_layers
+            if index_sources[layer] not in local_layers
         }
         indices_by_source: dict[int, torch.Tensor] = {}
+        aux_loss_denominator = (
+            None if aux_loss_denominators is None else aux_loss_denominators[0]
+        )
         if external_sources:
             if pipeline_indices_TS is None:
                 raise ValueError("this GLM-5 PP stage requires DSA indices")
@@ -362,13 +395,15 @@ class Glm5Model(Decoder):
             indices_by_source[source] = pipeline_indices_TS
         for name, layer in self.layers.items():
             layer_id = int(name)
-            source = self.index_sources[layer_id]
+            source = index_sources[layer_id]
             hidden_TD, indices_TS = layer(
                 hidden_TD,
                 attention_masks,
                 positions,
                 indices_by_source.get(source),
                 return_indices=True,
+                padding_mask=padding_mask,
+                aux_loss_denominator=aux_loss_denominator,
             )
             if source == layer_id:
                 indices_by_source[source] = indices_TS
@@ -376,8 +411,8 @@ class Glm5Model(Decoder):
         if self._skip_lm_head or self.lm_head is None:
             if local_layers:
                 next_layer = max(local_layers) + 1
-                if next_layer < len(self.index_sources):
-                    source = self.index_sources[next_layer]
+                if next_layer < len(index_sources):
+                    source = index_sources[next_layer]
                     if source != next_layer:
                         return hidden_TD, indices_by_source[source]
             return hidden_TD

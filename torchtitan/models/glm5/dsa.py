@@ -17,14 +17,18 @@ import torch.nn.functional as F
 from torch.nn.attention.flex_attention import BlockMask
 
 from torchtitan.models.common import ComplexRoPE, LayerNorm, Linear
-from torchtitan.models.common.attention import FlexAttention
-from torchtitan.protocols.module import Module
+from torchtitan.models.base.module import Module
+from torchtitan.models.common.attention import FlexInnerAttention
+from torchtitan.models.common.attention.cp_attention import (
+    KVAllGatherCPFlexInnerAttention,
+)
 
 
 def create_dsa_causal_mask(
     positions_T: torch.Tensor,
     *,
     dtype: torch.dtype,
+    padding_mask_T: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Build a packed-document causal additive mask of shape ``[1, T, T]``.
 
@@ -40,6 +44,8 @@ def create_dsa_causal_mask(
     allowed_TT = (token_indices_T[:, None] >= token_indices_T[None, :]) & (
         document_ids_T[:, None] == document_ids_T[None, :]
     )
+    if padding_mask_T is not None:
+        allowed_TT = allowed_TT & padding_mask_T[:, None] & padding_mask_T[None, :]
     return torch.zeros(
         1, T, T, dtype=dtype, device=positions_T.device
     ).masked_fill(~allowed_TT.unsqueeze(0), torch.finfo(dtype).min)
@@ -210,7 +216,12 @@ def build_dsa_block_mask(
     occupied = padded.reshape((Q + B - 1) // B, B, (K + B - 1) // B, B)
     occupied = occupied.any(dim=3).any(dim=1)[None, None]
     counts = occupied.sum(-1).to(torch.int32)
-    blocks = occupied.to(torch.int32).argsort(dim=-1, descending=True, stable=True)
+    # Ascend executes integer ArgSort on AiCPU. The keys are boolean, so
+    # float32 preserves the exact 0/1 order while keeping stable tie ordering
+    # and lets supported devices use their accelerator sort kernel.
+    blocks = occupied.to(torch.float32).argsort(
+        dim=-1, descending=True, stable=True
+    )
 
     def mask_mod(b, h, q, k):
         # Flex may evaluate padded lanes; clamp reads before applying bounds.
@@ -222,17 +233,26 @@ def build_dsa_block_mask(
     )
 
 
-class Glm5FlexAttention(FlexAttention):
+class Glm5FlexAttention(FlexInnerAttention):
     """Expanded MLA Q/K/V with GLM token-selected block-sparse attention."""
 
     @dataclass(kw_only=True, slots=True)
-    class Config(FlexAttention.Config):
+    class Config(FlexInnerAttention.Config):
         block_size: int = 128
         attention_dropout: float = 0.0
 
+        def build_attention_metadata(self, positions: torch.Tensor, **kwargs):
+            # GLM builds a dense legality mask before the learned top-k stage.
+            # The resulting sparse BlockMask depends on the selected indices
+            # and therefore cannot be built by Decoder's generic metadata path.
+            del positions, kwargs
+            return None
+
         def __post_init__(self):
             if self.attention_dropout != 0.0:
-                raise ValueError("GLM FlexAttention currently requires attention_dropout=0")
+                raise ValueError(
+                    "GLM FlexAttention currently requires attention_dropout=0"
+                )
 
     def __init__(self, config):
         super().__init__(config)
@@ -243,14 +263,54 @@ class Glm5FlexAttention(FlexAttention):
         q_QNH: torch.Tensor,
         k_KNH: torch.Tensor,
         v_KNV: torch.Tensor,
-        attention_masks: torch.Tensor,
+        attention_metadata: torch.Tensor,
         topk_indices_QS: torch.Tensor,
         *,
         scale: float | None = None,
     ) -> torch.Tensor:
         mask = build_dsa_block_mask(
-            topk_indices_QS, attention_masks, self.block_size
+            topk_indices_QS, attention_metadata, self.block_size
         )
         return super().forward(
-            q_QNH, k_KNH, v_KNV, attention_masks=mask, scale=scale
+            q_QNH, k_KNH, v_KNV, attention_metadata=mask, scale=scale
+        )
+
+
+class Glm5KVAllGatherCPFlexAttention(KVAllGatherCPFlexInnerAttention):
+    """GLM DSA with local queries and official all-gathered CP keys/values."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(KVAllGatherCPFlexInnerAttention.Config):
+        block_size: int = 128
+        attention_dropout: float = 0.0
+
+        def build_attention_metadata(self, positions: torch.Tensor, **kwargs):
+            del positions, kwargs
+            return None
+
+        def __post_init__(self):
+            if self.attention_dropout != 0.0:
+                raise ValueError(
+                    "GLM FlexAttention currently requires attention_dropout=0"
+                )
+
+    def __init__(self, config: Config):
+        super().__init__(config)
+        self.block_size = config.block_size
+
+    def forward(
+        self,
+        q_QNH: torch.Tensor,
+        k_KNH: torch.Tensor,
+        v_KNV: torch.Tensor,
+        attention_metadata: torch.Tensor,
+        topk_indices_QS: torch.Tensor,
+        *,
+        scale: float | None = None,
+    ) -> torch.Tensor:
+        mask = build_dsa_block_mask(
+            topk_indices_QS, attention_metadata, self.block_size
+        )
+        return super().forward(
+            q_QNH, k_KNH, v_KNV, attention_metadata=mask, scale=scale
         )

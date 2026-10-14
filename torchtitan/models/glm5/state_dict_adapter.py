@@ -20,19 +20,22 @@ also lets TorchTitan's distributed checkpoint writer save and load HuggingFace
 safetensors without first materializing one full model on every rank.
 """
 
+from __future__ import annotations
+
 import re
 import warnings
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import _StridedShard, Shard
 
+from torchtitan.models.common.moe_state_dict_adapter import MoEStateDictAdapter
 from torchtitan.models.common.rope import ComplexRoPE
-from torchtitan.models.utils import MoEStateDictAdapter
 
-from .model import Glm5Model
+if TYPE_CHECKING:
+    from .model import Glm5Model
 
 
 def _contiguous_stride(shape: torch.Size) -> tuple[int, ...]:
@@ -62,7 +65,9 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
         "self_attn.indexer.wk.weight": "attention.indexer.wk.weight",
         "self_attn.indexer.k_norm.weight": "attention.indexer.k_norm.weight",
         "self_attn.indexer.k_norm.bias": "attention.indexer.k_norm.bias",
-        "self_attn.indexer.weights_proj.weight": "attention.indexer.weights_proj.weight",
+        "self_attn.indexer.weights_proj.weight": (
+            "attention.indexer.weights_proj.weight"
+        ),
         "mlp.gate_proj.weight": "feed_forward.w1.weight",
         "mlp.up_proj.weight": "feed_forward.w3.weight",
         "mlp.down_proj.weight": "feed_forward.w2.weight",
@@ -82,9 +87,9 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
     _TITAN_LAYER_KEY = re.compile(r"^layers\.(\d+)\.(.+)$")
     _FUSED_GATE_UP = "mlp.experts.gate_up_proj"
     _FUSED_DOWN = "mlp.experts.down_proj"
-    _TITAN_GATE = "moe.routed_experts.inner_experts.w1_EFD"
-    _TITAN_UP = "moe.routed_experts.inner_experts.w3_EFD"
-    _TITAN_DOWN = "moe.routed_experts.inner_experts.w2_EDF"
+    _TITAN_GATE = "moe.routed_experts.w1_EFD"
+    _TITAN_UP = "moe.routed_experts.w3_EFD"
+    _TITAN_DOWN = "moe.routed_experts.w2.weight"
 
     def __init__(
         self,
@@ -164,28 +169,39 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
 
         if suffix.startswith("feed_forward.") and layer.feed_forward is not None:
             projection = suffix.removeprefix("feed_forward.").removesuffix(".weight")
-            if projection in {"w1", "w2", "w3"}:
-                return self._linear_shape(getattr(layer.feed_forward, projection))
+            if projection in {"w1", "w3"}:
+                return self._linear_shape(layer.feed_forward.w13)
+            if projection == "w2":
+                return self._linear_shape(layer.feed_forward.w2)
 
         if layer.moe is not None:
             moe = layer.moe
             if suffix == "moe.router.gate.weight":
                 return self._linear_shape(moe.router.gate)
             if suffix == "moe.expert_bias_E":
-                experts = moe.routed_experts.inner_experts
-                return (experts.num_experts,)
+                return (moe.num_experts,)
             if suffix in {self._TITAN_GATE, self._TITAN_UP}:
-                experts = moe.routed_experts.inner_experts
-                return (experts.num_experts, experts.hidden_dim, experts.dim)
+                experts = moe.routed_experts.w13
+                return (
+                    experts.group_size,
+                    experts.out_features,
+                    experts.in_features,
+                )
             if suffix == self._TITAN_DOWN:
-                experts = moe.routed_experts.inner_experts
-                return (experts.num_experts, experts.dim, experts.hidden_dim)
+                experts = moe.routed_experts.w2
+                return (
+                    experts.group_size,
+                    experts.out_features,
+                    experts.in_features,
+                )
             if suffix.startswith("moe.shared_experts."):
                 projection = suffix.removeprefix("moe.shared_experts.").removesuffix(
                     ".weight"
                 )
-                if projection in {"w1", "w2", "w3"}:
-                    return self._linear_shape(getattr(moe.shared_experts, projection))
+                if projection in {"w1", "w3"}:
+                    return self._linear_shape(moe.shared_experts.w13)
+                if projection == "w2":
+                    return self._linear_shape(moe.shared_experts.w2)
 
         raise KeyError(f"unmapped TorchTitan key: {titan_key}")
 
@@ -203,8 +219,12 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
             raise KeyError(
                 f"unmapped HF key: layer {layer_index} has no routed GLM-5 experts"
             )
-        experts = layer.moe.routed_experts.inner_experts
-        expected = (experts.num_experts, 2 * experts.hidden_dim, experts.dim)
+        experts = layer.moe.routed_experts.w13
+        expected = (
+            experts.group_size,
+            2 * experts.out_features,
+            experts.in_features,
+        )
         if not isinstance(value, torch.Tensor) or tuple(value.shape) != expected:
             actual = tuple(value.shape) if isinstance(value, torch.Tensor) else None
             raise ValueError(
@@ -463,10 +483,17 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
             self._validate_tensor_shape(titan_key, value)
             state_dict[titan_key] = value
 
-        return state_dict
+        return self._native_fused_linears_from_hf(
+            state_dict,
+            fuse_routed_experts=True,
+        )
 
     def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
         """Validate and convert TorchTitan state into HF names and expert packing."""
+        state_dict = self._native_fused_linears_to_hf(
+            state_dict,
+            split_routed_experts=True,
+        )
         hf_state_dict: dict[str, Any] = {}
         fused_experts: dict[int, dict[str, Any]] = {}
 
