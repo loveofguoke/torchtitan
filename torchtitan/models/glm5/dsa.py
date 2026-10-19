@@ -241,9 +241,8 @@ def build_dsa_block_mask(
     occupied = padded.reshape((Q + B - 1) // B, B, (K + B - 1) // B, B)
     occupied = occupied.any(dim=3).any(dim=1)[None, None]
     counts = occupied.sum(-1).to(torch.int32)
-    # Ascend executes integer ArgSort on AiCPU. The keys are boolean, so
-    # float32 preserves the exact 0/1 order while keeping stable tie ordering
-    # and lets supported devices use their accelerator sort kernel.
+    # Sorting float32 0/1 keys preserves the exact occupancy order while
+    # allowing accelerator backends to use their native stable sort path.
     blocks = occupied.to(torch.float32).argsort(
         dim=-1, descending=True, stable=True
     )

@@ -18,14 +18,17 @@ from torchtitan.components.optim import (
 from torchtitan.config import TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed.activation_remat import DefaultActivationRematConfig
-from torchtitan.models.common.config_utils import decoder_vocab_size
+from torchtitan.models.common.config_utils import (
+    decoder_vocab_size,
+    DEFAULT_DEBUG_MODEL_SEQ_LEN,
+)
 from torchtitan.models.glm5 import build_model_config, MTPLoss
 from torchtitan.observability.metrics import MetricsProcessor
 from torchtitan.trainer import Trainer
 
 
 def glm5_debugmodel(
-    seq_len: int = 128,
+    seq_len: int = DEFAULT_DEBUG_MODEL_SEQ_LEN,
     *,
     parallelism: ParallelismConfig | None = None,
     flavor: str = "glm5_2_debugmodel",
@@ -100,7 +103,7 @@ def glm5_2_scaled_debugmodel(
 
 
 def glm5_2_debugmodel_mtp(
-    seq_len: int = 128,
+    seq_len: int = DEFAULT_DEBUG_MODEL_SEQ_LEN,
     *,
     parallelism: ParallelismConfig | None = None,
     mtp_scale: float = 0.3,

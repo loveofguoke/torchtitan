@@ -29,6 +29,27 @@ Runnable development recipes live in
 `torchtitan_recipes/tests/models/glm5.py`. The released flavor describes the
 full architecture and is not intended for single-host smoke tests.
 
+## Download tokenizer and checkpoint assets
+
+Download tokenizer and model metadata from the released GLM-5.2 repository:
+
+```bash
+python scripts/download_hf_assets.py \
+  --repo_id zai-org/GLM-5.2 \
+  --assets tokenizer config index
+```
+
+To load the released weights for continued training or checkpoint conversion,
+also request `safetensors`. The checkpoint is very large, so the debug recipes
+use the repository test tokenizer and randomly initialized weights by default.
+
+Validate the model definition and Hugging Face checkpoint mapping with the
+reduced deterministic parity test:
+
+```bash
+python -m scripts.checkpoint_conversion.numerical_tests_glm5
+```
+
 ## Files
 
 - `flavors.py`: model flavors and nested config construction

@@ -23,8 +23,6 @@ Primary references:
 
 - [GLM-5.2 config](https://huggingface.co/zai-org/GLM-5.2/blob/main/config.json)
 - [GLM-5.2 checkpoint index](https://huggingface.co/zai-org/GLM-5.2/blob/main/model.safetensors.index.json)
-- [Official Ascend deployment and optimization guide](https://github.com/zai-org/GLM-5/blob/main/example/ascend.md)
-- [vLLM Ascend GLM-5.2 guide](https://docs.vllm.ai/projects/ascend/en/latest/tutorials/models/GLM5.2.html)
 
 ## Training data path
 
@@ -115,11 +113,9 @@ than a fallback to non-MTP training.
 
 ## Training versus speculative decoding
 
-`index_share_for_mtp_iteration` is a serving optimization.  A speculative
+`index_share_for_mtp_iteration` is a serving optimization. A speculative
 decoder can apply the same single MTP block repeatedly: iteration zero computes
-the lightning-indexer Top-K and later iterations reuse that selection.  The
-official Ascend stacks also overlap proposal and verification and tune the
-number of speculative tokens.
+the lightning-indexer Top-K and later iterations reuse that selection.
 
 TorchTitan's current implementation is the training objective.  It runs one
 NextN block once for each configured objective and does not contain a serving

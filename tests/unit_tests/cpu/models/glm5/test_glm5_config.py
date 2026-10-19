@@ -9,6 +9,7 @@ import unittest
 import torch
 
 from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.models.common.config_utils import DEFAULT_DEBUG_MODEL_SEQ_LEN
 from torchtitan.models.common.flops import get_nparams_and_active_nparams
 from torchtitan.models.common.moe import MoE
 from torchtitan.models.glm5 import build_model_config, MODEL_FLAVORS
@@ -52,7 +53,7 @@ class TestGlm5Config(unittest.TestCase):
             build_model_config(
                 "debugmodel",
                 parallelism=ParallelismConfig(),
-                seq_len=129,
+                seq_len=DEFAULT_DEBUG_MODEL_SEQ_LEN + 1,
             )
 
     def test_debug_model_builds_and_initializes(self) -> None:

@@ -35,6 +35,7 @@ from torchtitan.models.common.moe.sharding import (
     router_sharding_config,
 )
 from torchtitan.models.common.config_utils import (
+    DEFAULT_DEBUG_MODEL_SEQ_LEN,
     make_ffn_config,
     make_moe_config,
     make_routed_experts_config,
@@ -835,7 +836,7 @@ def build_model_config(
     max_context_len = {
         "744B-A40B": 1_048_576,
         "glm5_2_scaled_debugmodel": 4096,
-    }.get(flavor, 128)
+    }.get(flavor, DEFAULT_DEBUG_MODEL_SEQ_LEN)
     context_len = seq_len or max_context_len
     if context_len > max_context_len:
         raise ValueError(
