@@ -34,9 +34,13 @@ def dsa_mask_placement() -> SpmdType:
 def glm5_attention_sharding_config(*, enable_sp: bool) -> ShardingConfig:
     """Keep a GLM attention block on the decoder residual layout."""
     residual = residual_activation_placement(enable_sp=enable_sp)
+    attention = dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
+    positions = token_id_placement()
     return ShardingConfig(
-        in_src_shardings={"x_TD": residual},
-        out_src_shardings=residual,
+        in_src_shardings={"x_TD": residual, "positions": positions},
+        in_dst_shardings={"x_TD": attention, "positions": positions},
+        out_src_shardings=attention,
+        out_dst_shardings=residual,
     )
 
 

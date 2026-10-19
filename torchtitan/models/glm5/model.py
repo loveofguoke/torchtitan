@@ -34,11 +34,12 @@ from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.distributed.spmd_types import annotate_input_spmd_types
 from torchtitan.models.base.module import Module
 from torchtitan.models.common import ComplexRoPE, Linear, RMSNorm
-from torchtitan.models.common.attention import BaseAttention
+from torchtitan.models.common.attention import Attention
 from torchtitan.models.common.aux_loss import AuxLoss
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.models.common.decoder_sharding import decoder_input_sharding
 from torchtitan.models.common.flops import get_nparams_and_active_nparams
+from torchtitan.models.common.moe import MoE
 from torchtitan.models.deepseek_v3.mtp import MTPDecoder, roll_mtp_sequence
 
 from .dsa import DSAIndexerTopK, Glm5DsaIndexer, create_dsa_causal_mask
@@ -51,7 +52,7 @@ from .state_dict_adapter import Glm5StateDictAdapter
 # D/N/H/R/P/V: model, head-count, head, RoPE, pass-through, and value dimensions.
 
 
-class Glm5Attention(BaseAttention):
+class Glm5Attention(Attention):
     """Multi-head latent attention (MLA) gated by DSA top-k indices.
 
     Q follows ``D -> q_lora_rank -> N * (nope + rope)``. KV follows
@@ -61,7 +62,7 @@ class Glm5Attention(BaseAttention):
     the expanded Q/K/V tensors.
     """
     @dataclass(kw_only=True, slots=True)
-    class Config(BaseAttention.Config):
+    class Config(Attention.Config):
         dim: int
         q_lora_rank: int
         kv_lora_rank: int
@@ -199,13 +200,7 @@ class Glm5TransformerBlock(TransformerBlock):
         self.attention_norm = config.attention_norm.build()
         self.ffn_norm = config.ffn_norm.build()
         self.preserve_output_for_mtp = config.preserve_output_for_mtp
-        self.moe_enabled = config.moe is not None
-        if self.moe_enabled:
-            assert config.moe is not None
-            self.moe = config.moe.build()
-        else:
-            assert config.feed_forward is not None
-            self.feed_forward = config.feed_forward.build()
+        self.feed_forward = config.feed_forward.build()
 
     def forward(
         self,
@@ -232,8 +227,8 @@ class Glm5TransformerBlock(TransformerBlock):
         remat.recompute_needs_tensor(attention_TD)
         x_TD = x_TD + attention_TD
         normalized_TD = self.ffn_norm(x_TD)
-        if self.moe_enabled:
-            ffn_output_TD = self.moe(
+        if isinstance(self.feed_forward, MoE):
+            ffn_output_TD = self.feed_forward(
                 normalized_TD,
                 padding_mask_T=padding_mask,
                 aux_loss_denominator=aux_loss_denominator,
@@ -297,9 +292,10 @@ class Glm5Model(MTPDecoder):
             base_flops -= 4 * nparams_indexer
             # Per token, the indexer computes N dot products of width H against
             # the full sequence, followed by a weighted reduction over N heads.
+            num_dsa_layers = len(self.layers) + len(self.mtp_layers or ())
             dsa_flops = (
                 2
-                * len(self.layers)
+                * num_dsa_layers
                 * attention.indexer.n_heads
                 * (attention.indexer.head_dim + 1)
                 * seq_len
@@ -355,10 +351,17 @@ class Glm5Model(MTPDecoder):
                         "index source must be a current/earlier producer layer"
                     )
 
-    def preprocess_inputs(self, input_dict: dict[str, Any], **kwargs):
+    def preprocess_inputs(
+        self,
+        input_dict: dict[str, Any],
+        *,
+        parallelism_context,
+        parallelism,
+        global_routing_token_counts: torch.Tensor | None = None,
+        **kwargs: Any,
+    ):
         """Build the global DSA mask, then CP-shard only its query dimension."""
-        parallelism_context = kwargs["parallelism_context"]
-        parallelism = kwargs["parallelism"]
+        del kwargs
         positions = input_dict.get("positions")
         if positions is not None:
             input_dict["attention_masks"] = self.get_attention_masks(
@@ -420,7 +423,7 @@ class Glm5Model(MTPDecoder):
         labels = input_dict.pop("labels")
         has_aux_loss = next(self.config.traverse(AuxLoss.Config), None) is not None
         if has_aux_loss or self.mtp_layers:
-            input_dict["aux_loss_denominators"] = None
+            input_dict["aux_loss_denominators"] = global_routing_token_counts
         if self.mtp_layers is not None:
             inputs = (inputs, *(input_dict.pop(f"mtp_tokens_{d}") for d in depths))
             labels = (labels, *(input_dict.pop(f"mtp_labels_{d}") for d in depths))
@@ -443,7 +446,7 @@ class Glm5Model(MTPDecoder):
         *,
         padding_mask: torch.Tensor | None = None,
         aux_loss_denominators: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         # Preserve Decoder's positional ``model(tokens, positions)`` API. PP
         # metadata is [T, S], while GLM positions are required to be [T].
         if pipeline_indices_TS is not None and pipeline_indices_TS.ndim == 1:

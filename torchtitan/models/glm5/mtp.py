@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import torch
 import torch_remat as remat
 
+from torchtitan.models.common.moe import MoE
 from torchtitan.models.deepseek_v3.mtp import (
     MTPLoss,
     MTPTransformerBlock,
@@ -59,8 +60,8 @@ class Glm5MTPTransformerBlock(MTPTransformerBlock):
         mtp_padding_mask = ~mtp_input_valid_mask
         if padding_mask is not None:
             mtp_padding_mask = mtp_padding_mask | padding_mask
-        if self.moe_enabled:
-            ffn_out = self.moe(
+        if isinstance(self.feed_forward, MoE):
+            ffn_out = self.feed_forward(
                 self.ffn_norm(h),
                 padding_mask_T=mtp_padding_mask,
                 aux_loss_denominator=aux_loss_denominator,

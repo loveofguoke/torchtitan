@@ -30,6 +30,10 @@ from torchtitan.models.common import (
     TransformerBlock,
 )
 from torchtitan.models.common.moe import TokenChoiceTopKRouter
+from torchtitan.models.common.moe.sharding import (
+    router_gate_sharding_config,
+    router_sharding_config,
+)
 from torchtitan.models.common.config_utils import (
     make_ffn_config,
     make_moe_config,
@@ -43,10 +47,6 @@ from torchtitan.models.common.decoder_sharding import (
     replicated_state_sharding_config,
     rope_cache_sharding_config,
     token_embedding_sharding_config,
-)
-from torchtitan.models.common.moe_sharding import (
-    router_gate_sharding_config,
-    router_sharding_config,
 )
 from torchtitan.models.common.param_init import depth_scaled_std
 from torchtitan.models.deepseek_v3.sharding import (
@@ -64,7 +64,7 @@ from .dsa import (
     DSAIndexerTopK,
     Glm5DsaIndexer,
     Glm5FlexAttention,
-    Glm5KVAllGatherCPFlexAttention,
+    Glm5AllGatherKVFlexAttention,
 )
 from .sharding import (
     glm5_attention_sharding_config,
@@ -105,7 +105,6 @@ def build_glm5_mtp_layers(
         Glm5MTPTransformerBlock.Config(
             attention=copy.deepcopy(inner_cfg.attention),
             feed_forward=copy.deepcopy(inner_cfg.feed_forward),
-            moe=copy.deepcopy(inner_cfg.moe),
             attention_norm=copy.deepcopy(inner_cfg.attention_norm),
             ffn_norm=copy.deepcopy(inner_cfg.ffn_norm),
             enorm=RMSNorm.Config(
@@ -361,7 +360,7 @@ def make_glm5_attention_config(
             sharding_config=glm5_indexer_sharding_config(),
         ),
         inner_attention=(
-            Glm5KVAllGatherCPFlexAttention.Config
+            Glm5AllGatherKVFlexAttention.Config
             if enable_cp
             else Glm5FlexAttention.Config
         )(
@@ -451,10 +450,8 @@ def build_glm5_layers(
                 w2_param_init=_depth_init(layer_id),
                 enable_sp=enable_sp,
             )
-            moe = None
         else:
-            feed_forward = None
-            moe = make_moe_config(
+            feed_forward = make_moe_config(
                 num_experts=num_experts,
                 router=make_glm5_router_config(
                     dim=dim,
@@ -499,7 +496,6 @@ def build_glm5_layers(
                     sharding_config=norm_sharding_config(enable_sp=enable_sp),
                 ),
                 feed_forward=feed_forward,
-                moe=moe,
             )
         )
     return layers

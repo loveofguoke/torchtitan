@@ -30,7 +30,8 @@ import torch.distributed as dist
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import _StridedShard, Shard
 
-from torchtitan.models.common.moe_state_dict_adapter import MoEStateDictAdapter
+from torchtitan.models.common.moe import MoE
+from torchtitan.models.common.moe.state_dict_adapter import MoEStateDictAdapter
 from torchtitan.models.common.rope import ComplexRoPE
 
 if TYPE_CHECKING:
@@ -70,11 +71,11 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
         "mlp.gate_proj.weight": "feed_forward.w1.weight",
         "mlp.up_proj.weight": "feed_forward.w3.weight",
         "mlp.down_proj.weight": "feed_forward.w2.weight",
-        "mlp.gate.weight": "moe.router.gate.weight",
-        "mlp.gate.e_score_correction_bias": "moe.expert_bias_E",
-        "mlp.shared_experts.gate_proj.weight": "moe.shared_experts.w1.weight",
-        "mlp.shared_experts.up_proj.weight": "moe.shared_experts.w3.weight",
-        "mlp.shared_experts.down_proj.weight": "moe.shared_experts.w2.weight",
+        "mlp.gate.weight": "feed_forward.router.gate.weight",
+        "mlp.gate.e_score_correction_bias": "feed_forward.expert_bias_E",
+        "mlp.shared_experts.gate_proj.weight": "feed_forward.shared_experts.w1.weight",
+        "mlp.shared_experts.up_proj.weight": "feed_forward.shared_experts.w3.weight",
+        "mlp.shared_experts.down_proj.weight": "feed_forward.shared_experts.w2.weight",
         "input_layernorm.weight": "attention_norm.weight",
         "post_attention_layernorm.weight": "ffn_norm.weight",
     }
@@ -93,9 +94,9 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
     _TITAN_MTP_KEY = re.compile(r"^mtp_layers\.(\d+)\.(.+)$")
     _FUSED_GATE_UP = "mlp.experts.gate_up_proj"
     _FUSED_DOWN = "mlp.experts.down_proj"
-    _TITAN_GATE = "moe.routed_experts.w1_EFD"
-    _TITAN_UP = "moe.routed_experts.w3_EFD"
-    _TITAN_DOWN = "moe.routed_experts.w2.weight"
+    _TITAN_GATE = "feed_forward.routed_experts.w1_EFD"
+    _TITAN_UP = "feed_forward.routed_experts.w3_EFD"
+    _TITAN_DOWN = "feed_forward.routed_experts.w2.weight"
 
     def __init__(
         self,
@@ -202,11 +203,11 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
             if projection == "w2":
                 return self._linear_shape(layer.feed_forward.w2)
 
-        if layer.moe is not None:
-            moe = layer.moe
-            if suffix == "moe.router.gate.weight":
+        if isinstance(layer.feed_forward, MoE.Config):
+            moe = layer.feed_forward
+            if suffix == "feed_forward.router.gate.weight":
                 return self._linear_shape(moe.router.gate)
-            if suffix == "moe.expert_bias_E":
+            if suffix == "feed_forward.expert_bias_E":
                 return (moe.num_experts,)
             if suffix in {self._TITAN_GATE, self._TITAN_UP}:
                 experts = moe.routed_experts.w13
@@ -222,8 +223,8 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
                     experts.out_features,
                     experts.in_features,
                 )
-            if suffix.startswith("moe.shared_experts."):
-                projection = suffix.removeprefix("moe.shared_experts.").removesuffix(
+            if suffix.startswith("feed_forward.shared_experts."):
+                projection = suffix.removeprefix("feed_forward.shared_experts.").removesuffix(
                     ".weight"
                 )
                 if projection in {"w1", "w3"}:
@@ -243,11 +244,11 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
 
     def _validate_fused_experts(self, layer_index: int, value: Any) -> None:
         layer = self._layer_config(layer_index)
-        if layer.moe is None:
+        if not isinstance(layer.feed_forward, MoE.Config):
             raise KeyError(
                 f"unmapped HF key: layer {layer_index} has no routed GLM-5 experts"
             )
-        experts = layer.moe.routed_experts.w13
+        experts = layer.feed_forward.routed_experts.w13
         expected = (
             experts.group_size,
             2 * experts.out_features,

@@ -12,16 +12,19 @@ computes dense per-head ranking scores.
 
 from dataclasses import dataclass
 
+import spmd_types as spmd
 import torch
 import torch.nn.functional as F
 import torch_remat as remat
 from torch.nn.attention.flex_attention import BlockMask
 
+from torchtitan.distributed.parallelism_context import MeshAxisName
+from torchtitan.distributed.spmd_types import spmd_mesh_group
 from torchtitan.models.common import ComplexRoPE, LayerNorm, Linear
 from torchtitan.models.base.module import Module
 from torchtitan.models.common.attention import FlexInnerAttention
 from torchtitan.models.common.attention.cp_attention import (
-    KVAllGatherCPFlexInnerAttention,
+    AllGatherKVFlexInnerAttention,
 )
 
 
@@ -182,6 +185,18 @@ class Glm5DsaIndexer(Module):
         q_TNH = torch.cat((q_rot_TNR, q_pass_TNP), dim=-1)
         k_TH = torch.cat((k_rot_T1R, k_pass_T1P), dim=-1).squeeze(1)
 
+        # Context parallelism keeps queries local but every query ranks the
+        # global key sequence. Match the KV-all-gather attention contract by
+        # gathering indexer keys over CP before the discrete top-k boundary.
+        cp_group = spmd_mesh_group(MeshAxisName.CP)
+        if cp_group is not None:
+            k_TH = spmd.redistribute(
+                k_TH,
+                cp_group,
+                src=spmd.S(0),
+                dst=spmd.R,
+            )
+
         # The learned per-token head weights turn N head-specific similarities
         # into the scalar [T,T] ranking consumed by top-k.
         weights_TN = self.weights_proj(
@@ -286,11 +301,11 @@ class Glm5FlexAttention(FlexInnerAttention):
         )
 
 
-class Glm5KVAllGatherCPFlexAttention(KVAllGatherCPFlexInnerAttention):
+class Glm5AllGatherKVFlexAttention(AllGatherKVFlexInnerAttention):
     """GLM DSA with local queries and official all-gathered CP keys/values."""
 
     @dataclass(kw_only=True, slots=True)
-    class Config(KVAllGatherCPFlexInnerAttention.Config):
+    class Config(AllGatherKVFlexInnerAttention.Config):
         block_size: int = 128
         attention_dropout: float = 0.0
 

@@ -17,7 +17,7 @@ from torchtitan.components.optim import (
 )
 from torchtitan.config import TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
-from torchtitan.distributed.activation_checkpoint import SelectiveAC
+from torchtitan.distributed.activation_remat import DefaultActivationRematConfig
 from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.models.glm5 import build_model_config, MTPLoss
 from torchtitan.observability.metrics import MetricsProcessor
@@ -29,6 +29,7 @@ def glm5_debugmodel(
     *,
     parallelism: ParallelismConfig | None = None,
     flavor: str = "glm5_2_debugmodel",
+    mtp_scale: float | None = None,
 ) -> Trainer.Config:
     """Return a deterministic small GLM-5 training recipe."""
     if parallelism is None:
@@ -39,11 +40,15 @@ def glm5_debugmodel(
         seq_len=seq_len,
     )
     num_mtp_layers = len(model_config.mtp_layers or ())
+    if mtp_scale is not None and num_mtp_layers == 0:
+        raise ValueError("mtp_scale may only be set for a GLM MTP flavor")
+    if mtp_scale is not None and mtp_scale < 0:
+        raise ValueError("mtp_scale must be non-negative")
     num_tokens = 8 * seq_len
     loss_config = (
         MTPLoss.Config(
             global_vocab_size=decoder_vocab_size(model_config),
-            mtp_scale=0.3,
+            mtp_scale=0.3 if mtp_scale is None else mtp_scale,
         )
         if model_config.mtp_layers
         else CrossEntropyLoss.Config(
@@ -78,7 +83,7 @@ def glm5_debugmodel(
         ),
         parallelism=parallelism,
         checkpointer=None,
-        activation_checkpoint=SelectiveAC.Config(),
+        activation_remat=DefaultActivationRematConfig(),
     )
 
 
@@ -98,9 +103,11 @@ def glm5_2_debugmodel_mtp(
     seq_len: int = 128,
     *,
     parallelism: ParallelismConfig | None = None,
+    mtp_scale: float = 0.3,
 ) -> Trainer.Config:
     return glm5_debugmodel(
         seq_len,
         parallelism=parallelism,
         flavor="glm5_2_debugmodel_mtp",
+        mtp_scale=mtp_scale,
     )
