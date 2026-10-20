@@ -5,6 +5,8 @@
 # LICENSE file in the root directory of this source tree.
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -122,6 +124,35 @@ class TestGlm5Config(unittest.TestCase):
             glm5_debugmodel(mtp_scale=0.125)
         with self.assertRaisesRegex(ValueError, "must be non-negative"):
             glm5_2_debugmodel_mtp(mtp_scale=-0.1)
+
+    def test_preprocess_inputs_returns_loss_kwargs(self) -> None:
+        config = build_model_config(
+            "glm5_2_debugmodel",
+            parallelism=ParallelismConfig(),
+            seq_len=8,
+        )
+        model = config.build()
+        token_loss_weight = torch.tensor(0.5)
+        input_dict = {
+            "input": torch.arange(8),
+            "labels": torch.arange(8),
+            "loss_kwargs": {"token_loss_weight": token_loss_weight},
+        }
+
+        with patch(
+            "torchtitan.models.glm5.model.annotate_input_spmd_types",
+            side_effect=lambda _context, inputs, _shardings: inputs,
+        ):
+            inputs, labels, model_kwargs, loss_kwargs = model.preprocess_inputs(
+                input_dict,
+                parallelism_context=SimpleNamespace(cp_enabled=False),
+                parallelism=ParallelismConfig(),
+            )
+
+        torch.testing.assert_close(inputs, torch.arange(8))
+        torch.testing.assert_close(labels, torch.arange(8))
+        self.assertNotIn("token_loss_weight", model_kwargs)
+        torch.testing.assert_close(loss_kwargs["token_loss_weight"], token_loss_weight)
 
     def test_mtp_flops_include_auxiliary_dsa_indexer(self) -> None:
         config = build_model_config(

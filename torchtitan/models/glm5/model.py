@@ -362,6 +362,7 @@ class Glm5Model(MTPDecoder):
     ):
         """Build the global DSA mask, then CP-shard only its query dimension."""
         del kwargs
+        loss_kwargs = input_dict.pop("loss_kwargs", {})
         positions = input_dict.get("positions")
         if positions is not None:
             input_dict["attention_masks"] = self.get_attention_masks(
@@ -408,6 +409,8 @@ class Glm5Model(MTPDecoder):
             input_shardings[f"mtp_labels_{depth}"] = input_shardings["labels"]
             input_shardings[f"mtp_valid_{depth}"] = input_shardings["input"]
             input_shardings[f"mtp_attention_masks_{depth}"] = dsa_mask_placement()
+        input_shardings.update(dict.fromkeys(loss_kwargs, input_shardings["labels"]))
+        input_dict.update(loss_kwargs)
         if parallelism_context.cp_enabled:
             input_dict = self._cp_shard(
                 input_dict,
@@ -419,6 +422,7 @@ class Glm5Model(MTPDecoder):
             parallelism_context, input_dict, input_shardings
         )
 
+        loss_kwargs = {name: input_dict.pop(name) for name in loss_kwargs}
         inputs = input_dict.pop("input")
         labels = input_dict.pop("labels")
         has_aux_loss = next(self.config.traverse(AuxLoss.Config), None) is not None
@@ -433,7 +437,7 @@ class Glm5Model(MTPDecoder):
             input_dict["mtp_attention_masks"] = tuple(
                 input_dict.pop(f"mtp_attention_masks_{d}") for d in depths
             )
-        return inputs, labels, input_dict
+        return inputs, labels, input_dict, loss_kwargs
 
     def forward(
         self,
