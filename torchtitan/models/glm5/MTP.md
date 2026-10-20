@@ -1,9 +1,7 @@
 # GLM-5.2 multi-token prediction
 
-This note records the training implementation and its boundary with
-serving-time speculative decoding.  It is an implementation contract, not a
-claim that every distributed combination has already passed accelerator
-acceptance.
+This note describes the training implementation and its boundary with
+serving-time speculative decoding.
 
 ## Released checkpoint contract
 
@@ -43,11 +41,9 @@ The generic rolling and loss semantics are shared with DeepSeek-V3 through
 `torchtitan.models.deepseek_v3.mtp`; GLM only specializes the DSA attention
 interface and checkpoint schema.
 
-The recipe exposes `mtp_scale` explicitly.  Its default value of `0.3` follows
-the TorchTitan DeepSeek-V3 training convention; it is not claimed as a
-published GLM-5.2 pretraining hyperparameter because the released GLM config
-does not contain that value.  Experiments may override it through the recipe
-or the nested loss configuration, and reports must record the effective value.
+The recipe exposes `mtp_scale` explicitly. Its default value of `0.3` follows
+the TorchTitan DeepSeek-V3 training convention; the released GLM configuration
+does not publish an MTP loss scale.
 
 ## Model path
 
@@ -66,12 +62,9 @@ block, and returns a normalized auxiliary hidden state.  The normal top-level
 computes normal next-token cross entropy plus the configured weighted MTP term.
 
 The pre-final-norm input follows TorchTitan's DeepSeek-V3 training MTP
-contract.  Serving runtimes may instead discuss post-final-norm state recycling
-inside an iterative speculative-decoding loop.  That serving fix does not by
-itself redefine the one-pass auxiliary training objective.  A future claim of
-exact GLM forward parity must still compare first-depth logits against an
-authoritative checkpoint runtime; the Transformers GLM implementation cannot
-serve as that oracle because it currently omits the MTP layer.
+contract. The Transformers GLM implementation currently omits this MTP layer,
+so the reduced Hugging Face parity script validates the target decoder but not
+the auxiliary MTP logits.
 
 ## Checkpoint conversion
 
@@ -82,29 +75,17 @@ explicitly.  Tests assert both a bitwise native-to-HF-to-native round trip and
 the real released key shape, including the absence of a duplicated
 `shared_head.head.weight`.
 
-## Parallelism and acceptance boundary
+## Parallelism
 
 The implementation reuses the common MTP FSDP lifecycle and MTP TP/SP sharding
-configs.  GLM additionally assigns the DSA mask's query-sharded CP placement.
-These are implementation paths, not hardware acceptance results.
+configs. GLM additionally assigns the DSA mask's query-sharded CP placement.
 
 Parameter and FLOP accounting includes both the 78 target decoder layers and
 the configured MTP layers.  In particular, the frozen DSA indexer is charged
 for forward work but not nonexistent backward work for every executed target
 or MTP block.  This keeps MTP on/off MFU comparisons internally consistent.
 
-Required validation order is:
-
-1. CPU config construction and checkpoint round trip;
-2. single-device forward, backward, finite loss, and finite gradient norm;
-3. TP and SP numerical comparison;
-4. FSDP and EP smoke plus checkpoint save/resume;
-5. CP smoke and numerical comparison of the auxiliary DSA mask;
-6. graph-mode eager-versus-compiled comparison on each supported backend;
-7. profiler-off MTP off/on performance and memory A/B;
-8. only then broaden to combined topologies.
-
-### TODO: pipeline parallel MTP
+### Pipeline parallelism
 
 Pipeline parallel MTP currently requires the token embedding, target decoder
 tail, MTP block, final norm, and shared lm_head to be represented coherently at
@@ -113,7 +94,7 @@ embedding or lm_head instead of silently dropping the auxiliary objective.
 Until a dedicated PP contract and test exist, PP+MTP is unsupported rather
 than a fallback to non-MTP training.
 
-## Training versus speculative decoding
+## Training and speculative decoding
 
 `index_share_for_mtp_iteration` is a serving optimization. A speculative
 decoder can apply the same single MTP block repeatedly: iteration zero computes
@@ -122,11 +103,5 @@ the lightning-indexer Top-K and later iterations reuse that selection.
 TorchTitan's current implementation is the training objective.  It runs one
 NextN block once for each configured objective and does not contain a serving
 scheduler, KV cache, acceptance/rejection loop, or multi-stream proposer.
-Consequently:
-
-- the full MTP weights and loss are implemented here;
-- iterative Top-K reuse belongs to a future inference/runtime integration;
-- setting an environment variable must never pretend that the training path
-  implements speculative serving;
-- accelerator-specific fused kernels or communication overlap belong in the
-  platform extension, with explicit capability checks and A/B evidence.
+Consequently, the model implements the MTP weights and auxiliary training loss,
+while iterative Top-K reuse remains outside the TorchTitan training path.

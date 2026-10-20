@@ -1,4 +1,4 @@
-# GLM-5
+# GLM-5.2
 
 This directory implements the GLM-5.2 decoder architecture for TorchTitan.
 The implementation follows TorchTitan's config-first model contract and uses
@@ -40,8 +40,8 @@ CONFIG=glm5_debugmodel \
 ```
 
 The recipe defaults to 10 steps and uses TorchTitan's standard configuration
-overrides. For example, an 8-GPU run combining FSDP, TP, CP, and EP is
-registered as the `glm5_fsdp+tp+cp+ep` integration test:
+overrides. An 8-GPU run combining FSDP, TP, CP, and EP is registered as the
+`glm5_fsdp+tp+cp+ep` integration test:
 
 ```bash
 python -m tests.integration_tests.run_tests \
@@ -86,15 +86,6 @@ reduced deterministic parity test:
 python -m scripts.checkpoint_conversion.numerical_tests_glm5
 ```
 
-## Files
-
-- `flavors.py`: model flavors and nested config construction
-- `model.py`: decoder, transformer block, MLA, and DSA integration
-- `dsa.py`: learned indexer and sparse FlexAttention mask construction
-- `sharding.py`: GLM-specific declarative SPMD layouts
-- `state_dict_adapter.py`: Hugging Face checkpoint conversion
-- `mtp.py`: GLM-specific full-DSA MTP block built on the common MTP lifecycle
-
 ## Multi-token prediction
 
 The released GLM-5.2 checkpoint declares 78 target decoder layers and one
@@ -110,12 +101,6 @@ and label sequence, the GLM block builds the corresponding DSA mask, and
 ``MTPLoss`` adds the weighted auxiliary cross-entropy objective.  See
 [`MTP.md`](MTP.md) for the data, model, checkpoint, parallelism, and validation
 contracts.
-
-The checkpoint field ``index_share_for_mtp_iteration`` belongs to iterative
-speculative decoding: draft step zero computes a sparse Top-K selection and
-later draft iterations may reuse it.  A training batch executes the single
-NextN block once per objective, so that serving optimization is deliberately
-not exposed as a training configuration or a silent fallback here.
 
 ## Validation
 
@@ -144,12 +129,9 @@ glm5_fsdp+tp+cp+ep
 glm5_mtp_fsdp+tp+cp+ep
 ```
 
-The MTP case exercises shifted dataloader targets, the full auxiliary DSA/MoE
-block, combined main and auxiliary loss, backward, and the optimizer step.
-
-For numerical changes, compare loss and gradient norm with identical seeds,
-parallelism, and deterministic settings as described in the repository
-development guide.
+The MTP case exercises shifted targets, the auxiliary DSA/MoE block, the
+combined loss, backward, and the optimizer step. Pipeline parallelism with MTP
+is not yet supported; base GLM-5.2 pipeline parallelism is supported.
 
 ## References
 

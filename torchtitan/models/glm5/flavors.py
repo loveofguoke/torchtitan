@@ -374,8 +374,8 @@ def make_glm5_attention_config(
 
 def build_glm5_layers(
     *,
-    n_layers: int,
-    n_dense_layers: int,
+    num_layers: int,
+    num_dense_layers: int,
     dim: int,
     n_heads: int,
     q_lora_rank: int,
@@ -403,8 +403,8 @@ def build_glm5_layers(
     enable_ep: bool = False,
 ) -> list[TransformerBlock.Config]:
     """Build GLM-5 dense and MoE block configurations for every layer."""
-    if not 0 <= n_dense_layers <= n_layers:
-        raise ValueError("n_dense_layers must be in [0, n_layers].")
+    if not 0 <= num_dense_layers <= num_layers:
+        raise ValueError("num_dense_layers must be in [0, num_layers].")
     if router_num_expert_groups <= 0:
         raise ValueError("router_num_expert_groups must be > 0.")
     if num_experts % router_num_expert_groups != 0:
@@ -422,7 +422,7 @@ def build_glm5_layers(
         raise ValueError("router_top_k exceeds the experts in limited groups.")
 
     layers: list[TransformerBlock.Config] = []
-    for layer_id in range(n_layers):
+    for layer_id in range(num_layers):
         # Every block uses MLA+DSA attention. Only the FFN family changes:
         # early blocks are dense and the remaining blocks use routed+shared MoE.
         attention = make_glm5_attention_config(
@@ -443,7 +443,7 @@ def build_glm5_layers(
             enable_sp=enable_sp,
             enable_cp=enable_cp,
         )
-        if layer_id < n_dense_layers:
+        if layer_id < num_dense_layers:
             feed_forward = make_ffn_config(
                 dim=dim,
                 hidden_dim=dense_hidden_dim,
@@ -504,7 +504,7 @@ def build_glm5_layers(
 
 def _debugmodel(
     *,
-    n_dense_layers: int = 1,
+    num_dense_layers: int = 1,
     index_sources: tuple[int, ...] = (),
     seq_len: int = 128,
     parallelism: ParallelismConfig | None = None,
@@ -544,8 +544,8 @@ def _debugmodel(
             sharding_config=lm_head_sharding_config(),
         ),
         layers=build_glm5_layers(
-            n_layers=8,
-            n_dense_layers=n_dense_layers,
+            num_layers=8,
+            num_dense_layers=num_dense_layers,
             dim=dim,
             n_heads=8,
             q_lora_rank=128,
@@ -592,7 +592,7 @@ def _glm5_2_debugmodel(
 ) -> Glm5Model.Config:
     """Build a small model that preserves GLM-5.2 layer-type transitions."""
     return _debugmodel(
-        n_dense_layers=3,
+        num_dense_layers=3,
         index_sources=(0, 1, 2, 2, 2, 2, 6, 6),
         seq_len=seq_len,
         parallelism=parallelism,
@@ -683,8 +683,8 @@ def _glm5_2_scaled_debugmodel(
             sharding_config=lm_head_sharding_config(),
         ),
         layers=build_glm5_layers(
-            n_layers=num_layers,
-            n_dense_layers=3,
+            num_layers=num_layers,
+            num_dense_layers=3,
             dim=dim,
             n_heads=8,
             q_lora_rank=384,
@@ -741,8 +741,8 @@ def _glm5_2_744b_a40b(
         scaling="none",
     )
     layers = build_glm5_layers(
-        n_layers=num_layers,
-        n_dense_layers=3,
+        num_layers=num_layers,
+        num_dense_layers=3,
         dim=dim,
         n_heads=64,
         q_lora_rank=2048,
