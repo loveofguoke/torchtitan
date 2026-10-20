@@ -104,6 +104,8 @@ Required validation order is:
 7. profiler-off MTP off/on performance and memory A/B;
 8. only then broaden to combined topologies.
 
+### TODO: pipeline parallel MTP
+
 Pipeline parallel MTP currently requires the token embedding, target decoder
 tail, MTP block, final norm, and shared lm_head to be represented coherently at
 the pipeline boundary.  `Glm5Model.forward()` rejects a partition missing the

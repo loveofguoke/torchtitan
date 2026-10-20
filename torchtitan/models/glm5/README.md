@@ -29,6 +29,42 @@ Runnable development recipes live in
 `torchtitan_recipes/tests/models/glm5.py`. The released flavor describes the
 full architecture and is not intended for single-host smoke tests.
 
+## Training
+
+Run the small GLM-5.2 development model with the repository test assets:
+
+```bash
+MODULE=torchtitan_recipes.tests.models.glm5 \
+CONFIG=glm5_debugmodel \
+./run_train.sh
+```
+
+The recipe defaults to 10 steps and uses TorchTitan's standard configuration
+overrides. For example, an 8-GPU run combining FSDP, TP, CP, and EP is
+registered as the `glm5_fsdp+tp+cp+ep` integration test:
+
+```bash
+python -m tests.integration_tests.run_tests \
+  ./outputs/glm5-integration \
+  --test_suite models \
+  --test_name glm5_fsdp+tp+cp+ep \
+  --ngpu 8
+```
+
+## Supported parallelisms
+
+| Feature | Notes |
+|---------|-------|
+| FSDP2 / HSDP | Transformer blocks are sharded through the common decoder lifecycle. |
+| Tensor / sequence parallelism | Attention, dense projections, routed experts, shared experts, and the DSA indexer use declarative sharding configs. |
+| Context parallelism | DSA gathers indexer keys before Top-K selection and uses the common KV all-gather FlexAttention path. |
+| Expert parallelism | Routed experts use TorchTitan's common MoE implementation; shared experts remain replicated across the EP axis. |
+| Pipeline parallelism | Decoder layers are split through the common pipeline lifecycle; shared DSA selections are forwarded when their consumer is on a later stage. |
+
+GLM-5.2 DSA is represented with a PyTorch FlexAttention `BlockMask`. It does
+not use the packed-sequence `varlen` attention contract because DSA selects an
+arbitrary learned Top-K key set for each query.
+
 ## Download tokenizer and checkpoint assets
 
 Download tokenizer and model metadata from the released GLM-5.2 repository:
@@ -89,6 +125,33 @@ Run the CPU model tests with:
 pytest tests/unit_tests/cpu/models/glm5 -q
 ```
 
+Run the reduced Hugging Face parity check with the pinned Transformers
+reference documented by the script:
+
+```bash
+python -m scripts.checkpoint_conversion.numerical_tests_glm5 --device cuda
+```
+
+The parity check builds equivalent reduced TorchTitan and Hugging Face models,
+strictly loads the converted state dict, compares MoE routing choices, and
+checks full-sequence logits with a KL-divergence threshold.
+
+The integration suite registers separate base and MTP training cases. Both use
+an 8-GPU FSDP2+TP2+CP2+EP2 configuration with a real process group:
+
+```text
+glm5_fsdp+tp+cp+ep
+glm5_mtp_fsdp+tp+cp+ep
+```
+
+The MTP case exercises shifted dataloader targets, the full auxiliary DSA/MoE
+block, combined main and auxiliary loss, backward, and the optimizer step.
+
 For numerical changes, compare loss and gradient norm with identical seeds,
 parallelism, and deterministic settings as described in the repository
 development guide.
+
+## References
+
+- [GLM-5.2 model and checkpoint](https://huggingface.co/zai-org/GLM-5.2)
+- [Hugging Face GLM-MoE-DSA reference implementation](https://github.com/huggingface/transformers/tree/main/src/transformers/models/glm_moe_dsa)
