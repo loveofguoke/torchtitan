@@ -299,6 +299,7 @@ class Glm5Model(MTPDecoder):
             # Per token, the indexer computes N dot products of width H against
             # the full sequence, followed by a weighted reduction over N heads.
             num_dsa_layers = len(self.layers) + len(self.mtp_layers or ())
+            assert attention.indexer is not None
             dsa_flops = (
                 2
                 * num_dsa_layers

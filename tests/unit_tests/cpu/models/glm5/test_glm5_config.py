@@ -223,6 +223,13 @@ class TestGlm5Config(unittest.TestCase):
             indexer = config.layers[layer_idx].attention.indexer
             self.assertEqual(indexer is not None, layer_idx == source_idx)
 
+        mtp_config = build_model_config(
+            "glm5_2_debugmodel_mtp",
+            parallelism=ParallelismConfig(),
+            seq_len=128,
+        )
+        self.assertIsNotNone(mtp_config.mtp_layers[0].attention.indexer)
+
 
 if __name__ == "__main__":
     unittest.main()

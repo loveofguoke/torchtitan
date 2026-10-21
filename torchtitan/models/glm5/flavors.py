@@ -90,6 +90,7 @@ __all__ = [
 def build_glm5_mtp_layers(
     inner_cfg: Glm5TransformerBlock.Config,
     *,
+    indexer: Glm5DsaIndexer.Config,
     dim: int,
     num_mtp_layers: int,
     norm_eps: float,
@@ -99,7 +100,10 @@ def build_glm5_mtp_layers(
     norm_sharding = norm_sharding_config(enable_sp=enable_sp)
     return [
         Glm5MTPTransformerBlock.Config(
-            attention=copy.deepcopy(inner_cfg.attention),
+            attention=dataclasses.replace(
+                copy.deepcopy(inner_cfg.attention),
+                indexer=copy.deepcopy(indexer),
+            ),
             feed_forward=copy.deepcopy(inner_cfg.feed_forward),
             attention_norm=copy.deepcopy(inner_cfg.attention_norm),
             ffn_norm=copy.deepcopy(inner_cfg.ffn_norm),
@@ -613,11 +617,14 @@ def _glm5_2_debugmodel_mtp(
         dataclasses.replace(layer, preserve_output_for_mtp=True)
         for layer in config.layers
     ]
+    source_indexer = config.layers[config.index_sources[-1]].attention.indexer
+    assert source_indexer is not None
     return dataclasses.replace(
         config,
         layers=layers,
         mtp_layers=build_glm5_mtp_layers(
             layers[-1],
+            indexer=source_indexer,
             dim=config.dim,
             num_mtp_layers=1,
             norm_eps=1e-5,
@@ -774,6 +781,8 @@ def _glm5_2_744b_a40b(
     layers = [
         dataclasses.replace(layer, preserve_output_for_mtp=True) for layer in layers
     ]
+    source_indexer = layers[index_sources[-1]].attention.indexer
+    assert source_indexer is not None
     return Glm5Model.Config(
         max_context_length=seq_len,
         vocab_size=vocab_size,
@@ -804,6 +813,7 @@ def _glm5_2_744b_a40b(
         layers=layers,
         mtp_layers=build_glm5_mtp_layers(
             layers[-1],
+            indexer=source_indexer,
             dim=dim,
             num_mtp_layers=1,
             norm_eps=1e-5,
