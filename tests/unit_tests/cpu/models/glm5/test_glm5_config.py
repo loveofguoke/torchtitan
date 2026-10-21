@@ -201,6 +201,19 @@ class TestGlm5Config(unittest.TestCase):
             cp_config.layers[0].attention.inner_attention,
             Glm5AllGatherKVFlexAttention.Config,
         )
+        sharding_config = (
+            cp_config.layers[0].attention.inner_attention.sharding_config
+        )
+        self.assertEqual(
+            set(sharding_config.in_dst_shardings or {}),
+            {
+                "q_THK",
+                "k_THK",
+                "v_THV",
+                "attention_metadata",
+                "topk_indices_QS",
+            },
+        )
 
 
 if __name__ == "__main__":

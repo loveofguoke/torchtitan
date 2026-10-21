@@ -51,16 +51,16 @@ def glm5_inner_attention_sharding_config() -> ShardingConfig:
     indices = dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
     return ShardingConfig(
         in_src_shardings={
-            "q_QNH": attention,
-            "k_KNH": attention,
-            "v_KNV": attention,
+            "q_THK": attention,
+            "k_THK": attention,
+            "v_THV": attention,
             "attention_metadata": metadata,
             "topk_indices_QS": indices,
         },
         in_dst_shardings={
-            "q_QNH": attention,
-            "k_KNH": attention,
-            "v_KNV": attention,
+            "q_THK": attention,
+            "k_THK": attention,
+            "v_THV": attention,
             "attention_metadata": metadata,
             "topk_indices_QS": indices,
         },
