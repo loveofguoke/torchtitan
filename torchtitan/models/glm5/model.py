@@ -180,7 +180,8 @@ class Glm5Attention(Attention):
         )
         # The contiguous view reads the attention output with bare ops.
         remat.recompute_needs_tensor(output_TNV)
-        output_TD = self.wo(output_TNV.contiguous().view(T, -1))
+        output_TD: torch.Tensor = self.wo(output_TNV.contiguous().view(T, -1))
+        assert topk_indices_TS is not None
         return (output_TD, topk_indices_TS) if return_indices else output_TD
 
 
@@ -329,9 +330,9 @@ class Glm5Model(MTPDecoder):
         if self.tok_embeddings is not None:
             token_dtype = self.tok_embeddings.weight.dtype
         else:
-            token_dtype = next(
-                iter(next(iter(self.layers.values())).attention_norm.parameters())
-            ).dtype
+            attention_norm = next(iter(self.layers.values())).attention_norm
+            assert isinstance(attention_norm, nn.Module)
+            token_dtype = next(attention_norm.parameters()).dtype
         return create_dsa_causal_mask(
             positions,
             dtype=token_dtype,
