@@ -37,13 +37,10 @@ from torchtitan_recipes.tests.models.deepseek_v3 import (
     deepseek_v3_debugmodel,
     deepseek_v3_debugmodel_mtp,
 )
+from torchtitan_recipes.tests.models.glm5 import glm5_2_debugmodel_mtp, glm5_debugmodel
 from torchtitan_recipes.tests.models.gpt_oss import (
     gpt_oss_debugmodel,
     gpt_oss_debugmodel_flex,
-)
-from torchtitan_recipes.tests.models.glm5 import (
-    glm5_2_debugmodel_mtp,
-    glm5_debugmodel,
 )
 from torchtitan_recipes.tests.models.llama3 import llama3_debugmodel
 from torchtitan_recipes.tests.models.multimodal import (

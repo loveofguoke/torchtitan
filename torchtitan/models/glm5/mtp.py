@@ -47,9 +47,7 @@ class Glm5MTPTransformerBlock(MTPTransformerBlock):
             mtp_input_valid_mask
         )
         prev_embed = prev_embed * local_valid_mask.unsqueeze(-1).to(prev_embed.dtype)
-        fused = torch.cat(
-            [self.enorm(mtp_input_embed), self.hnorm(prev_embed)], dim=-1
-        )
+        fused = torch.cat([self.enorm(mtp_input_embed), self.hnorm(prev_embed)], dim=-1)
         h = self.eh_proj(fused)
 
         attention_out = self.attention(

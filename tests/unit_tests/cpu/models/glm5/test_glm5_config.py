@@ -15,10 +15,7 @@ from torchtitan.models.common.config_utils import DEFAULT_DEBUG_MODEL_SEQ_LEN
 from torchtitan.models.common.flops import get_nparams_and_active_nparams
 from torchtitan.models.common.moe import MoE
 from torchtitan.models.glm5 import build_model_config, MODEL_FLAVORS
-from torchtitan.models.glm5.dsa import (
-    Glm5FlexAttention,
-    Glm5AllGatherKVFlexAttention,
-)
+from torchtitan.models.glm5.dsa import Glm5AllGatherKVFlexAttention, Glm5FlexAttention
 from torchtitan.models.glm5.model import Glm5Attention
 from torchtitan.models.glm5.mtp import Glm5MTPTransformerBlock
 
@@ -47,7 +44,10 @@ class TestGlm5Config(unittest.TestCase):
             all(layer.feed_forward is not None for layer in config.layers[:3])
         )
         self.assertTrue(
-            all(isinstance(layer.feed_forward, MoE.Config) for layer in config.layers[3:])
+            all(
+                isinstance(layer.feed_forward, MoE.Config)
+                for layer in config.layers[3:]
+            )
         )
 
     def test_rejects_context_beyond_flavor_limit(self) -> None:
@@ -66,7 +66,9 @@ class TestGlm5Config(unittest.TestCase):
         )
         model = config.build()
         model.init_states()
-        self.assertGreater(sum(parameter.numel() for parameter in model.parameters()), 0)
+        self.assertGreater(
+            sum(parameter.numel() for parameter in model.parameters()), 0
+        )
 
     def test_mtp_flavor_builds_full_nextn_block(self) -> None:
         config = build_model_config(
@@ -75,9 +77,7 @@ class TestGlm5Config(unittest.TestCase):
             seq_len=8,
         )
         self.assertEqual(len(config.mtp_layers), 1)
-        self.assertIsInstance(
-            config.mtp_layers[0], Glm5MTPTransformerBlock.Config
-        )
+        self.assertIsInstance(config.mtp_layers[0], Glm5MTPTransformerBlock.Config)
         self.assertTrue(all(layer.preserve_output_for_mtp for layer in config.layers))
         model = config.build()
         model.init_states()
@@ -91,9 +91,7 @@ class TestGlm5Config(unittest.TestCase):
         )
         self.assertEqual(len(config.layers), 78)
         self.assertEqual(len(config.mtp_layers), 1)
-        self.assertIsInstance(
-            config.mtp_layers[0], Glm5MTPTransformerBlock.Config
-        )
+        self.assertIsInstance(config.mtp_layers[0], Glm5MTPTransformerBlock.Config)
         # GLM-5.2 stores the MTP block as HF layer 78 and shares the top-level
         # token embedding and lm_head with the 78-layer target decoder.
         self.assertEqual(

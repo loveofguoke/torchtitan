@@ -23,8 +23,8 @@ from torch.nn.attention.flex_attention import BlockMask
 
 from torchtitan.distributed.parallelism_context import MeshAxisName
 from torchtitan.distributed.spmd_types import spmd_mesh_group
-from torchtitan.models.common import ComplexRoPE, LayerNorm, Linear
 from torchtitan.models.base.module import Module
+from torchtitan.models.common import ComplexRoPE, LayerNorm, Linear
 from torchtitan.models.common.attention import FlexInnerAttention
 from torchtitan.models.common.attention.cp_attention import (
     AllGatherKVFlexInnerAttention,
@@ -53,9 +53,9 @@ def create_dsa_causal_mask(
     )
     if padding_mask_T is not None:
         allowed_TT = allowed_TT & padding_mask_T[:, None] & padding_mask_T[None, :]
-    return torch.zeros(
-        1, T, T, dtype=dtype, device=positions_T.device
-    ).masked_fill(~allowed_TT.unsqueeze(0), torch.finfo(dtype).min)
+    return torch.zeros(1, T, T, dtype=dtype, device=positions_T.device).masked_fill(
+        ~allowed_TT.unsqueeze(0), torch.finfo(dtype).min
+    )
 
 
 class DSAIndexerTopK(Module):
@@ -73,7 +73,6 @@ class DSAIndexerTopK(Module):
         index_topk: int
         softmax_scale: float
 
-
     def __init__(self, config: Config) -> None:
         super().__init__()
         self.index_topk = config.index_topk
@@ -88,9 +87,10 @@ class DSAIndexerTopK(Module):
     ) -> torch.Tensor:
         # [Q,N,H] x [H,K] -> [N,Q,K]. Index scores intentionally use FP32:
         # the K/K+1 boundary can change under a single low-precision ULP.
-        scores_NQK = torch.matmul(
-            q_QNH.float().transpose(0, 1), k_KH.float().transpose(0, 1)
-        ) * self.softmax_scale
+        scores_NQK = (
+            torch.matmul(q_QNH.float().transpose(0, 1), k_KH.float().transpose(0, 1))
+            * self.softmax_scale
+        )
         scores_NQK = F.relu(scores_NQK)
         # Each query predicts N mixing weights, producing one global-key score
         # after the weighted reduction over indexer heads.
@@ -111,6 +111,7 @@ class Glm5DsaIndexer(Module):
     applied only to the configured rotary prefix; the remaining features pass
     through unchanged.
     """
+
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
         dim: int
@@ -125,7 +126,6 @@ class Glm5DsaIndexer(Module):
         weights_proj: Linear.Config
         rope: ComplexRoPE.Config
         topk: DSAIndexerTopK.Config
-
 
     def __init__(self, config: Config):
         super().__init__()
@@ -246,17 +246,18 @@ def build_dsa_block_mask(
     counts = occupied.sum(-1).to(torch.int32)
     # Sorting float32 0/1 keys preserves the exact occupancy order while
     # allowing accelerator backends to use their native stable sort path.
-    blocks = occupied.to(torch.float32).argsort(
-        dim=-1, descending=True, stable=True
-    )
+    blocks = occupied.to(torch.float32).argsort(dim=-1, descending=True, stable=True)
 
     def mask_mod(b, h, q, k):
         # Flex may evaluate padded lanes; clamp reads before applying bounds.
         return (q < Q) & (k < K) & allowed_QK[q.clamp(max=Q - 1), k.clamp(max=K - 1)]
 
     return BlockMask.from_kv_blocks(
-        counts, blocks.to(torch.int32), BLOCK_SIZE=B,
-        mask_mod=mask_mod, seq_lengths=(Q, K),
+        counts,
+        blocks.to(torch.int32),
+        BLOCK_SIZE=B,
+        mask_mod=mask_mod,
+        seq_lengths=(Q, K),
     )
 
 

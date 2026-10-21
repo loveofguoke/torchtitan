@@ -229,9 +229,9 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
                     raise KeyError(
                         f"unmapped TorchTitan key: layer has no shared experts: {titan_key}"
                     )
-                projection = suffix.removeprefix("feed_forward.shared_experts.").removesuffix(
-                    ".weight"
-                )
+                projection = suffix.removeprefix(
+                    "feed_forward.shared_experts."
+                ).removesuffix(".weight")
                 if projection in {"w1", "w3"}:
                     return self._linear_shape(moe.shared_experts.w13)
                 if projection == "w2":

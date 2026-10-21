@@ -41,7 +41,7 @@ from torchtitan.models.common.flops import get_nparams_and_active_nparams
 from torchtitan.models.common.moe import MoE
 from torchtitan.models.deepseek_v3.mtp import MTPDecoder, roll_mtp_sequence
 
-from .dsa import Glm5DsaIndexer, create_dsa_causal_mask
+from .dsa import create_dsa_causal_mask, Glm5DsaIndexer
 from .sharding import dsa_mask_placement
 from .state_dict_adapter import Glm5StateDictAdapter
 
@@ -59,6 +59,7 @@ class Glm5Attention(Attention):
     indices. ``inner_attention`` applies token-selected sparse attention to
     the expanded Q/K/V tensors.
     """
+
     @dataclass(kw_only=True, slots=True)
     class Config(Attention.Config):
         dim: int
@@ -76,12 +77,11 @@ class Glm5Attention(Attention):
         wo: Linear.Config
         rope: ComplexRoPE.Config
         indexer: Glm5DsaIndexer.Config
-        inner_attention: InnerAttention.Config  # pyrefly: ignore[bad-override]
+        inner_attention: InnerAttention.Config
 
         @property
         def qk_head_dim(self) -> int:
             return self.qk_nope_head_dim + self.qk_rope_head_dim
-
 
     def __init__(self, config: Config):
         super().__init__()
@@ -154,9 +154,7 @@ class Glm5Attention(Attention):
         kv_TNX = self.wkv_b(kv_TR)
         # The head view/split reads the saved projection output with bare ops.
         remat.recompute_needs_tensor(kv_TNX)
-        kv_TNX = kv_TNX.view(
-            T, self.n_heads, self.qk_nope_head_dim + self.v_head_dim
-        )
+        kv_TNX = kv_TNX.view(T, self.n_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope_TNP, v_TNV = torch.split(
             kv_TNX, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
         )
@@ -213,12 +211,17 @@ class Glm5TransformerBlock(TransformerBlock):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if return_indices:
             attention_TD, topk_indices_TS = self.attention(
-                self.attention_norm(x_TD), attention_masks, positions,
-                topk_indices_TS, return_indices=True,
+                self.attention_norm(x_TD),
+                attention_masks,
+                positions,
+                topk_indices_TS,
+                return_indices=True,
             )
         else:
             attention_TD = self.attention(
-                self.attention_norm(x_TD), attention_masks, positions,
+                self.attention_norm(x_TD),
+                attention_masks,
+                positions,
                 topk_indices_TS,
             )
         # The residual add reads the attention output with bare ops.

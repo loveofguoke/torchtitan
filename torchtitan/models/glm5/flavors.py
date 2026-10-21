@@ -28,11 +28,6 @@ from torchtitan.models.common import (
     RMSNorm,
     Sigmoid,
 )
-from torchtitan.models.common.moe import TokenChoiceTopKRouter
-from torchtitan.models.common.moe.sharding import (
-    router_gate_sharding_config,
-    router_sharding_config,
-)
 from torchtitan.models.common.config_utils import (
     DEFAULT_DEBUG_MODEL_SEQ_LEN,
     make_ffn_config,
@@ -48,24 +43,25 @@ from torchtitan.models.common.decoder_sharding import (
     rope_cache_sharding_config,
     token_embedding_sharding_config,
 )
+from torchtitan.models.common.moe import TokenChoiceTopKRouter
+from torchtitan.models.common.moe.sharding import (
+    router_gate_sharding_config,
+    router_sharding_config,
+)
 from torchtitan.models.common.param_init import depth_scaled_std
 from torchtitan.models.deepseek_v3.sharding import (
     mtp_block_sharding_config,
     mtp_projection_sharding_config,
 )
-
-from .model import (
-    Glm5Attention,
-    Glm5Model,
-    Glm5TransformerBlock,
-)
-from .mtp import Glm5MTPTransformerBlock
 from .dsa import (
     DSAIndexerTopK,
+    Glm5AllGatherKVFlexAttention,
     Glm5DsaIndexer,
     Glm5FlexAttention,
-    Glm5AllGatherKVFlexAttention,
 )
+
+from .model import Glm5Attention, Glm5Model, Glm5TransformerBlock
+from .mtp import Glm5MTPTransformerBlock
 from .sharding import (
     glm5_attention_sharding_config,
     glm5_indexer_sharding_config,
@@ -642,9 +638,7 @@ def _glm5_2_scaled_debugmodel(
         layer_id
         if layer_id < 3 or (layer_id - 2) % 4 == 0
         else max(
-            source
-            for source in range(layer_id)
-            if source < 3 or (source - 2) % 4 == 0
+            source for source in range(layer_id) if source < 3 or (source - 2) % 4 == 0
         )
         for layer_id in range(num_layers)
     )
