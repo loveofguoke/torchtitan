@@ -6,6 +6,7 @@
 
 import logging
 from dataclasses import dataclass, field
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -17,6 +18,7 @@ from torchtitan.distributed.cuda_graph import (
     NUM_CUDA_GRAPH_WARMUP_STEPS,
     wrap_with_cuda_graph,
 )
+from torchtitan.tools.utils import device_module
 
 from .ema import EMA
 from .lr_scheduler import LRSchedulersContainer
@@ -97,6 +99,7 @@ class Optim(Configurable):
         parallelism_context: ParallelismContext,
         training_steps: int,
         pp_has_last_stage: bool,
+        cuda_graph_annotation_config: dict[str, Any] | None = None,
     ) -> None:
         self.config = config
         self.parallelism_context = parallelism_context
@@ -138,6 +141,7 @@ class Optim(Configurable):
                 self._update,
                 num_warmup_iterations=NUM_CUDA_GRAPH_WARMUP_STEPS,
                 name="optimizer",
+                annotation_config=cuda_graph_annotation_config,
             )
 
     def zero_grad(self, *, set_to_none: bool = True) -> None:
@@ -149,9 +153,9 @@ class Optim(Configurable):
         if self._is_first_step_call:
             # Finish GPU work before freeing cached memory for NCCL buffers.
             # https://github.com/pytorch/torchtitan/issues/5019
-            if torch.cuda.is_initialized():
-                torch.cuda.synchronize()
-            torch.cuda.empty_cache()
+            if torch.accelerator.is_available() and device_module.is_initialized():
+                device_module.synchronize()
+            device_module.empty_cache()
             self._is_first_step_call = False
         grad_norm = self._run_update(loss)
         self.lr_schedulers.step()
