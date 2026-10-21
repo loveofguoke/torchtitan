@@ -162,7 +162,7 @@ def _record_routing(model, *, is_hf: bool) -> dict[int, torch.Tensor]:
 def _print_routing_comparison(
     hf_choices: dict[int, torch.Tensor],
     tt_choices: dict[int, torch.Tensor],
-) -> None:
+) -> float:
     if set(hf_choices) != set(tt_choices):
         raise ValueError(
             "routing layers differ: "
@@ -182,9 +182,12 @@ def _print_routing_comparison(
         num_choices += hf_ids.numel()
     match_rate = num_matching / num_choices if num_choices else 1.0
     print(f"router choices: {num_matching}/{num_choices} match ({match_rate:.1%})")
+    return match_rate
 
 
-def _compare_logits(hf_logits: torch.Tensor, tt_logits: torch.Tensor) -> float:
+def _compare_logits(
+    hf_logits: torch.Tensor, tt_logits: torch.Tensor
+) -> tuple[float, float, float]:
     hf = hf_logits.float().reshape(-1, hf_logits.shape[-1])
     tt = tt_logits.float().reshape(-1, tt_logits.shape[-1])
     if hf.shape != tt.shape:
@@ -202,7 +205,7 @@ def _compare_logits(hf_logits: torch.Tensor, tt_logits: torch.Tensor) -> float:
         f"KL={kl:.4e} cos={cosine:.8f} max_diff={max_diff:.4e} "
         f"top1={top1:.1%}"
     )
-    return kl
+    return kl, cosine, top1
 
 
 @torch.no_grad()
@@ -217,7 +220,10 @@ def main() -> None:
         "--device",
         default="cuda" if torch.cuda.is_available() else "cpu",
     )
-    parser.add_argument("--max_kl", type=float, default=1e-5)
+    parser.add_argument("--min_router_match", type=float, default=0.99)
+    parser.add_argument("--max_kl", type=float, default=1e-4)
+    parser.add_argument("--min_cosine", type=float, default=0.9999)
+    parser.add_argument("--min_top1", type=float, default=1.0)
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -252,10 +258,18 @@ def main() -> None:
     ).logits
     tt_logits = tt_model(tokens, positions=positions).unsqueeze(0)
 
-    _print_routing_comparison(hf_choices, tt_choices)
-    kl = _compare_logits(hf_logits, tt_logits)
+    router_match = _print_routing_comparison(hf_choices, tt_choices)
+    kl, cosine, top1 = _compare_logits(hf_logits, tt_logits)
+    if router_match < args.min_router_match:
+        raise RuntimeError(
+            f"router match {router_match:.4%} is below {args.min_router_match:.4%}"
+        )
     if kl > args.max_kl:
         raise RuntimeError(f"KL divergence {kl:.4e} exceeds {args.max_kl:.4e}")
+    if cosine < args.min_cosine:
+        raise RuntimeError(f"cosine {cosine:.8f} is below {args.min_cosine:.8f}")
+    if top1 < args.min_top1:
+        raise RuntimeError(f"top-1 match {top1:.4%} is below {args.min_top1:.4%}")
 
 
 if __name__ == "__main__":

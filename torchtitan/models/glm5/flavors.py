@@ -778,7 +778,7 @@ def _glm5_2_744b_a40b(
         enable_cp=bool(parallelism and parallelism.context_parallel_degree > 1),
         enable_ep=bool(parallelism and parallelism.expert_parallel_degree > 1),
     )
-    layers = [
+    layers: list[Glm5TransformerBlock.Config] = [
         dataclasses.replace(layer, preserve_output_for_mtp=True) for layer in layers
     ]
     source_indexer = layers[index_sources[-1]].attention.indexer
