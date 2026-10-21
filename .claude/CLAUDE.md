@@ -83,7 +83,8 @@ You should NEVER set `config.debug.deterministic_warn_only = True`.
 
 8. **Audit the GLM three-repository contract.** Before changing GLM-5 or a
    shared model/trainer interface used by it, read
-   `torchtitan/models/glm5/DEPENDENCY_AUDIT.md`. Resolve downstream
+   `D:/yyb/huawei/glm/weeks/weekx/98_TorchTitan提交核验/TorchTitan三仓依赖审计.md`.
+   Resolve downstream
    TorchTitanTurbo patches and torchtitan-test call sites, then run the
    behavioral checks listed there. Do not assume an import-only check proves a
    copied or monkey-patched algorithm is still compatible.
