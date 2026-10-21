@@ -370,6 +370,7 @@ def make_glm5_attention_config(
 def build_glm5_layers(
     *,
     num_layers: int,
+    index_sources: tuple[int, ...],
     num_dense_layers: int,
     dim: int,
     n_heads: int,
@@ -400,6 +401,8 @@ def build_glm5_layers(
     """Build GLM-5 dense and MoE block configurations for every layer."""
     if not 0 <= num_dense_layers <= num_layers:
         raise ValueError("num_dense_layers must be in [0, num_layers].")
+    if len(index_sources) != num_layers:
+        raise ValueError("index_sources must contain one source per layer")
     if router_num_expert_groups <= 0:
         raise ValueError("router_num_expert_groups must be > 0.")
     if num_experts % router_num_expert_groups != 0:
@@ -438,6 +441,8 @@ def build_glm5_layers(
             enable_sp=enable_sp,
             enable_cp=enable_cp,
         )
+        if index_sources[layer_id] != layer_id:
+            attention = dataclasses.replace(attention, indexer=None)
         if layer_id < num_dense_layers:
             feed_forward = make_ffn_config(
                 dim=dim,
@@ -512,11 +517,12 @@ def _debugmodel(
         theta=1_000_000,
         scaling="none",
     )
+    effective_index_sources = index_sources or tuple(range(8))
     return Glm5Model.Config(
         max_context_length=seq_len,
         vocab_size=vocab_size,
         dim=dim,
-        index_sources=index_sources,
+        index_sources=effective_index_sources,
         tok_embeddings=Embedding.Config(
             num_embeddings=vocab_size,
             embedding_dim=dim,
@@ -540,6 +546,7 @@ def _debugmodel(
         ),
         layers=build_glm5_layers(
             num_layers=8,
+            index_sources=effective_index_sources,
             num_dense_layers=num_dense_layers,
             dim=dim,
             n_heads=8,
@@ -677,6 +684,7 @@ def _glm5_2_scaled_debugmodel(
         ),
         layers=build_glm5_layers(
             num_layers=num_layers,
+            index_sources=index_sources,
             num_dense_layers=3,
             dim=dim,
             n_heads=8,
@@ -735,6 +743,7 @@ def _glm5_2_744b_a40b(
     )
     layers = build_glm5_layers(
         num_layers=num_layers,
+        index_sources=index_sources,
         num_dense_layers=3,
         dim=dim,
         n_heads=64,

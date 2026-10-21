@@ -201,9 +201,7 @@ class TestGlm5Config(unittest.TestCase):
             cp_config.layers[0].attention.inner_attention,
             Glm5AllGatherKVFlexAttention.Config,
         )
-        sharding_config = (
-            cp_config.layers[0].attention.inner_attention.sharding_config
-        )
+        sharding_config = cp_config.layers[0].attention.inner_attention.sharding_config
         self.assertEqual(
             set(sharding_config.in_dst_shardings or {}),
             {
@@ -214,6 +212,16 @@ class TestGlm5Config(unittest.TestCase):
                 "topk_indices_QS",
             },
         )
+
+    def test_shared_indexer_layers_do_not_own_redundant_parameters(self) -> None:
+        config = build_model_config(
+            "glm5_2_debugmodel",
+            parallelism=ParallelismConfig(),
+            seq_len=128,
+        )
+        for layer_idx, source_idx in enumerate(config.index_sources):
+            indexer = config.layers[layer_idx].attention.indexer
+            self.assertEqual(indexer is not None, layer_idx == source_idx)
 
 
 if __name__ == "__main__":

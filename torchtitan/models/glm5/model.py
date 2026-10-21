@@ -76,7 +76,7 @@ class Glm5Attention(Attention):
         wkv_b: Linear.Config
         wo: Linear.Config
         rope: ComplexRoPE.Config
-        indexer: Glm5DsaIndexer.Config
+        indexer: Glm5DsaIndexer.Config | None
         inner_attention: InnerAttention.Config
 
         @property
@@ -100,7 +100,7 @@ class Glm5Attention(Attention):
         self.wkv_b = config.wkv_b.build()
         self.wo = config.wo.build()
         self.rope = config.rope.build()
-        self.indexer = config.indexer.build()
+        self.indexer = config.indexer.build() if config.indexer is not None else None
         self.inner_attention = config.inner_attention.build()
 
     @property
@@ -165,6 +165,8 @@ class Glm5Attention(Attention):
         # Selection and value computation are separate on purpose: the indexer
         # is frozen and discrete, while the attention path remains trainable.
         if topk_indices_TS is None:
+            if self.indexer is None:
+                raise ValueError("shared-indexer attention requires top-k indices")
             topk_indices_TS = self.indexer(
                 x_TD, q_resid_TR, positions, attention_masks[0]
             )
