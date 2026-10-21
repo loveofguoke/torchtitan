@@ -240,7 +240,7 @@ class Glm5TransformerBlock(TransformerBlock):
             remat.recompute_needs_tensor(ffn_output_TD)
         # Trailing add, always saved: it saves nothing for backward, so replay skips
         # it and its inputs need no persisting, matching checkpoint early stop.
-        output_TD = remat.region(
+        output_TD: torch.Tensor = remat.region(
             torch.add, self.remat_region_name("ffn_residual"), recompute=False
         )(x_TD, ffn_output_TD)
         if self.preserve_output_for_mtp:
@@ -250,7 +250,10 @@ class Glm5TransformerBlock(TransformerBlock):
             # bare consumer. Non-MTP flavors leave this disabled.
             remat.recompute_needs_tensor(output_TD)
             output_TD = output_TD.clone()
-        return (output_TD, topk_indices_TS) if return_indices else output_TD
+        if return_indices:
+            assert topk_indices_TS is not None
+            return output_TD, topk_indices_TS
+        return output_TD
 
 
 class Glm5Model(MTPDecoder):
