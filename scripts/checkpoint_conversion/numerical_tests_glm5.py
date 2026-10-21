@@ -33,6 +33,7 @@ from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.models.common.feed_forward import DenseFeedForward
 from torchtitan.models.common.moe import MoE
 from torchtitan.models.glm5 import build_model_config
+from torchtitan.models.glm5.flavors import Glm5Router
 from torchtitan.models.glm5.state_dict_adapter import Glm5StateDictAdapter
 from transformers import GlmMoeDsaConfig, GlmMoeDsaForCausalLM
 
@@ -56,6 +57,8 @@ def _build_hf_config(tt_config) -> GlmMoeDsaConfig:
     )
     if moe.shared_experts is None:
         raise ValueError("GLM-5 numerical parity requires shared experts.")
+    if not isinstance(moe.router, Glm5Router.Config):
+        raise ValueError("GLM-5 numerical parity requires the GLM group router.")
 
     routed_hidden_dim = moe.routed_experts.w13.out_features
     shared_hidden_dim = moe.shared_experts.w13.out_features
@@ -142,6 +145,7 @@ def _record_routing(model, *, is_hf: bool) -> dict[int, torch.Tensor]:
         if router is None:
             continue
         output_index = 2 if is_hf else 1
+
         def record_choices(
             _module,
             _inputs,

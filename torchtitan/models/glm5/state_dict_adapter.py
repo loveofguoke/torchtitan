@@ -104,6 +104,7 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
         hf_assets_path: str | None,
     ):
         super().__init__(model_config, hf_assets_path)
+        self.glm_config = model_config
         self.from_hf_map = {
             **self.HF_TO_TITAN_TOP_LEVEL,
             **{
@@ -116,11 +117,11 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
         self._to_hf_mtp = {v: k for k, v in self.HF_TO_TITAN_MTP.items()}
 
     def _layer_config(self, layer_index: int):
-        if 0 <= layer_index < len(self.model_config.layers):
-            return self.model_config.layers[layer_index]
-        mtp_index = layer_index - len(self.model_config.layers)
-        if 0 <= mtp_index < len(self.model_config.mtp_layers):
-            return self.model_config.mtp_layers[mtp_index]
+        if 0 <= layer_index < len(self.glm_config.layers):
+            return self.glm_config.layers[layer_index]
+        mtp_index = layer_index - len(self.glm_config.layers)
+        if 0 <= mtp_index < len(self.glm_config.mtp_layers):
+            return self.glm_config.mtp_layers[mtp_index]
         raise KeyError(f"unmapped HF key: layer index {layer_index} is unsupported")
 
     @staticmethod
@@ -138,13 +139,13 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
     def _expected_shape(self, titan_key: str) -> tuple[int, ...]:
         if titan_key == "tok_embeddings.weight":
             return (
-                self.model_config.tok_embeddings.num_embeddings,
-                self.model_config.tok_embeddings.embedding_dim,
+                self.glm_config.tok_embeddings.num_embeddings,
+                self.glm_config.tok_embeddings.embedding_dim,
             )
         if titan_key == "norm.weight":
-            return self._norm_shape(self.model_config.norm.normalized_shape)
+            return self._norm_shape(self.glm_config.norm.normalized_shape)
         if titan_key == "lm_head.weight":
-            return self._linear_shape(self.model_config.lm_head)
+            return self._linear_shape(self.glm_config.lm_head)
 
         match = self._TITAN_LAYER_KEY.fullmatch(titan_key)
         mtp_match = self._TITAN_MTP_KEY.fullmatch(titan_key)
@@ -152,7 +153,7 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
             raise KeyError(f"unmapped TorchTitan key: {titan_key}")
         if mtp_match is not None:
             mtp_index = int(mtp_match.group(1))
-            layer_index = len(self.model_config.layers) + mtp_index
+            layer_index = len(self.glm_config.layers) + mtp_index
             suffix = mtp_match.group(2)
         else:
             assert match is not None
@@ -224,6 +225,10 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
                     experts.in_features,
                 )
             if suffix.startswith("feed_forward.shared_experts."):
+                if moe.shared_experts is None:
+                    raise KeyError(
+                        f"unmapped TorchTitan key: layer has no shared experts: {titan_key}"
+                    )
                 projection = suffix.removeprefix("feed_forward.shared_experts.").removesuffix(
                     ".weight"
                 )
@@ -261,7 +266,7 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
             )
 
     def _validate_fused_down(self, layer_index: int, value: Any) -> None:
-        num_main_layers = len(self.model_config.layers)
+        num_main_layers = len(self.glm_config.layers)
         titan_key = (
             f"layers.{layer_index}.{self._TITAN_DOWN}"
             if layer_index < num_main_layers
@@ -468,8 +473,14 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
         gate, up = fused.chunk(2, dim=1)
         return gate, up
 
-    def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
+    def from_hf(
+        self,
+        hf_state_dict: dict[str, Any],
+        *,
+        is_quantized_layout: bool = False,
+    ) -> dict[str, Any]:
         """Validate and convert one HF state dict into TorchTitan key/layout form."""
+        del is_quantized_layout
         self._validate_hf_rope_config(ComplexRoPE.Config)
         state_dict: dict[str, Any] = {}
 
@@ -488,7 +499,7 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
             layer_index = int(match.group(1))
             suffix = match.group(2)
             layer = self._layer_config(layer_index)
-            mtp_index = layer_index - len(self.model_config.layers)
+            mtp_index = layer_index - len(self.glm_config.layers)
             is_mtp = mtp_index >= 0
             prefix = f"mtp_layers.{mtp_index}" if is_mtp else f"layers.{layer_index}"
 
@@ -521,8 +532,14 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
             fuse_routed_experts=True,
         )
 
-    def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+    def to_hf(
+        self,
+        state_dict: dict[str, Any],
+        *,
+        to_quantized_layout: bool = False,
+    ) -> dict[str, Any]:
         """Validate and convert TorchTitan state into HF names and expert packing."""
+        del to_quantized_layout
         state_dict = self._native_fused_linears_to_hf(
             state_dict,
             split_routed_experts=True,
@@ -543,7 +560,7 @@ class Glm5StateDictAdapter(MoEStateDictAdapter):
                 raise KeyError(f"unmapped TorchTitan key: {titan_key}")
             if mtp_match is not None:
                 mtp_index = int(mtp_match.group(1))
-                layer_index = len(self.model_config.layers) + mtp_index
+                layer_index = len(self.glm_config.layers) + mtp_index
                 suffix = mtp_match.group(2)
             else:
                 assert match is not None

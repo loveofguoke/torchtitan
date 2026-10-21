@@ -32,18 +32,16 @@ from torch import nn
 
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.distributed.spmd_types import annotate_input_spmd_types
-from torchtitan.models.base.module import Module
 from torchtitan.models.common import ComplexRoPE, Linear, RMSNorm
-from torchtitan.models.common.attention import Attention
+from torchtitan.models.common.attention import Attention, InnerAttention
 from torchtitan.models.common.aux_loss import AuxLoss
-from torchtitan.models.common.decoder import Decoder, TransformerBlock
+from torchtitan.models.common.decoder import TransformerBlock
 from torchtitan.models.common.decoder_sharding import decoder_input_sharding
 from torchtitan.models.common.flops import get_nparams_and_active_nparams
 from torchtitan.models.common.moe import MoE
 from torchtitan.models.deepseek_v3.mtp import MTPDecoder, roll_mtp_sequence
 
-from .dsa import DSAIndexerTopK, Glm5DsaIndexer, create_dsa_causal_mask
-from .dsa import Glm5FlexAttention as DSAInnerAttention
+from .dsa import Glm5DsaIndexer, create_dsa_causal_mask
 from .sharding import dsa_mask_placement
 from .state_dict_adapter import Glm5StateDictAdapter
 
@@ -78,7 +76,7 @@ class Glm5Attention(Attention):
         wo: Linear.Config
         rope: ComplexRoPE.Config
         indexer: Glm5DsaIndexer.Config
-        inner_attention: Module.Config
+        inner_attention: InnerAttention.Config  # pyrefly: ignore[bad-override]
 
         @property
         def qk_head_dim(self) -> int:
@@ -176,9 +174,8 @@ class Glm5Attention(Attention):
             q_TNH,
             k_TNH,
             v_TNV,
-            # local_map's input placements follow positional tensor arguments.
-            attention_masks,
-            topk_indices_TS,
+            attention_metadata=attention_masks,
+            topk_indices_QS=topk_indices_TS,
             scale=self.softmax_scale,
         )
         # The contiguous view reads the attention output with bare ops.
@@ -332,7 +329,9 @@ class Glm5Model(MTPDecoder):
         if self.tok_embeddings is not None:
             token_dtype = self.tok_embeddings.weight.dtype
         else:
-            token_dtype = next(iter(self.layers.values())).attention_norm.weight.dtype
+            token_dtype = next(
+                iter(next(iter(self.layers.values())).attention_norm.parameters())
+            ).dtype
         return create_dsa_causal_mask(
             positions,
             dtype=token_dtype,
@@ -380,6 +379,7 @@ class Glm5Model(MTPDecoder):
         if self.mtp_layers is not None and positions is None:
             raise ValueError("GLM-5 MTP input preprocessing requires positions.")
         for depth in depths:
+            assert positions is not None
             mtp_tokens, mtp_valid = roll_mtp_sequence(
                 input_dict["input"],
                 shift=depth,
@@ -439,7 +439,7 @@ class Glm5Model(MTPDecoder):
             )
         return inputs, labels, input_dict, loss_kwargs
 
-    def forward(
+    def forward(  # pyrefly: ignore[bad-param-name-override, bad-override]
         self,
         tokens: torch.Tensor | tuple[torch.Tensor, ...],
         pipeline_indices_TS: torch.Tensor | None = None,

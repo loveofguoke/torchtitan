@@ -32,7 +32,7 @@ class Glm5MTPTransformerBlock(MTPTransformerBlock):
     class Config(MTPTransformerBlock.Config):
         pass
 
-    def forward(
+    def forward(  # pyrefly: ignore[bad-param-name-override, bad-override]
         self,
         mtp_input_embed: torch.Tensor,
         prev_embed: torch.Tensor,

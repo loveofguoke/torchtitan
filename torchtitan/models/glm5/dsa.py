@@ -265,17 +265,12 @@ class Glm5FlexAttention(FlexInnerAttention):
 
     @dataclass(kw_only=True, slots=True)
     class Config(FlexInnerAttention.Config):
-        block_size: int = 128
+        block_size: int | tuple[int, int] = 128
         attention_dropout: float = 0.0
 
-        def build_attention_metadata(self, positions: torch.Tensor, **kwargs):
-            # GLM builds a dense legality mask before the learned top-k stage.
-            # The resulting sparse BlockMask depends on the selected indices
-            # and therefore cannot be built by Decoder's generic metadata path.
-            del positions, kwargs
-            return None
-
         def __post_init__(self):
+            if not isinstance(self.block_size, int):
+                raise ValueError("GLM DSA requires a square integer block_size")
             if self.attention_dropout != 0.0:
                 raise ValueError(
                     "GLM FlexAttention currently requires attention_dropout=0"
@@ -283,23 +278,24 @@ class Glm5FlexAttention(FlexInnerAttention):
 
     def __init__(self, config):
         super().__init__(config)
+        assert isinstance(config.block_size, int)
         self.block_size = config.block_size
 
-    def forward(
+    def forward(  # pyrefly: ignore[bad-override]
         self,
-        q_QNH: torch.Tensor,
-        k_KNH: torch.Tensor,
-        v_KNV: torch.Tensor,
+        q_THK: torch.Tensor,
+        k_THK: torch.Tensor,
+        v_THV: torch.Tensor,
+        *,
         attention_metadata: torch.Tensor,
         topk_indices_QS: torch.Tensor,
-        *,
         scale: float | None = None,
     ) -> torch.Tensor:
         mask = build_dsa_block_mask(
             topk_indices_QS, attention_metadata, self.block_size
         )
         return super().forward(
-            q_QNH, k_KNH, v_KNV, attention_metadata=mask, scale=scale
+            q_THK, k_THK, v_THV, attention_metadata=mask, scale=scale
         )
 
 
@@ -308,14 +304,12 @@ class Glm5AllGatherKVFlexAttention(AllGatherKVFlexInnerAttention):
 
     @dataclass(kw_only=True, slots=True)
     class Config(AllGatherKVFlexInnerAttention.Config):
-        block_size: int = 128
+        block_size: int | tuple[int, int] = 128
         attention_dropout: float = 0.0
 
-        def build_attention_metadata(self, positions: torch.Tensor, **kwargs):
-            del positions, kwargs
-            return None
-
         def __post_init__(self):
+            if not isinstance(self.block_size, int):
+                raise ValueError("GLM DSA requires a square integer block_size")
             if self.attention_dropout != 0.0:
                 raise ValueError(
                     "GLM FlexAttention currently requires attention_dropout=0"
@@ -323,21 +317,22 @@ class Glm5AllGatherKVFlexAttention(AllGatherKVFlexInnerAttention):
 
     def __init__(self, config: Config):
         super().__init__(config)
+        assert isinstance(config.block_size, int)
         self.block_size = config.block_size
 
-    def forward(
+    def forward(  # pyrefly: ignore[bad-override]
         self,
-        q_QNH: torch.Tensor,
-        k_KNH: torch.Tensor,
-        v_KNV: torch.Tensor,
+        q_THK: torch.Tensor,
+        k_THK: torch.Tensor,
+        v_THV: torch.Tensor,
+        *,
         attention_metadata: torch.Tensor,
         topk_indices_QS: torch.Tensor,
-        *,
         scale: float | None = None,
     ) -> torch.Tensor:
         mask = build_dsa_block_mask(
             topk_indices_QS, attention_metadata, self.block_size
         )
         return super().forward(
-            q_QNH, k_KNH, v_KNV, attention_metadata=mask, scale=scale
+            q_THK, k_THK, v_THV, attention_metadata=mask, scale=scale
         )

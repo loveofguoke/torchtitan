@@ -27,7 +27,6 @@ from torchtitan.models.common import (
     Linear,
     RMSNorm,
     Sigmoid,
-    TransformerBlock,
 )
 from torchtitan.models.common.moe import TokenChoiceTopKRouter
 from torchtitan.models.common.moe.sharding import (
@@ -401,7 +400,7 @@ def build_glm5_layers(
     enable_sp: bool = False,
     enable_cp: bool = False,
     enable_ep: bool = False,
-) -> list[TransformerBlock.Config]:
+) -> list[Glm5TransformerBlock.Config]:
     """Build GLM-5 dense and MoE block configurations for every layer."""
     if not 0 <= num_dense_layers <= num_layers:
         raise ValueError("num_dense_layers must be in [0, num_layers].")
@@ -421,7 +420,7 @@ def build_glm5_layers(
     if router_top_k > experts_per_group * router_num_limited_groups:
         raise ValueError("router_top_k exceeds the experts in limited groups.")
 
-    layers: list[TransformerBlock.Config] = []
+    layers: list[Glm5TransformerBlock.Config] = []
     for layer_id in range(num_layers):
         # Every block uses MLA+DSA attention. Only the FFN family changes:
         # early blocks are dense and the remaining blocks use routed+shared MoE.
