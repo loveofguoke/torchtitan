@@ -781,7 +781,9 @@ def _glm5_2_744b_a40b(
     layers: list[Glm5TransformerBlock.Config] = [
         dataclasses.replace(layer, preserve_output_for_mtp=True) for layer in layers
     ]
-    source_indexer = layers[index_sources[-1]].attention.indexer
+    source_attention = layers[index_sources[-1]].attention
+    assert isinstance(source_attention, Glm5Attention.Config)
+    source_indexer = source_attention.indexer
     assert source_indexer is not None
     return Glm5Model.Config(
         max_context_length=seq_len,
