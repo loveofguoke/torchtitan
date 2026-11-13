@@ -111,7 +111,7 @@ class Glm5CPMLAAttention(Glm5MLAAttention, AllGatherKVMLAFlexAttention):
     """Reuse upstream compact KV communication with GLM document metadata."""
 
     @dataclass(kw_only=True, slots=True)
-    class Config(AllGatherKVMLAFlexAttention.Config):
+    class Config(Glm5MLAAttention.Config, AllGatherKVMLAFlexAttention.Config):
         def __post_init__(self) -> None:
             Glm5MLAAttention.Config.__post_init__(self)
 
